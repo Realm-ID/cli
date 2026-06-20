@@ -49,6 +49,8 @@ func run(args []string) int {
 		return cmdConfig(args[1:])
 	case "api":
 		return cmdAPI(args[1:])
+	case "schema":
+		return cmdSchema(args[1:])
 	case "version", "--version", "-v":
 		fmt.Fprintln(os.Stdout, "realm-id", version)
 		return exitOK
@@ -56,10 +58,21 @@ func run(args []string) int {
 		usage()
 		return exitOK
 	default:
+		// Generated typed command tree (ADR-062 §1): `realm-id <resource> <verb>`.
+		if t, err := loadTree(); err == nil && t.isResource(args[0]) {
+			return cmdResource(args)
+		}
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", args[0])
 		usage()
 		return exitUsage
 	}
+}
+
+// cmdSchema dumps the embedded OpenAPI contract so an agent can self-orient
+// (ADR-062 §1, progressive disclosure).
+func cmdSchema(_ []string) int {
+	_, _ = os.Stdout.Write(openapiYAML)
+	return exitOK
 }
 
 func usage() {
@@ -72,8 +85,19 @@ Usage:
   realm-id config set <key> <val>  Set platform | bff_url | issuer_url
   realm-id config get <key>        Print a config value
   realm-id config list             Show the active configuration
-  realm-id api <method> <path>     Authenticated request through the BFF (JSON)
+  realm-id <resource> <verb>       Typed API command (e.g. realm-id platforms list)
+  realm-id <resource>              List a resource's verbs
+  realm-id schema                  Dump the OpenAPI contract (agent self-orientation)
+  realm-id api <method> <path>     Raw authenticated request through the BFF (JSON)
   realm-id version                 Print the CLI version
+
+Resources: platforms, tenants, users, invitations, api-keys, roles,
+  federation-bindings, origins, domains, identity-providers, audit-events,
+  contact-verifications, contact-drift-reviews, mfa, admin
+
+Output: --output json|table (json when piped, table on a TTY)
+Scope:  --platform <id> (or active config) · --tenant <id>
+Body:   --json '<obj>' · --field k=v (repeatable, key:=rawjson for typed) · stdin
 
 Env: REALM_ID_BFF, REALM_ID_ISSUER, REALM_ID_API_KEY, REALM_ID_CONFIG
 `)
