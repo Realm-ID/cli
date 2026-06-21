@@ -1,0 +1,85 @@
+# GoReleaser config for the realm-id CLI (ADR-062 §6 — distribution).
+# Runs in CI on tag push — see .github/workflows/release.yml.
+# Validate locally with:  goreleaser check   (or  goreleaser release --snapshot --clean)
+version: 2
+
+project_name: realm-id
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: realm-id
+    main: ./cmd/realm-id
+    binary: realm-id
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      # main.version is the `var version = "dev"` in cmd/realm-id/main.go
+      - -s -w -X main.version={{ .Version }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: default
+    # → realm-id_0.2.0_linux_amd64.tar.gz  (the installer derives this exact name)
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+release:
+  github:
+    owner: Realm-ID
+    name: cli
+  draft: false
+  prerelease: auto
+
+# ---------------------------------------------------------------------------
+# Homebrew tap — ENABLE after these one-time manual prereqs:
+#   1. Create the PUBLIC repo  Realm-ID/homebrew-tap
+#   2. Mint a token with `contents:write` on it; store it as the
+#      HOMEBREW_TAP_TOKEN secret in Realm-ID/cli Actions, and uncomment the
+#      matching `env:` line in .github/workflows/release.yml
+# Then uncomment this block. GoReleaser auto-PRs/commits the formula on release.
+#
+# brews:
+#   - name: realm-id
+#     repository:
+#       owner: Realm-ID
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+#     homepage: "https://realmid.dev"
+#     description: "Agent-first CLI for the RealmID identity platform"
+#     license: "Apache-2.0"
+#     install: |
+#       bin.install "realm-id"
+#     test: |
+#       system "#{bin}/realm-id", "version"
+#
+# ---------------------------------------------------------------------------
+# Docker (ghcr.io/realm-id/cli) — ENABLE after adding buildx + QEMU setup and a
+# ghcr docker-login step to release.yml (needs `packages: write` permission).
+# Then uncomment `dockers:` + `docker_manifests:` and add a Dockerfile.

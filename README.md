@@ -8,11 +8,27 @@ authenticates by opening a link — no embedded browser.
 
 ## Install
 
+**Recommended — prebuilt binary (no Go toolchain, no repo access):**
+
+```bash
+curl -fsSL https://realmid.dev/cli/install.sh | sh
+```
+
+Downloads a checksum-verified binary for your OS/arch from GitHub Releases.
+Pin a version or install dir: `… | sh -s -- --version v0.2.0 --bin-dir "$HOME/.local/bin"`.
+Windows: download the `.zip` from the [Releases page](https://github.com/Realm-ID/cli/releases).
+
+**Homebrew** (after the tap is published — see `TODO.md` §6):
+
+```bash
+brew install realm-id/tap/realm-id
+```
+
+**From source** (needs the Go toolchain):
+
 ```bash
 go install github.com/Realm-ID/cli/cmd/realm-id@latest
 ```
-
-(Homebrew / prebuilt binaries are on the roadmap — see the project `TODO.md`.)
 
 ## Usage
 
