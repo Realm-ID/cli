@@ -345,9 +345,25 @@ func jsonRequest(method, url, bearer string, body any, out any) (int, []byte, er
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if out != nil && len(raw) > 0 {
-		_ = json.Unmarshal(raw, out)
+		decodeBody(raw, out)
 	}
 	return resp.StatusCode, raw, nil
+}
+
+// decodeBody unmarshals a BFF success body into out. Native GoFr handlers
+// (the device-flow endpoints) wrap their return value in a {"data":{…}}
+// envelope (gofr http/response.Response), so peel that off when present and
+// fall back to the bare body for raw/passthrough responses that don't wrap.
+func decodeBody(raw []byte, out any) {
+	var env struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err == nil && len(env.Data) > 0 {
+		if json.Unmarshal(env.Data, out) == nil {
+			return
+		}
+	}
+	_ = json.Unmarshal(raw, out)
 }
 
 // errorCode pulls {"error":{"code":...}} out of a BFF error body.
