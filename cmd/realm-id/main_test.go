@@ -130,6 +130,149 @@ func TestAuthLogin_AccessDenied(t *testing.T) {
 	}
 }
 
+// deviceLoginMux builds a fake BFF that approves immediately, returning the
+// given device-token poll body (already wrapped in the GoFr {"data":…}
+// envelope), and records whether /switch-tenant was called and with what.
+func deviceLoginMux(t *testing.T, tokenBody string) (*http.ServeMux, *string) {
+	t.Helper()
+	var switched string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/device/code", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"device_code":"dvc_abc","user_code":"WXYZ-1234",`+
+			`"verification_uri":"https://app.example/device","expires_in":60,"interval":1}}`)
+	})
+	mux.HandleFunc("/auth/device/token", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, tokenBody)
+	})
+	mux.HandleFunc("/switch-tenant", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			TenantID string `json:"tenant_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		switched = body.TenantID
+		_, _ = io.WriteString(w, `{"data":{"expires_at":123}}`)
+	})
+	return mux, &switched
+}
+
+// TestAuthLogin_SingleTenant_AutoPicks: an unpinned single-membership login
+// auto-selects the tenant and pins it via /switch-tenant (ADR-062 §2).
+func TestAuthLogin_SingleTenant_AutoPicks(t *testing.T) {
+	mux, switched := deviceLoginMux(t, `{"data":{"session_token":"sess_xyz","realm_id":"rlm_1",`+
+		`"tenant_id":"","tenants":[{"id":"t-1","display_name":"Acme"}]}}`)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	cfg := &Config{}
+	if code := authLogin(cfg); code != exitOK {
+		t.Fatalf("authLogin exit = %d", code)
+	}
+	if *switched != "t-1" {
+		t.Fatalf("/switch-tenant called with %q, want t-1", *switched)
+	}
+	saved, _ := loadConfig()
+	if saved.Tenant != "t-1" {
+		t.Fatalf("persisted tenant = %q, want t-1", saved.Tenant)
+	}
+}
+
+// TestAuthLogin_MultiTenant_ListsNoSwitch: a multi-membership login leaves the
+// session unpinned — no /switch-tenant, no persisted tenant — and lists choices.
+func TestAuthLogin_MultiTenant_ListsNoSwitch(t *testing.T) {
+	mux, switched := deviceLoginMux(t, `{"data":{"session_token":"sess_xyz","realm_id":"rlm_1",`+
+		`"tenant_id":"","tenants":[{"id":"t-1"},{"id":"t-2"}]}}`)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	cfg := &Config{}
+	if code := authLogin(cfg); code != exitOK {
+		t.Fatalf("authLogin exit = %d", code)
+	}
+	if *switched != "" {
+		t.Fatalf("/switch-tenant should not be called for multi-tenant, got %q", *switched)
+	}
+	saved, _ := loadConfig()
+	if saved.Tenant != "" {
+		t.Fatalf("multi-tenant login must leave tenant unpinned, got %q", saved.Tenant)
+	}
+}
+
+// TestAuthLogin_Pinned_RecordsTenant: a BFF-pinned (single-tenant) login records
+// the returned tenant_id without an extra /switch-tenant round-trip.
+func TestAuthLogin_Pinned_RecordsTenant(t *testing.T) {
+	mux, switched := deviceLoginMux(t, `{"data":{"session_token":"sess_xyz","realm_id":"rlm_1",`+
+		`"tenant_id":"t-9","tenants":[{"id":"t-9"}]}}`)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	cfg := &Config{}
+	if code := authLogin(cfg); code != exitOK {
+		t.Fatalf("authLogin exit = %d", code)
+	}
+	if *switched != "" {
+		t.Fatalf("already-pinned login should not re-switch, got %q", *switched)
+	}
+	saved, _ := loadConfig()
+	if saved.Tenant != "t-9" {
+		t.Fatalf("persisted tenant = %q, want t-9", saved.Tenant)
+	}
+}
+
+// TestConfigSetTenant_Switches: `config set tenant <id>` pins the live session
+// via /switch-tenant and persists it.
+func TestConfigSetTenant_Switches(t *testing.T) {
+	mux, switched := deviceLoginMux(t, "")
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	if err := saveConfig(&Config{SessionToken: "sess_xyz"}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	if code := cmdConfig([]string{"set", "tenant", "t-7"}); code != exitOK {
+		t.Fatalf("config set tenant exit = %d", code)
+	}
+	if *switched != "t-7" {
+		t.Fatalf("/switch-tenant called with %q, want t-7", *switched)
+	}
+	saved, _ := loadConfig()
+	if saved.Tenant != "t-7" {
+		t.Fatalf("persisted tenant = %q, want t-7", saved.Tenant)
+	}
+}
+
+// TestConfigSetTenant_FailedSwitchNotPersisted: a rejected switch must not
+// persist the tenant (the session stays on its prior pin).
+func TestConfigSetTenant_FailedSwitchNotPersisted(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/switch-tenant", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":"not_a_member","message":"nope"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	if err := saveConfig(&Config{SessionToken: "sess_xyz", Tenant: "t-old"}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	if code := cmdConfig([]string{"set", "tenant", "t-bad"}); code == exitOK {
+		t.Fatal("config set tenant should fail on a rejected switch")
+	}
+	saved, _ := loadConfig()
+	if saved.Tenant != "t-old" {
+		t.Fatalf("failed switch persisted tenant = %q, want t-old unchanged", saved.Tenant)
+	}
+}
+
 func TestExitForStatus(t *testing.T) {
 	cases := map[int]int{
 		200:                            exitOK,

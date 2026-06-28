@@ -82,7 +82,7 @@ Usage:
   realm-id auth login              Authenticate via a browser link (device flow)
   realm-id auth whoami             Show the current session identity
   realm-id auth logout             Revoke the session and clear local credentials
-  realm-id config set <key> <val>  Set platform | bff_url | issuer_url
+  realm-id config set <key> <val>  Set platform | tenant | bff_url | issuer_url
   realm-id config get <key>        Print a config value
   realm-id config list             Show the active configuration
   realm-id <resource> <verb>       Typed API command (e.g. realm-id platforms list)
@@ -136,6 +136,23 @@ type deviceCodeResp struct {
 	Interval                int    `json:"interval"`
 }
 
+// tenantInfo mirrors one BFF membership row in the device-token poll response.
+type tenantInfo struct {
+	ID          string `json:"id"`
+	Role        string `json:"role,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+}
+
+// deviceTokenResp is the BFF device-token poll response. tenant_id is set when
+// the session was pinned (single-membership user); for a multi-membership user
+// it is "" and the CLI selects a tenant from tenants[] (ADR-062 §2).
+type deviceTokenResp struct {
+	SessionToken string       `json:"session_token"`
+	RealmID      string       `json:"realm_id"`
+	TenantID     string       `json:"tenant_id"`
+	Tenants      []tenantInfo `json:"tenants"`
+}
+
 func authLogin(cfg *Config) int {
 	bff := cfg.bffURL()
 	var dc deviceCodeResp
@@ -153,18 +170,17 @@ func authLogin(cfg *Config) int {
 	deadline := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(time.Duration(interval) * time.Second)
-		var tok struct {
-			SessionToken string `json:"session_token"`
-			RealmID      string `json:"realm_id"`
-		}
+		var tok deviceTokenResp
 		st, raw, _ := jsonRequest(http.MethodPost, bff+"/auth/device/token",
 			"", map[string]string{"device_code": dc.DeviceCode}, &tok)
 		if st == http.StatusOK && tok.SessionToken != "" {
 			cfg.SessionToken = tok.SessionToken
+			cfg.Tenant = tok.TenantID // pinned at the BFF for a single-tenant user; "" otherwise
 			if err := saveConfig(cfg); err != nil {
 				return fail(err)
 			}
 			fmt.Fprintln(os.Stderr, "Authorized. Credentials saved.")
+			selectTenantAfterLogin(cfg, tok)
 			return exitOK
 		}
 		switch errorCode(raw) {
@@ -179,6 +195,65 @@ func authLogin(cfg *Config) int {
 		}
 	}
 	return fail(errors.New("timed out waiting for approval"))
+}
+
+// selectTenantAfterLogin does client-side tenant selection (ADR-062 §2):
+//   - session already pinned (single-membership user): report the active tenant.
+//   - exactly one membership but unpinned: auto-pick and pin it.
+//   - many memberships: list them and tell the user how to choose.
+//   - none: nothing to do.
+func selectTenantAfterLogin(cfg *Config, tok deviceTokenResp) {
+	if tok.TenantID != "" {
+		fmt.Fprintf(os.Stderr, "Active tenant: %s\n", tok.TenantID)
+		return
+	}
+	switch len(tok.Tenants) {
+	case 0:
+		// No tenant memberships — leave the session unpinned.
+	case 1:
+		if err := pinTenant(cfg, tok.Tenants[0].ID); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not set active tenant: %v\n", err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Active tenant: %s\n", tenantLabel(tok.Tenants[0]))
+	default:
+		fmt.Fprintln(os.Stderr, "\nYou belong to multiple tenants:")
+		for _, t := range tok.Tenants {
+			fmt.Fprintf(os.Stderr, "  %s\n", tenantLabel(t))
+		}
+		fmt.Fprintln(os.Stderr, "\nSelect one with:  realm-id config set tenant <id>")
+		fmt.Fprintln(os.Stderr, "(or pass --tenant <id> per command)")
+	}
+}
+
+func tenantLabel(t tenantInfo) string {
+	if t.DisplayName != "" {
+		return fmt.Sprintf("%s (%s)", t.ID, t.DisplayName)
+	}
+	return t.ID
+}
+
+// pinTenant re-pins the BFF session to tenantID via POST /switch-tenant (no
+// re-login — ADR-031) and persists it as the CLI's active tenant. The session
+// is unusable on the admin surface until pinned (the BFF refuses an unpinned
+// session with tenant_required), so a failed switch is surfaced, not swallowed.
+func pinTenant(cfg *Config, tenantID string) error {
+	if cfg.SessionToken == "" {
+		return errors.New("not logged in (run: realm-id auth login)")
+	}
+	st, raw, err := jsonRequest(http.MethodPost, cfg.bffURL()+"/switch-tenant",
+		cfg.SessionToken, map[string]string{"tenant_id": tenantID}, nil)
+	if err != nil {
+		return err
+	}
+	if st >= 400 {
+		if code := errorCode(raw); code != "" {
+			return fmt.Errorf("switch-tenant failed: %s", code)
+		}
+		return fmt.Errorf("switch-tenant failed (status %d)", st)
+	}
+	cfg.Tenant = tenantID
+	return saveConfig(cfg)
 }
 
 func authWhoami(cfg *Config) int {
@@ -228,12 +303,20 @@ func cmdConfig(args []string) int {
 		return exitOK
 	case "set":
 		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: realm-id config set <platform|bff_url|issuer_url> <value>")
+			fmt.Fprintln(os.Stderr, "usage: realm-id config set <platform|tenant|bff_url|issuer_url> <value>")
 			return exitUsage
 		}
 		switch args[1] {
 		case "platform":
 			cfg.Platform = args[2]
+		case "tenant":
+			// Tenant selection re-pins the live BFF session (ADR-062 §2);
+			// pinTenant persists cfg.Tenant only on a successful switch.
+			if err := pinTenant(cfg, args[2]); err != nil {
+				return fail(err)
+			}
+			fmt.Fprintf(os.Stderr, "Active tenant: %s\n", args[2])
+			return exitOK
 		case "bff_url":
 			cfg.BFFURL = args[2]
 		case "issuer_url":
@@ -256,6 +339,8 @@ func configValue(cfg *Config, key string) string {
 	switch key {
 	case "platform":
 		return cfg.Platform
+	case "tenant":
+		return cfg.Tenant
 	case "bff_url":
 		return cfg.bffURL()
 	case "issuer_url":
@@ -272,6 +357,7 @@ func configList(cfg *Config) int {
 	}
 	out := map[string]string{
 		"platform":      cfg.Platform,
+		"tenant":        cfg.Tenant,
 		"bff_url":       cfg.bffURL(),
 		"issuer_url":    cfg.issuerURL(),
 		"session_token": sessionState,

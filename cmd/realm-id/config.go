@@ -34,6 +34,12 @@ type Config struct {
 	IssuerURL    string `json:"issuer_url,omitempty"`
 	Platform     string `json:"platform,omitempty"`
 	SessionToken string `json:"session_token,omitempty"`
+	// Tenant is the active tenant the session is pinned to (ADR-062 §2). It is
+	// chosen client-side — `auth login` auto-sets it for single-membership
+	// users; multi-membership users pick via `config set tenant <id>` or the
+	// per-command --tenant flag. Setting it re-pins the BFF session via
+	// POST /switch-tenant (no re-login).
+	Tenant string `json:"tenant,omitempty"`
 }
 
 // configPath honours XDG (~/.config/realm-id/config.json), with a

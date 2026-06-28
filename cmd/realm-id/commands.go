@@ -221,7 +221,12 @@ func resolveParam(cfg *Config, p pathParam, pf *parsedFlags) (string, error) {
 		if v := pf.vals[p.Name]; v != "" {
 			return v, nil
 		}
-		return "", fmt.Errorf("this command needs a tenant: pass --tenant <id>")
+		// Fall back to the active tenant chosen at the CLI level (ADR-062 §2):
+		// `realm-id config set tenant <id>` or auto-picked at login.
+		if cfg.Tenant != "" {
+			return cfg.Tenant, nil
+		}
+		return "", fmt.Errorf("no active tenant: `realm-id config set tenant <id>` or pass --tenant")
 	default:
 		if v := pf.vals[p.Name]; v != "" {
 			return v, nil
