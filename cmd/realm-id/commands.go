@@ -295,16 +295,25 @@ func inferScalar(s string) any {
 	return s
 }
 
-// resolveCredential picks the base URL + bearer. A service key (REALM_ID_API_KEY)
-// talks issuer-direct (ADR-062 §4 Service mode); otherwise the device-flow
-// session bearer is used. The typed admin surface is the issuer's contract, so
-// both modes target the issuer.
+// resolveCredential picks the base URL + bearer for a typed command.
+//
+// Two modes, two hosts (ADR-062 §4):
+//   - Service mode: a static API key (REALM_ID_API_KEY, rk_live_…) authenticates
+//     issuer-direct — the issuer accepts it as a platform credential.
+//   - Session mode: the device-flow session token (rsid_…) is a *BFF* session
+//     credential, not an issuer access JWT — the issuer rejects it. Typed
+//     commands therefore route through the BFF's `/api/*` admin passthrough,
+//     which mints a user-scoped upstream token and forwards to the issuer
+//     under the session's identity. The generated paths are the issuer's bare
+//     admin paths (e.g. /platforms/{id}); the BFF strips the `/api` prefix
+//     before forwarding, so we prepend it here. (`realm-id api` stays a raw
+//     escape hatch and is deliberately NOT prefixed — it must also reach
+//     native BFF routes like /me and /switch-tenant.)
 func resolveCredential(cfg *Config) (base, bearer string) {
-	base = cfg.issuerURL()
 	if k := envOr("REALM_ID_API_KEY", ""); k != "" {
-		return base, k
+		return cfg.issuerURL(), k
 	}
-	return base, cfg.SessionToken
+	return cfg.bffURL() + "/api", cfg.SessionToken
 }
 
 func printCommandHelp(w io.Writer, cmd command) {

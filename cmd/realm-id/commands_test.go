@@ -1,8 +1,40 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
+
+// TestRunCommand_SessionMode_RoutesThroughBFFApi is the end-to-end regression
+// guard for the routing bug: a typed command authenticated by a device-flow
+// session token must hit the BFF's /api/* passthrough with the rsid_ bearer —
+// not the issuer, which rejects the session token.
+func TestRunCommand_SessionMode_RoutesThroughBFFApi(t *testing.T) {
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("REALM_ID_API_KEY", "") // session mode, not service mode
+	t.Setenv("REALM_ID_BFF", srv.URL)
+	t.Setenv("REALM_ID_ISSUER", "https://issuer.invalid") // must NOT be hit
+
+	cmd := command{Group: []string{"things"}, Verb: "list", Method: "GET", Path: "/things"}
+	cfg := &Config{SessionToken: "rsid_sess"}
+	if code := runCommand(cfg, cmd, nil); code != exitOK {
+		t.Fatalf("runCommand exit = %d, want exitOK (%d)", code, exitOK)
+	}
+	if gotPath != "/api/things" {
+		t.Fatalf("BFF saw path %q, want /api/things (the passthrough mount)", gotPath)
+	}
+	if gotAuth != "Bearer rsid_sess" {
+		t.Fatalf("BFF saw auth %q, want the session bearer", gotAuth)
+	}
+}
 
 func TestParseFlags(t *testing.T) {
 	pf, err := parseFlags([]string{"--platform", "plt_1", "--tenant=t_2", "--field", "name=x", "--field", "n:=3", "--output", "table"})
@@ -86,15 +118,23 @@ func TestBuildBody(t *testing.T) {
 }
 
 func TestResolveCredential(t *testing.T) {
-	t.Setenv("REALM_ID_API_KEY", "rk_live_1")
 	t.Setenv("REALM_ID_ISSUER", "https://issuer.example")
+	t.Setenv("REALM_ID_BFF", "https://bff.example")
+
+	// Service mode: a static API key authenticates issuer-direct (ADR-062 §4).
+	t.Setenv("REALM_ID_API_KEY", "rk_live_1")
 	base, bearer := resolveCredential(&Config{SessionToken: "sess"})
 	if base != "https://issuer.example" || bearer != "rk_live_1" {
-		t.Fatalf("with key: base=%q bearer=%q", base, bearer)
+		t.Fatalf("service mode: base=%q bearer=%q, want issuer + key", base, bearer)
 	}
+
+	// Session mode: the device-flow session token (rsid_) is a BFF credential,
+	// so typed commands route through the BFF's /api/* admin passthrough — NOT
+	// the issuer, which rejects it. Base must carry the /api prefix the BFF
+	// strips before forwarding upstream.
 	t.Setenv("REALM_ID_API_KEY", "")
-	_, bearer = resolveCredential(&Config{SessionToken: "sess"})
-	if bearer != "sess" {
-		t.Fatalf("without key bearer = %q, want session", bearer)
+	base, bearer = resolveCredential(&Config{SessionToken: "rsid_sess"})
+	if base != "https://bff.example/api" || bearer != "rsid_sess" {
+		t.Fatalf("session mode: base=%q bearer=%q, want bff/api + session", base, bearer)
 	}
 }

@@ -15,7 +15,7 @@ curl -fsSL https://realmid.dev/cli/install.sh | sh
 ```
 
 Downloads a checksum-verified binary for your OS/arch from GitHub Releases.
-Pin a version or install dir: `… | sh -s -- --version v0.2.3 --bin-dir "$HOME/.local/bin"`.
+Pin a version or install dir: `… | sh -s -- --version v0.2.4 --bin-dir "$HOME/.local/bin"`.
 Windows: download the `.zip` from the [Releases page](https://github.com/Realm-ID/cli/releases).
 
 **Homebrew** (after the tap is published — see `TODO.md` §6):
