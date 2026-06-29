@@ -27,3 +27,22 @@ underlying code fixes.
   Touches the issuer `/auth/device/approve` surface + `ui/web/src/main.tsx`
   `/device` branch. (Related: root `TODO.md` "No post-deploy smoke check for
   ui/web /device".)
+
+## `auth login` hardening (from Traide follow-up 2026-06-29)
+
+- [x] **Hard singleton for `auth login`** — DONE 2026-06-29 (`cmd/realm-id/main.go`).
+  Replaced the soft supersede-only guard with an OS lockfile (`login.lock`
+  next to config): a second concurrent `auth login` on the same machine is
+  **refused** with a clear message ("a device login is already in progress…")
+  instead of silently opening a second tab with a different `user_code`. The
+  lock is deadline-stamped (~11 min) so a crashed/abandoned run self-clears.
+  With ≤1 login live at a time, only one approvable code exists from the CLI
+  side → the wrong-tab footgun can't occur. Unit-tested
+  (`TestAcquireLoginLock_Singleton`, `_ReclaimsStale`). Ship in `cli/v0.2.7`.
+- [ ] **Surface the approve-side error to the CLI poll** (cross-repo: api/ + cli/).
+  Today the CLI only ever sees `authorization_pending` until `expired_token`,
+  so a failed approval (e.g. 409 `approval_needs_app`, `login_failed`) is
+  indistinguishable from a timeout. Needs the BFF to record a terminal failure
+  reason on the device record and return it from `/auth/device/token`, then the
+  CLI prints "approval failed: <reason>" instead of "expired before approval".
+  Deferred (contract change) — mirror entry in `api/TODO.md`.

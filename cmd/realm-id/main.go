@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -247,7 +248,103 @@ func clearActiveLogin(deviceCode string) {
 	}
 }
 
+// deviceCodeMaxTTL bounds how long the singleton login lock can be held before
+// it is considered stale and reclaimable. It is set a little over the server's
+// device-code TTL (~600s) so a crashed/abandoned run's lock self-clears shortly
+// after its code would have expired anyway.
+const deviceCodeMaxTTL = 11 * time.Minute
+
+// errLoginInProgress is returned by acquireLoginLock when another device login
+// is already running on this machine. It is the ONLY acquire failure the caller
+// treats as fatal — any other error (e.g. unresolved config dir) is non-fatal
+// and the login proceeds lockless, mirroring the best-effort active-login marker.
+var errLoginInProgress = errors.New(
+	"a device login is already in progress on this machine; cancel it or wait for it to finish before starting another")
+
+func loginLockPath() (string, error) {
+	p, err := configPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(p), "login.lock"), nil
+}
+
+// acquireLoginLock takes the per-machine device-login singleton lock and returns
+// a release func. If a login is already in progress (lock held and not past its
+// device-code deadline) it returns errLoginInProgress so the caller refuses
+// cleanly — this is the hard mutual exclusion that makes the concurrent-run /
+// wrong-tab footgun impossible (ADR-062 §2), not just discouraged. A lock left
+// by a crashed or expired run (deadline in the past, or unreadable) is reclaimed.
+func acquireLoginLock(ttl time.Duration) (func(), error) {
+	p, err := loginLockPath()
+	if err != nil {
+		return nil, err // non-fatal: caller proceeds lockless
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return nil, err // non-fatal
+	}
+	content := fmt.Sprintf("%d\n%d", os.Getpid(), time.Now().Add(ttl).Unix())
+	// Fast path: atomic exclusive create wins the lock outright.
+	if f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600); err == nil {
+		_, _ = f.WriteString(content)
+		_ = f.Close()
+		return func() { releaseLoginLock(p) }, nil
+	}
+	// Lock file exists. Reclaim it only if the in-flight login's deadline has
+	// passed; otherwise a live login owns it → refuse.
+	if !loginLockStale(p) {
+		return nil, errLoginInProgress
+	}
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		return nil, err // non-fatal
+	}
+	return func() { releaseLoginLock(p) }, nil
+}
+
+// loginLockStale reports whether the lock at p is reclaimable: unreadable,
+// malformed, or past its recorded deadline. Unreadable/malformed is treated as
+// stale so a corrupt marker can never wedge logins forever.
+func loginLockStale(p string) bool {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return true
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)
+	if len(parts) != 2 {
+		return true
+	}
+	deadline, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	if err != nil {
+		return true
+	}
+	return time.Now().Unix() >= deadline
+}
+
+// releaseLoginLock removes the lock iff it still names our pid, so a run that
+// went stale and was reclaimed by a newer login never deletes the newer lock.
+func releaseLoginLock(p string) {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)
+	if len(parts) >= 1 && strings.TrimSpace(parts[0]) == strconv.Itoa(os.Getpid()) {
+		_ = os.Remove(p)
+	}
+}
+
 func authLogin(cfg *Config, deviceName string) int {
+	// Hard singleton (ADR-062 §2): refuse a second concurrent device login on
+	// this machine. With at most one login live at a time, only one approvable
+	// user_code can exist from the CLI's side, so the wrong-tab footgun can't
+	// happen. A non-fatal lock error (e.g. unresolved config dir) falls through
+	// to the best-effort active-login marker rather than blocking a real login.
+	if release, lockErr := acquireLoginLock(deviceCodeMaxTTL); errors.Is(lockErr, errLoginInProgress) {
+		return fail(lockErr)
+	} else if release != nil {
+		defer release()
+	}
+
 	bff := cfg.bffURL()
 	var dc deviceCodeResp
 	// Send a device label so this session is identifiable in the user's
@@ -256,6 +353,11 @@ func authLogin(cfg *Config, deviceName string) int {
 	status, _, err := jsonRequest(http.MethodPost, bff+"/auth/device/code", "", body, &dc)
 	if err != nil || status >= 400 {
 		return fail(fmt.Errorf("starting device login failed (status %d): %v", status, err))
+	}
+	debugDev := envOr("REALM_ID_DEBUG", "") != ""
+	if debugDev {
+		fmt.Fprintf(os.Stderr, "[debug] BFF=%s\n[debug] device/code status=%d user_code=%s device_code=%s expires_in=%d interval=%d\n",
+			bff, status, dc.UserCode, dc.DeviceCode, dc.ExpiresIn, dc.Interval)
 	}
 	// The URL embeds THIS run's user_code; the page reads it from the query
 	// string so the user never has to type or match a code. Approving any other
@@ -291,7 +393,16 @@ func authLogin(cfg *Config, deviceName string) int {
 		var tok deviceTokenResp
 		st, raw, _ := jsonRequest(http.MethodPost, bff+"/auth/device/token",
 			"", map[string]string{"device_code": dc.DeviceCode}, &tok)
-		if st == http.StatusOK && tok.SessionToken != "" {
+		if debugDev {
+			fmt.Fprintf(os.Stderr, "[debug] poll device_code=%s status=%d code=%q\n", dc.DeviceCode, st, errorCode(raw))
+		}
+		// Accept any 2xx that carries a session token. The BFF runs on GoFr,
+		// which returns 201 Created (not 200) for a POST handler — so the
+		// approved /auth/device/token response arrives as 201. Hardcoding 200
+		// here silently discarded the delivered token and kept polling until the
+		// (now single-use-consumed) record expired → bogus "expired before
+		// approval" on every successful approval. Match the whole 2xx class.
+		if st/100 == 2 && tok.SessionToken != "" {
 			cfg.SessionToken = tok.SessionToken
 			cfg.Tenant = tok.TenantID // pinned at the BFF for a single-tenant user; "" otherwise
 			if err := saveConfig(cfg); err != nil {
@@ -302,8 +413,9 @@ func authLogin(cfg *Config, deviceName string) int {
 			selectTenantAfterLogin(cfg, tok)
 			return exitOK
 		}
-		switch errorCode(raw) {
-		case "authorization_pending":
+		switch ec := errorCode(raw); ec {
+		case "authorization_pending", "":
+			// Still waiting (or a transient empty body) — keep polling.
 			continue
 		case "slow_down":
 			interval += 5
@@ -311,6 +423,15 @@ func authLogin(cfg *Config, deviceName string) int {
 			return failCode(errors.New("authorization was denied"), exitForbidden)
 		case "expired_token":
 			return fail(errors.New("the device code expired before approval"))
+		default:
+			// A terminal approve-side failure surfaced through the poll
+			// (ADR-062 §2): the approval was attempted but rejected — e.g.
+			// approval_needs_app (finish first-login/MFA setup in the app),
+			// login_failed. Report the real reason instead of polling to expiry.
+			if msg := errorMessage(raw); msg != "" {
+				return fail(fmt.Errorf("approval failed: %s", msg))
+			}
+			return fail(fmt.Errorf("approval failed (%s)", ec))
 		}
 	}
 	return fail(errors.New("timed out waiting for approval"))
@@ -580,6 +701,18 @@ func errorCode(raw []byte) string {
 	}
 	_ = json.Unmarshal(raw, &e)
 	return e.Error.Code
+}
+
+// errorMessage extracts the human-readable message from an error envelope, for
+// surfacing approve-side failures to the user.
+func errorMessage(raw []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &e)
+	return e.Error.Message
 }
 
 func exitForStatus(status int) int {

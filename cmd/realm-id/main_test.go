@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestErrorCode(t *testing.T) {
@@ -373,4 +375,83 @@ func TestResolveDeviceName(t *testing.T) {
 			t.Fatal("expected hostname or fallback, got empty")
 		}
 	})
+}
+
+func TestAcquireLoginLock_Singleton(t *testing.T) {
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+
+	// First acquire wins.
+	release, err := acquireLoginLock(11 * time.Minute)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	if release == nil {
+		t.Fatal("first acquire returned nil release")
+	}
+
+	// Second concurrent acquire is refused with the sentinel.
+	if _, err := acquireLoginLock(11 * time.Minute); !errors.Is(err, errLoginInProgress) {
+		t.Fatalf("second acquire = %v, want errLoginInProgress", err)
+	}
+
+	// After release, a new acquire succeeds again.
+	release()
+	release2, err := acquireLoginLock(11 * time.Minute)
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	release2()
+}
+
+func TestAcquireLoginLock_ReclaimsStale(t *testing.T) {
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+
+	// A lock whose deadline is already in the past is stale and reclaimable.
+	if _, err := acquireLoginLock(-time.Second); err != nil {
+		t.Fatalf("acquire (writes already-expired deadline): %v", err)
+	}
+	if release, err := acquireLoginLock(11 * time.Minute); err != nil {
+		t.Fatalf("expected stale lock to be reclaimed, got %v", err)
+	} else {
+		release()
+	}
+}
+
+// TestAuthLogin_Accepts201Created is the regression guard for the device-login
+// bug where the CLI required HTTP 200 on the approved /auth/device/token poll
+// but the GoFr BFF returns 201 Created — so the delivered session token was
+// discarded and every successful approval looked like "expired before approval".
+// The poll must accept the whole 2xx class.
+func TestAuthLogin_Accepts201Created(t *testing.T) {
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_NO_BROWSER", "1") // don't spawn a real browser
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/device/code", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated) // GoFr returns 201 for POST
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+			"device_code": "dvc_test", "user_code": "TEST-CODE",
+			"verification_uri_complete": "https://app.realmid.dev/device?user_code=TEST-CODE",
+			"expires_in":                600, "interval": 1,
+		}})
+	})
+	mux.HandleFunc("/auth/device/token", func(w http.ResponseWriter, _ *http.Request) {
+		// Approved — return the session token with 201 Created (the GoFr default
+		// that the old CLI mishandled).
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+			"session_token": "rsid_devicelogin", "realm_id": "r-1", "tenant_id": "t-1",
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	cfg := &Config{}
+	if rc := authLogin(cfg, "test-device"); rc != exitOK {
+		t.Fatalf("authLogin returned %d, want exitOK(%d) — 201 must be accepted", rc, exitOK)
+	}
+	if cfg.SessionToken != "rsid_devicelogin" {
+		t.Fatalf("session token not captured from 201 response: %q", cfg.SessionToken)
+	}
 }
