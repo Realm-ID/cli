@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -103,6 +104,41 @@ func TestAuthLogin_DeviceFlow(t *testing.T) {
 	}
 	if tokenPosts < 2 {
 		t.Fatalf("device/token posts = %d, want >=2 (pending then approved)", tokenPosts)
+	}
+}
+
+// TestAuthLogin_SupersededStops verifies that when a newer `auth login` claims
+// the active-login marker, an older poller stops on its next tick instead of
+// polling its abandoned code for the whole TTL (ADR-062 §2). The fake BFF
+// rewrites the marker to a different device_code on the first poll, simulating
+// a second login starting in another terminal.
+func TestAuthLogin_SupersededStops(t *testing.T) {
+	var polls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/device/code", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"device_code":"dvc_old","user_code":"WXYZ-1234",`+
+			`"verification_uri":"https://app.example/device","expires_in":60,"interval":1}}`)
+	})
+	mux.HandleFunc("/auth/device/token", func(w http.ResponseWriter, _ *http.Request) {
+		polls++
+		// A newer login starts: overwrite the shared marker.
+		if p, err := activeLoginPath(); err == nil {
+			_ = os.WriteFile(p, []byte("dvc_new"), 0o600)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"authorization_pending","message":"pending"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	if code := authLogin(&Config{}, "test-host"); code != exitErr {
+		t.Fatalf("authLogin exit = %d, want exitErr (%d) on supersession", code, exitErr)
+	}
+	if polls != 1 {
+		t.Fatalf("device/token polls = %d, want 1 (should stop on the tick after supersession)", polls)
 	}
 }
 

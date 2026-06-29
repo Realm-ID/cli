@@ -16,6 +16,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -175,6 +178,75 @@ func resolveDeviceName(args []string) string {
 	return "realm-id cli"
 }
 
+// openBrowser best-effort opens url in the user's default browser and reports
+// whether the launcher started. It deliberately never blocks or fails the
+// login: headless servers, SSH sessions and CI have no browser, and the
+// printed URL is always the fallback. Set REALM_ID_NO_BROWSER=1 to suppress
+// the launch entirely (the documented escape hatch for headless/agent runs).
+func openBrowser(url string) bool {
+	if envOr("REALM_ID_NO_BROWSER", "") != "" {
+		return false
+	}
+	// Only launch when attached to an interactive terminal. Headless/agent runs
+	// (ADR-062's non-interactive callers), CI, and piped output get the printed
+	// link instead of a stray browser process.
+	if fi, err := os.Stderr.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default: // linux, *bsd
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start() == nil
+}
+
+// claimActiveLogin records deviceCode as the active login. A subsequent
+// `auth login` overwrites the marker, which any older poller reads to learn it
+// was superseded. Best-effort: a write failure just means supersession won't be
+// detected, never that the login fails.
+func claimActiveLogin(deviceCode string) {
+	p, err := activeLoginPath()
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte(deviceCode), 0o600)
+}
+
+// activeLoginIs reports whether deviceCode is still the active login. A missing
+// or unreadable marker is treated as "still active" — we never abort a login
+// just because the marker can't be read.
+func activeLoginIs(deviceCode string) bool {
+	p, err := activeLoginPath()
+	if err != nil {
+		return true
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(string(b)) == deviceCode
+}
+
+// clearActiveLogin removes the marker iff it still names deviceCode, so a
+// finished login doesn't leave a stale marker that would falsely supersede the
+// next one. Best-effort.
+func clearActiveLogin(deviceCode string) {
+	if !activeLoginIs(deviceCode) {
+		return
+	}
+	if p, err := activeLoginPath(); err == nil {
+		_ = os.Remove(p)
+	}
+}
+
 func authLogin(cfg *Config, deviceName string) int {
 	bff := cfg.bffURL()
 	var dc deviceCodeResp
@@ -185,8 +257,23 @@ func authLogin(cfg *Config, deviceName string) int {
 	if err != nil || status >= 400 {
 		return fail(fmt.Errorf("starting device login failed (status %d): %v", status, err))
 	}
+	// The URL embeds THIS run's user_code; the page reads it from the query
+	// string so the user never has to type or match a code. Approving any other
+	// code (a stale browser tab, or a code typed in by hand) authorizes a
+	// different device record that nobody is polling — the #1 device-flow
+	// support footgun (ADR-062 §2). Best-effort auto-open lands the user on the
+	// exact link; the printed URL stays as the fallback.
 	fmt.Fprintf(os.Stderr, "To authorize this CLI, open:\n\n    %s\n\n", dc.VerificationURIComplete)
-	fmt.Fprintf(os.Stderr, "(or visit %s and enter code %s)\nWaiting for approval...\n", dc.VerificationURI, dc.UserCode)
+	if openBrowser(dc.VerificationURIComplete) {
+		fmt.Fprintln(os.Stderr, "(opened in your browser — approve the request shown there)")
+	} else {
+		fmt.Fprintf(os.Stderr, "(if it doesn't open, paste the link above — it already contains code %s)\n", dc.UserCode)
+	}
+	fmt.Fprintln(os.Stderr, "Waiting for approval...")
+
+	// Become the active login. Any older poller still running sees this and
+	// stops on its next tick, so only the newest code is being waited on.
+	claimActiveLogin(dc.DeviceCode)
 
 	interval := dc.Interval
 	if interval <= 0 {
@@ -195,6 +282,12 @@ func authLogin(cfg *Config, deviceName string) int {
 	deadline := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(time.Duration(interval) * time.Second)
+		// A newer `auth login` superseded us — stop rather than poll a code the
+		// user has abandoned (which would otherwise sit pending its whole TTL).
+		if !activeLoginIs(dc.DeviceCode) {
+			fmt.Fprintln(os.Stderr, "Superseded by a newer `realm-id auth login`; stopping this one.")
+			return exitErr
+		}
 		var tok deviceTokenResp
 		st, raw, _ := jsonRequest(http.MethodPost, bff+"/auth/device/token",
 			"", map[string]string{"device_code": dc.DeviceCode}, &tok)
@@ -204,6 +297,7 @@ func authLogin(cfg *Config, deviceName string) int {
 			if err := saveConfig(cfg); err != nil {
 				return fail(err)
 			}
+			clearActiveLogin(dc.DeviceCode)
 			fmt.Fprintln(os.Stderr, "Authorized. Credentials saved.")
 			selectTenantAfterLogin(cfg, tok)
 			return exitOK

@@ -59,6 +59,18 @@ func configPath() (string, error) {
 	return filepath.Join(dir, "realm-id", "config.json"), nil
 }
 
+// activeLoginPath is the marker file (next to config.json) naming the
+// device_code of the most recent `auth login`. A newer login overwrites it so
+// any still-running older poller detects it was superseded and stops, instead
+// of waiting out its full TTL on a code the user has moved on from (ADR-062 §2).
+func activeLoginPath() (string, error) {
+	p, err := configPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(p), "login.active"), nil
+}
+
 func loadConfig() (*Config, error) {
 	p, err := configPath()
 	if err != nil {

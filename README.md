@@ -4,7 +4,7 @@ The agent-first CLI for the [RealmID](https://realmid.dev) identity platform (AD
 
 gcloud-shaped, JSON-emitting, and driveable by humans **and** AI agents. `auth login`
 uses the OAuth 2.0 Device Authorization Grant (RFC 8628), so a terminal or agent
-authenticates by opening a link — no embedded browser.
+authenticates by opening a link in your system browser — no embedded browser.
 
 ## Install
 
@@ -77,9 +77,15 @@ rebuild. Mapping: REST resource → noun, method → verb (`list`/`describe`/`cr
   (e.g. platform- vs tenant-scoped `identity-providers list`), the broadest-scope
   variant wins; the narrower ones stay reachable via `realm-id api`.
 
+`auth login` opens the approval link in your default browser (best-effort, only on
+an interactive terminal) and prints it as a fallback; the link already carries the
+one-time code, so you never type or match a code. Re-running `auth login` supersedes
+any earlier run still waiting — the older poller stops on its next tick. Set
+`REALM_ID_NO_BROWSER=1` to suppress the auto-open (headless/agent/CI runs).
+
 Config lives at `~/.config/realm-id/config.json` (mode `0600`; it holds the session
 bearer). Overrides: `REALM_ID_BFF`, `REALM_ID_ISSUER`, `REALM_ID_API_KEY`,
-`REALM_ID_CONFIG`.
+`REALM_ID_CONFIG`, `REALM_ID_NO_BROWSER`.
 
 ## Status
 
