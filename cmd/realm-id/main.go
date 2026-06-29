@@ -116,7 +116,7 @@ func cmdAuth(args []string) int {
 	}
 	switch args[0] {
 	case "login":
-		return authLogin(cfg)
+		return authLogin(cfg, resolveDeviceName(args[1:]))
 	case "whoami":
 		return authWhoami(cfg)
 	case "logout":
@@ -153,10 +153,35 @@ type deviceTokenResp struct {
 	Tenants      []tenantInfo `json:"tenants"`
 }
 
-func authLogin(cfg *Config) int {
+// resolveDeviceName picks the label sent with a device login, in order:
+//   --device-name <value>, then $REALM_ID_DEVICE_NAME, then the OS hostname.
+// Falls back to "realm-id cli" when the hostname is unavailable. The label
+// helps a user tell this session apart in their session list (ADR-062).
+func resolveDeviceName(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--device-name" && i+1 < len(args) {
+			return args[i+1]
+		}
+		if v, ok := strings.CutPrefix(args[i], "--device-name="); ok {
+			return v
+		}
+	}
+	if v := envOr("REALM_ID_DEVICE_NAME", ""); v != "" {
+		return v
+	}
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "realm-id cli"
+}
+
+func authLogin(cfg *Config, deviceName string) int {
 	bff := cfg.bffURL()
 	var dc deviceCodeResp
-	status, _, err := jsonRequest(http.MethodPost, bff+"/auth/device/code", "", nil, &dc)
+	// Send a device label so this session is identifiable in the user's
+	// session list (ADR-062). Body is optional server-side.
+	body := map[string]string{"device_name": deviceName}
+	status, _, err := jsonRequest(http.MethodPost, bff+"/auth/device/code", "", body, &dc)
 	if err != nil || status >= 400 {
 		return fail(fmt.Errorf("starting device login failed (status %d): %v", status, err))
 	}

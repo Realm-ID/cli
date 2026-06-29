@@ -85,7 +85,7 @@ func TestAuthLogin_DeviceFlow(t *testing.T) {
 	t.Setenv("REALM_ID_BFF", srv.URL)
 
 	cfg := &Config{}
-	if code := authLogin(cfg); code != exitOK {
+	if code := authLogin(cfg, "test-host"); code != exitOK {
 		t.Fatalf("authLogin exit = %d, want exitOK (%d)", code, exitOK)
 	}
 	if cfg.SessionToken != "sess_xyz" {
@@ -125,7 +125,7 @@ func TestAuthLogin_AccessDenied(t *testing.T) {
 	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
 	t.Setenv("REALM_ID_BFF", srv.URL)
 
-	if code := authLogin(&Config{}); code != exitForbidden {
+	if code := authLogin(&Config{}, "test-host"); code != exitForbidden {
 		t.Fatalf("authLogin exit = %d, want exitForbidden (%d)", code, exitForbidden)
 	}
 }
@@ -166,7 +166,7 @@ func TestAuthLogin_SingleTenant_AutoPicks(t *testing.T) {
 	t.Setenv("REALM_ID_BFF", srv.URL)
 
 	cfg := &Config{}
-	if code := authLogin(cfg); code != exitOK {
+	if code := authLogin(cfg, "test-host"); code != exitOK {
 		t.Fatalf("authLogin exit = %d", code)
 	}
 	if *switched != "t-1" {
@@ -189,7 +189,7 @@ func TestAuthLogin_MultiTenant_ListsNoSwitch(t *testing.T) {
 	t.Setenv("REALM_ID_BFF", srv.URL)
 
 	cfg := &Config{}
-	if code := authLogin(cfg); code != exitOK {
+	if code := authLogin(cfg, "test-host"); code != exitOK {
 		t.Fatalf("authLogin exit = %d", code)
 	}
 	if *switched != "" {
@@ -212,7 +212,7 @@ func TestAuthLogin_Pinned_RecordsTenant(t *testing.T) {
 	t.Setenv("REALM_ID_BFF", srv.URL)
 
 	cfg := &Config{}
-	if code := authLogin(cfg); code != exitOK {
+	if code := authLogin(cfg, "test-host"); code != exitOK {
 		t.Fatalf("authLogin exit = %d", code)
 	}
 	if *switched != "" {
@@ -312,4 +312,29 @@ func TestConfigValueDefaults(t *testing.T) {
 	if configValue(c, "nope") != "" {
 		t.Fatal("unknown key should be empty")
 	}
+}
+
+func TestResolveDeviceName(t *testing.T) {
+	t.Run("flag wins (space form)", func(t *testing.T) {
+		if got := resolveDeviceName([]string{"--device-name", "fromflag"}); got != "fromflag" {
+			t.Fatalf("got %q", got)
+		}
+	})
+	t.Run("flag wins (equals form)", func(t *testing.T) {
+		if got := resolveDeviceName([]string{"--device-name=eqflag"}); got != "eqflag" {
+			t.Fatalf("got %q", got)
+		}
+	})
+	t.Run("env when no flag", func(t *testing.T) {
+		t.Setenv("REALM_ID_DEVICE_NAME", "fromenv")
+		if got := resolveDeviceName(nil); got != "fromenv" {
+			t.Fatalf("got %q", got)
+		}
+	})
+	t.Run("falls back to a non-empty default", func(t *testing.T) {
+		t.Setenv("REALM_ID_DEVICE_NAME", "")
+		if got := resolveDeviceName(nil); got == "" {
+			t.Fatal("expected hostname or fallback, got empty")
+		}
+	})
 }
