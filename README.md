@@ -44,6 +44,8 @@ realm-id config list                 # show the active configuration
 realm-id platforms list-mine
 realm-id roles list --platform plt_abc
 realm-id roles create --platform plt_abc --field name=editor --field description="Can edit"
+realm-id api-keys create --platform plt_abc --field label=provisioning   # mint
+realm-id api-keys delete --platform plt_abc --keyId key_123              # revoke (soft)
 realm-id users list --tenant ten_123 --status active
 realm-id users set-role --tenant ten_123 --uid usr_9 --field role:=\"owner\"
 realm-id tenants describe --tenant ten_123 --output table
@@ -82,6 +84,14 @@ an interactive terminal) and prints it as a fallback; the link already carries t
 one-time code, so you never type or match a code. Re-running `auth login` supersedes
 any earlier run still waiting — the older poller stops on its next tick. Set
 `REALM_ID_NO_BROWSER=1` to suppress the auto-open (headless/agent/CI runs).
+
+> **Provisioning runs:** the device-login session bearer is **short-lived**, so a
+> long multi-step provisioning sequence can outlive it (you'll start getting `401`
+> mid-run). Either re-run `auth login` when that happens, or for an unattended
+> provisioning run set `REALM_ID_API_KEY=rk_live_…` (Service mode, no session
+> expiry). Also avoid running `auth login` in **two terminals at once** — you may
+> approve one run's code while the *other* run's poller is the one you're watching,
+> which looks like a hang. One run, one code, poll until it mints.
 
 Config lives at `~/.config/realm-id/config.json` (mode `0600`; it holds the session
 bearer). Overrides: `REALM_ID_BFF`, `REALM_ID_ISSUER`, `REALM_ID_API_KEY`,
