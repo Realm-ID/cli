@@ -1,4 +1,4 @@
-module github.com/Realm-ID/cli
+module realmid.dev/cli
 
 go 1.23
 
