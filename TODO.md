@@ -46,3 +46,10 @@ underlying code fixes.
   reason on the device record and return it from `/auth/device/token`, then the
   CLI prints "approval failed: <reason>" instead of "expired before approval".
   Deferred (contract change) — mirror entry in `api/TODO.md`.
+
+## Chores
+
+- [ ] `cmd/realm-id/main.go` — pre-existing `gofmt -l` violation (doc-comment
+  list indentation on `resolveDeviceName` etc., a newer-Go gofmt reformat).
+  Not touched here (out of scope for the approval-failed test work); run
+  `gofmt -w cmd/realm-id/main.go` in a dedicated formatting pass.

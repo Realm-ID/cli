@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -165,6 +166,91 @@ func TestAuthLogin_AccessDenied(t *testing.T) {
 
 	if code := authLogin(&Config{}, "test-host"); code != exitForbidden {
 		t.Fatalf("authLogin exit = %d, want exitForbidden (%d)", code, exitForbidden)
+	}
+}
+
+// captureStderr redirects os.Stderr for the duration of fn and returns whatever
+// was written there — used to assert the user-facing failure message.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	fn()
+
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	return string(out)
+}
+
+// TestAuthLogin_ApprovalFailed exercises the poll loop's `default` branch: a
+// terminal approve-side error code (e.g. approval_needs_app) is surfaced with
+// its real message, not masqueraded as an "expired"/"timed out" failure.
+func TestAuthLogin_ApprovalFailed(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/device/code", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"device_code":"dvc_abc","user_code":"WXYZ-1234",`+
+			`"verification_uri":"https://app.example/device","expires_in":60,"interval":1}}`)
+	})
+	mux.HandleFunc("/auth/device/token", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"approval_needs_app",`+
+			`"message":"complete MFA/first-login setup in the app"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	var code int
+	out := captureStderr(t, func() { code = authLogin(&Config{}, "test-host") })
+
+	if code != exitErr {
+		t.Fatalf("authLogin exit = %d, want exitErr (%d) on approval failure", code, exitErr)
+	}
+	if !strings.Contains(out, "complete MFA/first-login setup in the app") {
+		t.Fatalf("stderr = %q, want the real approval-failure message", out)
+	}
+	if strings.Contains(out, "expired") || strings.Contains(out, "timed out") {
+		t.Fatalf("stderr = %q, approval failure must not masquerade as expired/timed out", out)
+	}
+}
+
+// TestAuthLogin_ApprovalFailed_EmptyMessage hits the `approval failed (<code>)`
+// fallback when the envelope carries a code but no human-readable message.
+func TestAuthLogin_ApprovalFailed_EmptyMessage(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/device/code", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"device_code":"dvc_abc","user_code":"WXYZ-1234",`+
+			`"verification_uri":"https://app.example/device","expires_in":60,"interval":1}}`)
+	})
+	mux.HandleFunc("/auth/device/token", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"login_failed","message":""}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	var code int
+	out := captureStderr(t, func() { code = authLogin(&Config{}, "test-host") })
+
+	if code != exitErr {
+		t.Fatalf("authLogin exit = %d, want exitErr (%d)", code, exitErr)
+	}
+	if !strings.Contains(out, "approval failed (login_failed)") {
+		t.Fatalf("stderr = %q, want the code-fallback message", out)
+	}
+	if strings.Contains(out, "expired") || strings.Contains(out, "timed out") {
+		t.Fatalf("stderr = %q, must not masquerade as expired/timed out", out)
 	}
 }
 
