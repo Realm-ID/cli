@@ -48,6 +48,12 @@ realm-id api-keys create --platform plt_abc --field label=provisioning   # mint
 realm-id api-keys delete --platform plt_abc --keyId key_123              # revoke (soft)
 realm-id users list --tenant ten_123 --status active
 realm-id users set-role --tenant ten_123 --uid usr_9 --field role:=\"owner\"
+
+# create an org — owner is REQUIRED (ADR-073 Amendment C; owner_user_id is NOT
+# NULL). Optionally bring your own tenant id + created_at for a verbatim import.
+realm-id tenants create --platform plt_abc \
+  --field display_name=Acme \
+  --field owner:='{"email":"boss@acme.com","display_name":"Boss"}'
 realm-id tenants describe --tenant ten_123 --output table
 
 realm-id <resource>              # list a resource's verbs

@@ -8,6 +8,16 @@ info:
     mirrors it. Schema source of truth is
     `api/internal/migrations/migrations.go` (ADR-030).
 
+    Response-status convention (ADR-069): a **uniform `200` `{data:...}`
+    envelope**. Every endpoint returns `200` on success — including all
+    DELETEs, which carry a `{status:...}` body — EXCEPT genuine
+    resource-creation POSTs, which return `201 Created` (enumerated below:
+    `POST /platforms`, `/identity-providers`, `/sources` (ADR-072),
+    `/platforms/{id}/{api-keys,roles,origins,federation-bindings}`,
+    `/platforms/{pid}/tenants`, `/tenants/{id}/invitations`, tenant-scoped
+    invitations, and `/tenants/{id}/service-accounts` (ADR-071)). Clients
+    should accept the whole `2xx` class; the RealmID SDKs already do.
+
     Retired in this release (returned 404):
     `/auth/select-tenant`, `/auth/token/switch`, `/auth/user-token`,
     `/auth/cross-platform-token`, and the `choice_token` machinery.
@@ -23,10 +33,10 @@ info:
     `POST /auth/token`**. `POST /auth/service-token` and
     `POST /auth/platform-token` are deleted (hard cut, no aliases).
     `/auth/login` now takes a `grant_type`-discriminated body with
-    five grants (`provider_token`, `password`, `otp_internal`,
-    `api_key`, `platform_api_key`) and the legacy `method` field
-    survives one release as a deprecated alias for the user grants
-    (sunset 2026-08-01). All issued tokens carry an explicit
+    five grants (`provider_token`, `password`, `otp`,
+    `api_key`, `platform_api_key`). The legacy `method` field was a
+    one-release deprecated alias for the user grants and is **removed**
+    at its announced sunset (2026-08-01). All issued tokens carry an explicit
     `subject_type ∈ {user, service, platform}`. Two new realm-config
     keys, `service_refresh_rotates` and `platform_refresh_rotates`
     (both default `false`), opt service / platform refresh tokens
@@ -36,7 +46,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.14.0
+  version: 0.15.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -119,7 +129,22 @@ components:
       type: object
       required: [code, message]
       description: |
-        Standard error envelope. `code` is a stable machine-readable
+        Standard error envelope. **Wire shape note (applies to every
+        error response in this spec):** GoFr nests the handler's error
+        object under a top-level `"error"` key, and the human-readable
+        text travels in a field named `"error"` — NOT `"message"`
+        (`apiErr.Response()` in `internal/httpapi/types.go`). The actual
+        bytes on the wire are:
+
+            {"error": {"code": "<slug>", "error": "<human text>"}}
+
+        The `message` property below is the *logical* hint field; read it
+        from `error.error` when consuming raw HTTP. Extra sibling fields
+        (e.g. the 412 precondition envelopes' `mfa_challenge_token`,
+        `revocation_token`, `active_sessions`, `tenant_id`) are nested
+        under the same top-level `"error"` object.
+
+        `code` is a stable machine-readable
         slug; `message` is a human-readable hint. Common 401 codes
         emitted by the auth surface:
 
@@ -141,7 +166,8 @@ components:
           `/auth/login` (`api_key` vs `platform_api_key`) doesn't
           match the api-key's class (ADR-051).
         - `user_not_invited` — known user but not a member of any
-          tenant in the resolved realm.
+          tenant in the resolved realm. (Returned as **403**, not 401 —
+          listed here for discoverability.)
         - `refresh_invalid` — on `POST /auth/token` only: the presented
           refresh token is expired, revoked, or reuse-detected. Terminal
           for the caller — re-authentication is required (no retry helps).
@@ -183,6 +209,13 @@ components:
       properties:
         id: { type: string, format: uuid }
         origin: { type: string }
+        device_name:
+          type: string
+          description: >
+            Human-readable label for the device that created this session
+            (e.g. a CLI hostname), supplied at login via the `X-Device-Name`
+            header. Omitted when the session carries no label. Lets a user
+            tell sessions apart when revoking (ADR-062).
         created_at: { type: integer, format: int64 }
         last_seen_at: { type: integer, format: int64 }
 
@@ -227,8 +260,22 @@ components:
       properties:
         tenant_id: { type: string, format: uuid }
         display_name: { type: string }
-        role: { type: string, enum: [owner, member] }
+        role:
+          type: string
+          description: |
+            The user's role in this tenant. Any name from the realm's
+            role catalog (`GET /platforms/{id}/roles`): the system roles
+            `owner` / `admin` / `member` / `viewer` / `platform_api`, or
+            a platform-defined custom role (ADR-040). Not a closed enum.
         mfa_required: { type: boolean }
+        mfa_methods:
+          type: array
+          items: { type: string, enum: [totp, otp] }
+          description: |
+            The MFA methods this membership must satisfy (union of the
+            user's enrollment and the role/realm requirements —
+            `computeMFAMethods`, ADR-059/075). Empty/omitted when no
+            method-specific requirement applies.
 
     LoginRequest:
       type: object
@@ -242,7 +289,7 @@ components:
         Inbound bearer rules (the handler dispatches on `grant_type`
         before applying any bearer gate):
 
-        - `provider_token`, `password`, `otp_internal` — **user
+        - `provider_token`, `password`, `otp` — **user
           grants**. Require `Authorization: Bearer <platform access
           token>` (the realm's BFF / partner-backend gate, ADR-041 +
           ADR-047). Realm is resolved from the bearer's `realm_id`
@@ -253,21 +300,25 @@ components:
           the declared `grant_type`; mismatch → 401
           `key_class_mismatch`.
 
-        Legacy `method` field: accepted as a deprecated alias for
-        `grant_type` for the user-facing grants only (`google` →
-        `provider_token` with `provider:"google"`, `firebase_phone` →
-        `provider_token` with `provider:"firebase_phone"`,
-        `password` → `password`, `otp_internal` → `otp_internal`).
-        Removed in `v0.8.0`; `Sunset: 2026-08-01`.
+        The legacy `method` selector (pre-ADR-051) is **removed** at
+        its announced `Sunset: 2026-08-01`. A body carrying only
+        `method` now 400s `missing_grant_type`; send `grant_type`
+        (+ `provider` for `provider_token`). `grant_type=password` is
+        reserved and unconditionally 400s `unknown_method`
+        (ADR-042 slot).
 
         ADR-046 (still applies under `provider_token`/`google`):
-        `tenant_id` is required so the verifier can pick the tenant's
-        per-tenant Google `client_id`s (plus the platform-default
-        list) to validate `aud`.
+        `tenant_id` is required on tenant-scoped origins so the
+        verifier can pick the tenant's per-tenant `client_id`s (plus
+        the platform-default list) to validate `aud`. On realm-root
+        origins (e.g. `app.realmid.dev` or a platform's admin
+        console apex) discovery returns `tenant_id: null` and the
+        field is OPTIONAL — realm-scoped `identity_providers`
+        client_ids gate the sign-in instead (issuer v0.27.2).
       oneOf:
         - $ref: '#/components/schemas/LoginRequestProviderToken'
         - $ref: '#/components/schemas/LoginRequestPassword'
-        - $ref: '#/components/schemas/LoginRequestOTPInternal'
+        - $ref: '#/components/schemas/LoginRequestOTP'
         - $ref: '#/components/schemas/LoginRequestAPIKey'
         - $ref: '#/components/schemas/LoginRequestPlatformAPIKey'
         - $ref: '#/components/schemas/LoginRequestTokenExchange'
@@ -276,31 +327,14 @@ components:
         mapping:
           provider_token:    '#/components/schemas/LoginRequestProviderToken'
           password:          '#/components/schemas/LoginRequestPassword'
-          otp_internal:      '#/components/schemas/LoginRequestOTPInternal'
+          otp:               '#/components/schemas/LoginRequestOTP'
           api_key:           '#/components/schemas/LoginRequestAPIKey'
           platform_api_key:  '#/components/schemas/LoginRequestPlatformAPIKey'
           urn:ietf:params:oauth:grant-type:token-exchange: '#/components/schemas/LoginRequestTokenExchange'
       properties:
         grant_type:
           type: string
-          enum: [provider_token, password, otp_internal, api_key, platform_api_key, 'urn:ietf:params:oauth:grant-type:token-exchange']
-        method:
-          type: string
-          deprecated: true
-          x-deprecated: true
-          x-sunset: '2026-08-01'
-          description: |
-            DEPRECATED (one-release alias for the user-grant subset
-            of `grant_type`). Removed in v0.8.0. New integrations
-            must send `grant_type`. Mapping:
-            `google` → `provider_token` (provider:"google"),
-            `firebase_phone` → `provider_token` (provider:"firebase_phone"),
-            `password` → `password`,
-            `otp_internal` → `otp_internal`. The api-key grants
-            (`api_key`, `platform_api_key`) have no `method` alias —
-            the legacy URLs (`/auth/service-token`,
-            `/auth/platform-token`) are gone in v0.7.0 with no alias.
-          enum: [google, firebase_phone, password, otp_internal]
+          enum: [provider_token, password, otp, api_key, platform_api_key, 'urn:ietf:params:oauth:grant-type:token-exchange']
         custom_claims:
           type: object
           additionalProperties: true
@@ -322,12 +356,21 @@ components:
         grant_type: { type: string, enum: [provider_token] }
         provider:
           type: string
-          enum: [google, firebase_phone, apple, microsoft, github]
+          enum: [google, firebase, firebase_phone, microsoft, apple, facebook, github]
           description: |
-            v1 ships `google` and `firebase_phone`. `apple`,
-            `microsoft`, `github` are listed as post-v1 providers;
-            the enum is kept wide so the schema documents the
-            forward roadmap.
+            `google`, `firebase`, `microsoft`, `apple`, and `facebook`
+            have working direct OIDC verifiers. `firebase_phone` is a
+            legacy alias for the Firebase verifier. `facebook` accepts
+            only the OIDC ID-token ("Limited Login") flavor — the classic
+            access token is not supported (it needs an app secret RealmID
+            does not store). `github` is post-v1 and listed so the schema
+            documents the forward roadmap. The accepted `aud` (client_id;
+            for `apple` the Services ID, for `facebook` the app id) is
+            resolved per realm/tenant from identity_providers; for
+            `firebase` the configured value is the Firebase project id.
+            `tenant_id` is optional for every provider on a realm-root
+            origin (e.g. app.realmid.dev or a partner admin console),
+            where realm-scoped client_ids gate sign-in with no tenant pin.
         token:
           type: string
           description: The provider-issued id-token to exchange.
@@ -335,8 +378,11 @@ components:
           type: string
           format: uuid
           description: |
-            Required for `provider:"google"` (ADR-046); optional
-            otherwise. When set, the response is single-tenant and
+            Optional. Pins membership resolution to one tenant; required
+            only when a partner end-user origin resolves to a specific
+            tenant and the response must be single-tenant. On a realm-root
+            origin it is absent — realm-scoped client_ids gate sign-in
+            (v0.27.2; ADR-046). When set, the response is single-tenant and
             an access token is minted on the first call.
         custom_claims:
           type: object
@@ -351,8 +397,13 @@ components:
       type: object
       required: [grant_type, identifier, presented]
       description: |
-        Native username/password login (ADR-042 native u/p schema
-        slot). Inbound bearer: platform access JWT.
+        **Reserved, not implemented.** `grant_type=password` is the
+        ADR-042 native u/p schema slot: the grant name is recognised on
+        the wire, but there is no native password verifier — the handler
+        **unconditionally returns `400 unknown_method`**
+        ("grant_type=password not enabled"). The field shapes below are
+        the reserved contract for when it ships. Inbound bearer:
+        platform access JWT.
       properties:
         grant_type: { type: string, enum: [password] }
         identifier:
@@ -381,31 +432,37 @@ components:
         identifier: alice@example.com
         presented: hunter2
 
-    LoginRequestOTPInternal:
+    LoginRequestOTP:
       type: object
       required: [grant_type, identifier, presented]
       description: |
-        Single-factor OTP login (the partner-OTP primitive — manager
-        hands SA an OTP, SA types phone + OTP). Gated by
-        `realms.config.otp_login_enabled`. Inbound bearer: platform
-        access JWT.
+        OTP login (ADR-071; direct cutover from the former
+        `otp` grant). Under ADR-071 this authenticates a
+        **service account** (`users.kind=service`) via a `view_bff` OTP
+        an owner/admin minted for it (`POST /auth/otp/issue`
+        `purpose=login`). The `kind × mode` gate rejects a `kind=human`
+        subject here (humans elevate via TOTP, never an owner-minted OTP)
+        — failure collapses to `invalid_credentials` (no enumeration).
+        Gated by `realms.config.otp_login_enabled`. Inbound bearer:
+        platform access JWT.
       properties:
-        grant_type: { type: string, enum: [otp_internal] }
+        grant_type: { type: string, enum: [otp] }
         identifier:
           type: string
           description: |
-            E.164 phone or email. Resolved against the realm's user
-            lookup. Failure → `invalid_credentials` (no enumeration).
+            The service account's login handle (email/phone). Resolved
+            against the realm's user lookup. Failure → `invalid_credentials`
+            (no enumeration).
         presented:
           type: string
-          description: The OTP value the manager handed to the SA.
+          description: The OTP value minted for the service account.
         tenant_id:
           type: string
           format: uuid
           description: Optional tenant pin (same semantics as `password`).
       example:
-        grant_type: otp_internal
-        identifier: '+15551234567'
+        grant_type: otp
+        identifier: 'sync-bot@dealer-a.example'
         presented: '038412'
 
     LoginRequestAPIKey:
@@ -436,7 +493,7 @@ components:
         `key_class_mismatch`. The platform access token returned
         here is what callers present as the inbound bearer for
         the user-facing grants (`provider_token`, `password`,
-        `otp_internal`).
+        `otp`).
       properties:
         grant_type: { type: string, enum: [platform_api_key] }
         api_key:
@@ -478,40 +535,88 @@ components:
 
     LoginResponse:
       description: |
-        `/auth/login` response. Three success shapes plus the MFA
-        precondition. The shape is selected by `subject_type` and,
-        for users, by tenant cardinality + MFA state:
+        `/auth/login` response. Three success shapes. The shape is
+        selected by `subject_type` and, for users, by tenant
+        cardinality + MFA state:
 
         1. **User, fully resolved** (`subject_type:"user"`,
            single-tenant, no MFA pending): refresh + access +
-           tenant_id + role + expires_in + tenants[].
-        2. **User, multi-tenant** (`subject_type:"user"`): refresh
-           + tenants[]; caller picks a tenant via `POST /auth/token`.
-           No access_token / tenant_id / role / expires_in.
-        3. **Service or platform** (`subject_type:"service"` |
-           `"platform"`): refresh + access + expires_in. No
-           tenants[], no tenant_id, no role — the session is
-           pinned to the api-key's bot user / admin tenant.
-        4. **MFA required** — `status:"mfa_required"`, no refresh
-           until `/auth/mfa/verify` succeeds. Shape unchanged.
+           tenant_id + role + expires_in + tenants[] + user.
+        2. **User, multi-tenant OR MFA pending**
+           (`subject_type:"user"`): refresh + tenants[] + user;
+           caller picks a tenant via `POST /auth/token`. No
+           access_token / tenant_id / role / expires_in.
+        3. **Api-key grants** (`subject_type:"service"` |
+           `"platform"` via `grant_type=api_key` /
+           `platform_api_key`): refresh + access + expires_in +
+           `"tenants": []` (present but always empty). No tenant_id,
+           no role — the session is pinned to the api-key's bot
+           user / admin tenant. NOTE: a **service-account OTP login**
+           (`grant_type=otp` resolving a `kind=service` user,
+           ADR-071) is *user-shaped*: it returns
+           `subject_type:"service"` **with** tenants[] / tenant_id /
+           role / user — shapes 1/2 with `subject_type:"service"`.
+
+        **MFA is NOT signalled here.** There is no
+        `status:"mfa_required"` login shape — every successful
+        credential exchange returns `status:"ok"` **including a
+        refresh token** even when MFA is still pending. An
+        MFA-requiring membership is flagged per-tenant via
+        `tenants[].mfa_required` (which suppresses the shape-1
+        access-token fast path), and the `412 mfa_required`
+        precondition (`PreconditionMFA`) is raised later, on the
+        `POST /auth/token` tenant mint.
       oneOf:
         - $ref: '#/components/schemas/LoginResponseUserResolved'
         - $ref: '#/components/schemas/LoginResponseUserMultiTenant'
         - $ref: '#/components/schemas/LoginResponseM2M'
-        - $ref: '#/components/schemas/PreconditionMFA'
 
     LoginResponseUserResolved:
       type: object
       required: [status, subject_type, refresh_token, access_token, tenant_id, role, expires_in, tenants]
-      description: Single-tenant user, no MFA pending — fully resolved on the first call.
+      description: |
+        Single-tenant user, no MFA pending — fully resolved on the first
+        call. `subject_type` is `service` (not `user`) when the resolved
+        subject is a `kind=service` account (`grant_type=otp`, ADR-071).
       properties:
         status: { type: string, enum: [ok] }
-        subject_type: { type: string, enum: [user] }
+        subject_type: { type: string, enum: [user, service] }
+        user:
+          type: object
+          required: [id]
+          properties:
+            id: { type: string, format: uuid }
+          description: |
+            The resolved subject's user id. Present on every user-grant
+            login (even when no access token is minted) so a BFF can
+            resolve the user without decoding the JWT `sub`. Omitted on
+            api-key (M2M) grants.
         refresh_token: { type: string }
         access_token: { type: string }
         tenant_id: { type: string, format: uuid }
         role: { type: string }
         expires_in: { type: integer, format: int64 }
+        refresh_exp:
+          type: integer
+          format: int64
+          description: >
+            Absolute wall-clock expiry (unix seconds) of the refresh token —
+            the min of the rolling refresh TTL, the ADR-054 scheduled cutoff,
+            and the ADR-058 absolute session cap. Distinct from `expires_in`
+            (the access-token lifetime, in seconds). Optional and
+            forward-compatible: absent on pre-refresh_exp issuers, so a
+            consumer sizing a session from it must fall back to its own ceiling
+            when absent/zero.
+        idle_ttl:
+          type: integer
+          format: int64
+          description: >
+            Realm-configured idle (inactivity) session timeout, in seconds —
+            a sliding-window DURATION (resets on each request), NOT an absolute
+            expiry (ADR-070). The BFF force-logs-out a session idle for longer
+            than this; the issuer only reports the value. Absent / 0 = idle
+            timeout disabled for this realm (the default). Sourced straight
+            from `realms.config.idle_ttl_seconds` with no min-of-three compute.
         tenants:
           type: array
           items: { $ref: '#/components/schemas/TenantMembership' }
@@ -523,6 +628,10 @@ components:
         tenant_id: 018f0c9f-2c1f-7c6c-9a0b-3a8b1d4c2f00
         role: owner
         expires_in: 900
+        refresh_exp: 1782043200
+        idle_ttl: 1800
+        user:
+          id: 018f0c9f-2c1f-7c6c-9a0b-3a8b1d4c2f99
         tenants:
           - tenant_id: 018f0c9f-2c1f-7c6c-9a0b-3a8b1d4c2f00
             display_name: Acme Inc
@@ -533,11 +642,20 @@ components:
       type: object
       required: [status, subject_type, refresh_token, tenants]
       description: |
-        Multi-tenant user — caller must pick a tenant and call
-        `/auth/token` with the refresh + `tenant_id`.
+        Multi-tenant user — or a single-tenant user whose membership has
+        `mfa_required:true` (the access-token fast path is suppressed).
+        Caller must pick a tenant and call `/auth/token` with the
+        refresh + `tenant_id` (which raises `412 mfa_required` when MFA
+        is still unsatisfied for that tenant).
       properties:
         status: { type: string, enum: [ok] }
-        subject_type: { type: string, enum: [user] }
+        subject_type: { type: string, enum: [user, service] }
+        user:
+          type: object
+          required: [id]
+          properties:
+            id: { type: string, format: uuid }
+          description: The resolved subject's user id (see LoginResponseUserResolved.user).
         refresh_token: { type: string }
         tenants:
           type: array
@@ -558,11 +676,14 @@ components:
 
     LoginResponseM2M:
       type: object
-      required: [status, subject_type, refresh_token, access_token, expires_in]
+      required: [status, subject_type, refresh_token, access_token, expires_in, tenants]
       description: |
-        Service or platform login — pinned to the api-key's bot
-        user + admin tenant. No `tenants[]`, `tenant_id`, or
-        `role` (those are user concepts).
+        Api-key (M2M) login — pinned to the api-key's bot user + admin
+        tenant. `tenants` is present but **always `[]`** on this shape;
+        `tenant_id` / `role` / `user` are omitted (those are user
+        concepts). Emitted by `grant_type=api_key` / `platform_api_key`
+        only — a service-account **OTP** login is user-shaped (see
+        `LoginResponse` shape 3 note).
       properties:
         status: { type: string, enum: [ok] }
         subject_type:
@@ -571,12 +692,31 @@ components:
         refresh_token: { type: string }
         access_token: { type: string }
         expires_in: { type: integer, format: int64 }
+        tenants:
+          type: array
+          maxItems: 0
+          items: { $ref: '#/components/schemas/TenantMembership' }
+          description: Always the empty array on api-key grants.
+        refresh_exp:
+          type: integer
+          format: int64
+          description: >
+            Absolute refresh-token expiry (unix seconds); see
+            LoginResponseUserResolved.refresh_exp. Optional.
+        idle_ttl:
+          type: integer
+          format: int64
+          description: >
+            Realm idle-timeout duration (seconds); see
+            LoginResponseUserResolved.idle_ttl. Absent / 0 = disabled. Optional.
       example:
         status: ok
         subject_type: platform
         refresh_token: rt_...
         access_token: eyJhbGciOi...
         expires_in: 300
+        refresh_exp: 1782043200
+        tenants: []
 
     TokenRequest:
       type: object
@@ -624,6 +764,20 @@ components:
         access_token: { type: string }
         refresh_token: { type: string }
         expires_in: { type: integer, format: int64 }
+        refresh_exp:
+          type: integer
+          format: int64
+          description: >
+            Absolute expiry (unix seconds) of the rotated refresh token (or,
+            when rotation is off for a service/platform refresh, of the
+            unchanged echoed token); see
+            LoginResponseUserResolved.refresh_exp. Optional.
+        idle_ttl:
+          type: integer
+          format: int64
+          description: >
+            Realm idle-timeout duration (seconds); see
+            LoginResponseUserResolved.idle_ttl. Absent / 0 = disabled. Optional.
         tenant_id:
           type: string
           format: uuid
@@ -637,6 +791,8 @@ components:
         access_token: eyJhbGciOi...
         refresh_token: rt_...
         expires_in: 900
+        refresh_exp: 1782043200
+        idle_ttl: 1800
         tenant_id: 018f0c9f-2c1f-7c6c-9a0b-3a8b1d4c2f00
         role: owner
 
@@ -648,13 +804,13 @@ components:
         code: { type: string }
         method:
           type: string
-          enum: [totp, otp_internal]
+          enum: [totp, otp]
           description: |
             Which MFA method this verify is completing. Defaults to
-            `totp` for backward compatibility. Set `otp_internal` to
+            `totp` for backward compatibility. Set `otp` to
             consume an OTP minted via `POST /auth/otp/issue`
             (gated by `realms.config.otp_mfa_enabled` and per-user /
-            per-role enrollment in `otp_internal`). The first-factor
+            per-role enrollment in `otp`). The first-factor
             login response's `methods[]` lists which values are valid
             here for the current challenge.
 
@@ -672,6 +828,18 @@ components:
         access_token: { type: string }
         refresh_token: { type: string }
         expires_in: { type: integer, format: int64 }
+        refresh_exp:
+          type: integer
+          format: int64
+          description: >
+            Absolute expiry (unix seconds) of the rotated refresh token; see
+            LoginResponseUserResolved.refresh_exp. Optional.
+        idle_ttl:
+          type: integer
+          format: int64
+          description: >
+            Realm idle-timeout duration (seconds); see
+            LoginResponseUserResolved.idle_ttl. Absent / 0 = disabled. Optional.
         tenant_id: { type: string, format: uuid }
         role: { type: string }
         mfa_at:
@@ -706,13 +874,34 @@ components:
           description: |
             Opaque tenant-scoped key the OTP gates. Conventionally
             `"user:<uuid>"`, `"booking:<uuid>"`, `"payout:<uuid>"`,
-            etc. RealmID does not interpret the prefix.
+            etc. RealmID does not interpret the prefix — EXCEPT for
+            `purpose: "login"` (ADR-071 §5), where the server re-derives
+            a canonical `"user:<service-account-id>"` from the validated
+            target and ignores any caller-supplied value (a login OTP is
+            a become-the-subject credential and is never minted from an
+            untrusted subject_ref).
         purpose:
           type: string
           description: |
             Opaque tenant-scoped purpose label. Examples: `"login"`,
             `"delivery"`, `"payout_approval"`. Pattern
-            `^[a-z][a-z0-9_]{0,63}$`.
+            `^[a-z][a-z0-9_]{0,63}$`. `purpose: "login"` is the
+            **mint-gate** (ADR-071 §5): the effective caller must be
+            owner/admin of the tenant and the target `subject_ref` must
+            reference a `kind=service` account in that tenant — else
+            `403`. Other purposes keep the open-to-any-tenant-member
+            behavior of the partner OTP primitive.
+        delivery_mode:
+          type: string
+          enum: [view_bff]
+          default: view_bff
+          description: |
+            Mint transport (ADR-071 §4). **v1 ships `view_bff` only**
+            (default when omitted): the plaintext code is returned to
+            the authorized caller in the response `value` and relayed
+            out-of-band. RI-delivered modes (`sms`/`whatsapp`/`email`)
+            are deferred behind the credential-custodian/KMS work and
+            currently return `400 unsupported_delivery_mode`.
 
     OTPIssueResponse:
       type: object
@@ -829,11 +1018,18 @@ components:
         entity_id: { type: string, format: uuid }
         provider:
           type: string
-          enum: [google, microsoft, facebook, apple]
+          enum: [google, microsoft, firebase, facebook, apple]
         client_type:
           type: string
           enum: [web, ios, android, desktop, other]
         client_id: { type: string }
+        app_id:
+          type: string
+          format: uuid
+          description: |
+            The `sources.id` this registration is bound to (ADR-072 §1 /
+            § Amendment, app-first registration). Omitted/empty =
+            legacy/unrestricted row.
         allowed_origins:
           type: array
           items: { type: string }
@@ -842,6 +1038,15 @@ components:
             (400) when `client_type` is non-web. Each entry must parse
             as a URL with scheme + host.
         comments: { type: string }
+        config:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Provider-specific PUBLIC config (e.g. the Firebase web
+            config: `apiKey`, `authDomain`, `projectId`, `appId`).
+            Echoed verbatim on discovery so a browser SDK can bootstrap
+            sign-in with no app-side config. All values are publishable —
+            never store secrets here. Omitted when empty.
         enabled: { type: boolean }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
@@ -867,28 +1072,60 @@ components:
             When set, the tenant must belong to `platform_id`.
         provider:
           type: string
-          enum: [google, microsoft, facebook, apple]
+          enum: [google, microsoft, firebase, facebook, apple]
         client_type:
           type: string
           enum: [web, ios, android, desktop, other]
         client_id: { type: string }
+        app_id:
+          type: string
+          format: uuid
+          description: |
+            Optional: bind this registration to a human app/source
+            (ADR-072 § Amendment). Must reference a source in the same
+            platform (400 `app_not_found` / `app_platform_mismatch`) of
+            a human type (400 `app_kind_mismatch` for a bot source).
+            Empty/omitted = legacy/unrestricted.
         allowed_origins:
           type: array
           items: { type: string }
         comments: { type: string }
+        config:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Provider-specific PUBLIC config (e.g. the Firebase web
+            config: `apiKey`, `authDomain`, `projectId`, `appId`).
+            Echoed verbatim on discovery. All values are publishable —
+            never store secrets here.
 
     PatchIdentityProviderRequest:
       type: object
       description: |
-        At least one of `enabled`, `client_id`, `allowed_origins`,
-        `comments` must be supplied.
+        Sparse update. At least one of `enabled`, `client_id`,
+        `allowed_origins`, `comments`, `config`, `app_id` must be
+        supplied. Supplying `config` replaces the whole config map.
       properties:
         enabled: { type: boolean }
         client_id: { type: string }
+        app_id:
+          type: string
+          format: uuid
+          description: |
+            Re-bind (or, with `""`, clear) the row's app binding
+            (ADR-072 § Amendment). Omitted = leave unchanged. A non-empty
+            value is validated like create (400 `app_not_found` /
+            `app_platform_mismatch` / `app_kind_mismatch`).
         allowed_origins:
           type: array
           items: { type: string }
         comments: { type: string }
+        config:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Provider-specific PUBLIC config. Replaces the stored map
+            wholesale (not merged). Publishable values only.
 
     PublicIdentityProvider:
       type: object
@@ -896,11 +1133,18 @@ components:
       properties:
         type:
           type: string
-          enum: [google, microsoft, facebook, apple]
+          enum: [google, microsoft, firebase, facebook, apple]
         client_type:
           type: string
           enum: [web, ios, android, desktop, other]
         client_id: { type: string }
+        config:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Provider-specific PUBLIC config (e.g. the Firebase web
+            config). Present only when non-empty; lets a browser SDK
+            bootstrap sign-in with no app-side config.
 
     PublicIdentityProviderResponse:
       type: object
@@ -923,8 +1167,21 @@ components:
       properties:
         domain: { type: string }
         status: { type: string, enum: [pending, verified] }
-        dns_record_name: { type: string, example: _realmid-challenge.automahn.com }
+        dns_record_name: { type: string, example: _realmid-verification.automahn.com }
         dns_record_value: { type: string }
+
+    PendingDomain:
+      type: object
+      description: |
+        A pending domain claim as listed by `GET /domains/pending` — the
+        claim response shape plus created/expiry timestamps (unix seconds).
+      properties:
+        domain: { type: string }
+        status: { type: string, enum: [pending] }
+        dns_record_name: { type: string, example: _realmid-verification.automahn.com }
+        dns_record_value: { type: string }
+        created_at: { type: integer, format: int64 }
+        expires_at: { type: integer, format: int64 }
 
     VerifyDomainRequest:
       type: object
@@ -932,12 +1189,98 @@ components:
       properties:
         domain: { type: string }
 
+    ImportUsersRequest:
+      type: object
+      required: [users]
+      properties:
+        users:
+          type: array
+          maxItems: 1000
+          items: { $ref: '#/components/schemas/ImportUserRow' }
+    ImportUserRow:
+      type: object
+      required: [role]
+      description: At least one of `email`/`phone` is required.
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: |
+            Optional. When present it becomes `users.id` (bring-your-own,
+            reconciles if it already exists in THIS tenant, rejects the file if
+            it exists in another). When absent a UUIDv7 is minted and returned.
+        email: { type: string }
+        phone: { type: string, description: E.164 (leading '+') }
+        role:
+          type: string
+          description: Validated against the realm catalog; `owner`/`platform_api` rejected.
+        display_name: { type: string }
+        provider:
+          type: string
+          enum: [google, microsoft, apple, facebook, firebase]
+          description: With `provider_uid`, writes an exact first-SSO binding.
+        provider_uid: { type: string }
+        created_at:
+          type: string
+          format: date-time
+          description: |
+            Optional RFC3339 "member since" timestamp (ADR-073 C.4); absent ⇒
+            import-time. `invalid_created_at` on a malformed value.
+    InlineOwner:
+      type: object
+      description: |
+        Seats a tenant's owner inline at create (ADR-073 Amendment C.2). At
+        least one of `email`/`phone` is required. There is deliberately NO
+        `role` — the owner is provisioned with the dormant `member` role
+        (ADR-076: ownership is the `owner_user_id` pointer, not the role name);
+        the owner's real app-role, if any, arrives via the roster import that
+        reuses the same `user_id`.
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: Optional bring-your-own owner id; absent ⇒ minted.
+        email: { type: string }
+        phone: { type: string, description: E.164 (leading '+') }
+        display_name: { type: string }
+        provider:
+          type: string
+          enum: [google, microsoft, apple, facebook, firebase]
+          description: With `provider_uid`, writes the owner's exact first-SSO binding.
+        provider_uid: { type: string }
+    ImportUsersResponse:
+      type: object
+      properties:
+        committed:
+          type: boolean
+          description: false → validation rejected the file; nothing was written.
+        imported: { type: integer }
+        updated: { type: integer }
+        failed: { type: integer }
+        rows:
+          type: array
+          items:
+            type: object
+            properties:
+              line: { type: integer, description: 1-based row index }
+              user_id: { type: string, description: bring-your-own or minted-and-returned }
+              identifier: { type: string }
+              status: { type: string, enum: [created, updated, failed, ok] }
+              error: { type: string }
+              error_hint: { type: string }
+
     CreatePlatformRequest:
       type: object
-      required: [display_name, domain, slug]
+      required: [display_name, slug]
       properties:
         display_name: { type: string }
-        domain: { type: string }
+        domain:
+          type: string
+          description: |
+            Optional custom apex (ADR-073 Release A). Omit to create a
+            domainless platform whose routing domain is
+            `<slug>.realmid.dev`. When supplied it must be a caller-owned
+            verified domain (`412 domain_not_verified` otherwise).
         slug:
           type: string
           description: |
@@ -991,7 +1334,6 @@ components:
         allowed_domains:
           type: array
           items: { type: string }
-        custom_domain: { type: string }
         status: { type: string, enum: [active, suspended, deactivated] }
         config:
           $ref: '#/components/schemas/TenantConfig'
@@ -1004,6 +1346,30 @@ components:
             admin UIs avoid an N+1 fan-out; omitted on single-tenant
             fetches. `null` when no owner is seated yet (e.g., a freshly
             minted admin tenant before the invite is accepted).
+        users_count:
+          type: integer
+          description: |
+            Dashboard rollup column. The tenant's FULL roster size — every
+            `users` row in the tenant regardless of `status` (active, invited,
+            suspended, deactivated) or `kind` (human, service), so it matches
+            the count the org's own Users page shows.
+
+            Populated ONLY on `GET /platforms/{pid}/tenants`, where one
+            realm-scoped aggregate covers the whole page. **Absent** (not `0`)
+            on every other surface — render an absent value as unknown.
+        last_activity_at:
+          type: integer
+          format: int64
+          description: |
+            Dashboard rollup column, unix seconds. `MAX(audit_log.occurred_at)`
+            for this tenant — the same definition `last_activity_at` uses at
+            platform scope on `GET /admin/platforms`. Reflects AUDITED events
+            only (an org whose users merely sign in without triggering an
+            audited action will not move it).
+
+            Populated ONLY on `GET /platforms/{pid}/tenants`, and **absent**
+            when the tenant has never had an audited event — render absent as
+            unknown, never as the epoch.
 
     TenantConfig:
       type: object
@@ -1056,6 +1422,23 @@ components:
             (lower-cased; no scheme, port, or path); invalid entries
             return 400 `invalid_domain`. The list is replaced wholesale on
             every patch and is ignored when `signup_mode != 'allowlist'`.
+        role_overrides:
+          type: array
+          items: { type: string }
+          description: |
+            Org-governance (roles overhaul): the set of realm-role names this
+            org (tenant) has DISABLED for itself. Disable-only — an org can
+            hide a role the platform defined but cannot create or re-enable
+            roles. Each name must exist in the realm catalog; `owner` is
+            rejected. Replaced wholesale on every patch. The org's effective
+            role set = enabled realm roles minus this list.
+        default_invitation_role:
+          type: string
+          description: |
+            Org-level default invitation role, overriding the realm default
+            when set. Must be an enabled realm role that is not in
+            `role_overrides` and is not `owner`. Empty string clears it (falls
+            back to the realm default).
 
     RealmConfigPatch:
       type: object
@@ -1088,6 +1471,20 @@ components:
             service/platform (M2M) sessions are exempt. Omit = service
             default (30d). The cap cannot be disabled, only tuned within
             [1h, 365d].
+        idle_ttl_seconds:
+          type: integer
+          minimum: 0
+          description: |
+            ADR-070 — per-realm idle (inactivity) session timeout, in seconds.
+            After this many seconds without activity a user's BFF session is
+            force-logged-out (a sliding window that resets on each request).
+            Enforcement lives in the BFF; the issuer only stores this value and
+            emits it as the `idle_ttl` duration on login/token/refresh
+            responses. `null` / `0` / omitted = **disabled** (the default;
+            fully backward compatible). When set, must be `>= 300` (5 min) and
+            must not exceed the realm's effective `refresh_ttl_seconds` (idling
+            out after the refresh token has already died is meaningless) —
+            values outside that band return 400 `invalid_config_value`.
         challenge_ttl_seconds:
           type: integer
           minimum: 1
@@ -1125,6 +1522,21 @@ components:
             lifecycle (ADR-031). Service refresh TTL reuses
             `refresh_ttl_seconds`. Default `false` matches today's
             "M2M tokens are essentially single-shot" posture.
+        service_refresh_ttl_seconds:
+          type: integer
+          minimum: 300
+          maximum: 15552000
+          description: |
+            ADR-071 §6 — platform default refresh TTL for **ClassService**
+            (service-account) sessions, in seconds [300, 180d]. `0`/absent
+            falls back to `refresh_ttl_seconds` at mint time.
+        service_refresh_ttl_max_seconds:
+          type: integer
+          minimum: 300
+          maximum: 15552000
+          description: |
+            ADR-071 §6 — platform ceiling a per-org service-TTL override
+            cannot exceed, in seconds [300, 180d].
         platform_refresh_rotates:
           type: boolean
           description: |
@@ -1151,6 +1563,56 @@ components:
             doesn't pass one. Must reference a name in the realm's
             /platforms/{id}/roles catalog; cannot be `owner`. Falls back to
             `member` when unset or stale. Owner-editable.
+        signing_key_rotation_mode:
+          type: string
+          enum: [auto, manual]
+          description: |
+            Scheduled signing-key rotation policy (roles/signing-keys overhaul).
+            `auto` (default when unset) rotates on `signing_key_rotation_interval`;
+            `manual` disables scheduled rotation (keys only rotate on an explicit
+            `POST /platforms/{id}/signing-keys/rotate`).
+        signing_key_rotation_interval:
+          type: string
+          enum: ['1w', '1mo', '1y']
+          description: |
+            Auto-rotation cadence. Empty falls back to the worker default (the
+            base/RI realm keeps a short internal cadence; customer realms default
+            to `1w` in the console). Ignored when `signing_key_rotation_mode` is
+            `manual`.
+        mfa_policy:
+          type: string
+          enum: [disabled, enabled, enforced]
+          description: |
+            ADR-075 — **platform-level** MFA floor, layered on top of the
+            per-org `TenantConfig.mfa_policy`. Distinct from that per-org key
+            (which is `off`/`opt_in`/`required_for_all`). Values:
+            `disabled` (or omitted) — no platform floor; org policy governs
+            (default, backward-compatible). `enabled` — UI-hint only; MFA is
+            surfaced as recommended but carries **no** server-side effect (an org
+            may still opt out). `enforced` — MFA is required across **every** org
+            regardless of the per-org policy, and an unenrolled user is pushed
+            into first-login enrollment (ADR-061). Only `enforced` changes
+            request-path behavior. Surfaced on `realm.info()` / GET
+            /platforms/mine.
+        accept_provider_mfa:
+          type: boolean
+          description: |
+            ADR-078 — when true, a login token that carried a provider-native
+            MFA proof (google/microsoft/firebase only) satisfies the GENERIC MFA
+            requirement (the ADR-075 floor + org policy) for that session,
+            removing the double-challenge for federated users. It NEVER satisfies
+            a role's `required_mfa_methods`. Default false = fail-closed (RI always
+            challenges). Surfaced on GET /platforms/mine.
+        provider_mfa_ttl_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: |
+            ADR-078 §6 — re-MFA window for provider-sourced satisfaction. `0`
+            (default) = valid for the whole session (still bounded by the session
+            TTL). `>0` = a session whose provider MFA was proven longer ago than
+            this no longer satisfies a step-up ("specific operation") check — the
+            user must re-MFA (RI challenge if enrolled, else re-login).
         require_bff_login:
           type: boolean
           description: |
@@ -1179,24 +1641,131 @@ components:
         otp_login_enabled:
           type: boolean
           description: |
-            Gates `POST /auth/login` with `method=otp_internal` (the
+            Gates `POST /auth/login` with `grant_type=otp` (the
             single-factor "manager hands SA an OTP, SA types phone +
-            OTP" flow). Default false.
+            OTP" flow — see `LoginRequestOTP`). `grant_type` is the
+            RFC 6749 credential-exchange parameter; the OTP login has
+            no `method` field. Default false.
         otp_mfa_enabled:
           type: boolean
           description: |
-            Gates `POST /auth/mfa/verify` with `method=otp_internal`
+            Gates `POST /auth/mfa/verify` with `method=otp`
             (two-factor: first-factor login → manager-issued OTP as
             second factor). Default false. Per-user activation also
             requires the user (or one of the user's role assignments)
-            to be enrolled in `otp_internal` — see `users.mfa_methods`
+            to be enrolled in `otp` — see `users.mfa_methods`
             and `roles.required_mfa_methods`.
+        refresh_absolute_expiry:
+          type: object
+          description: |
+            ADR-054 — scheduled absolute expiry for refresh tokens. Object
+            `{mode, daily_cutoff_local, timezone}`. `mode="rolling"` (or
+            omitted) preserves rolling-TTL behaviour and ignores the other
+            two fields. `mode="scheduled"` forces every refresh token in the
+            realm to expire at the next daily cutoff and requires both a
+            valid `daily_cutoff_local` (HH:MM, 00:00..23:59) and IANA
+            `timezone`. The emitted `refresh_exp` (SPEC §4.1) is the min of
+            the rolling TTL, this scheduled cutoff, and the ADR-058
+            max-user-session-lifetime cap.
+          properties:
+            mode:
+              type: string
+              enum: [rolling, scheduled]
+              default: rolling
+            daily_cutoff_local:
+              type: string
+              description: Local wall-clock cutoff HH:MM (00:00..23:59). Required when mode=scheduled.
+              example: "03:30"
+            timezone:
+              type: string
+              description: IANA timezone name for daily_cutoff_local. Required when mode=scheduled.
+              example: Asia/Singapore
+            applies_to_service:
+              type: boolean
+              default: false
+              description: |
+                ADR-071 §6 three-class matrix — when `true`, the
+                scheduled cutoff also walls **ClassService**
+                (service-account) refresh tokens. Default `false`:
+                service sessions are exempt (an unattended agent is not
+                logged out at the daily wall). ClassPlatform is never
+                walled regardless.
+        origin_enforcement:
+          type: string
+          enum: ['', off, required]
+          description: |
+            ADR-065 — per-realm browser-Origin policy surfaced to the SDK
+            middleware via `realm.info()`. Enforcement happens SDK-side, not
+            on the server. `""`/`off` = no Origin check; `required` = the SDK
+            rejects browser calls whose Origin isn't an allowed realm origin.
+
+    RealmConfigView:
+      type: object
+      description: |
+        Read shape served by GET /platforms/{id}/config. Key-for-key identical
+        to `RealmConfigPatch` (a drift test pins the two property sets equal in
+        both directions) — semantics, ranges and enums for each key are
+        documented there. This schema deliberately omits the write-side enum
+        constraints because a never-configured key reads back as the zero value
+        (`""` / `0` / `false`), which is not itself a settable enum member.
+        Every key is always present; RealmConfig fields with no patch
+        counterpart (`suspended_at`, `suspend_reason`) are NOT exposed.
+      properties:
+        concurrent_session_limit: { type: integer }
+        session_eviction_policy: { type: string }
+        access_ttl_seconds: { type: integer }
+        refresh_ttl_seconds: { type: integer }
+        challenge_ttl_seconds: { type: integer }
+        platform_token_ttl_seconds: { type: integer }
+        access_token_custom_claim_keys:
+          type: array
+          items: { type: string }
+          description: Always an array, never null. `[]` = no custom claims accepted.
+        mfa_session_ttl_seconds: { type: integer }
+        default_invitation_role: { type: string }
+        require_bff_login: { type: boolean }
+        origin_enforcement: { type: string }
+        otp_length: { type: integer }
+        otp_ttl_seconds: { type: integer }
+        otp_login_enabled: { type: boolean }
+        otp_mfa_enabled: { type: boolean }
+        service_refresh_rotates: { type: boolean }
+        platform_refresh_rotates: { type: boolean }
+        service_refresh_ttl_seconds: { type: integer }
+        service_refresh_ttl_max_seconds: { type: integer }
+        max_user_session_lifetime_seconds: { type: integer }
+        idle_ttl_seconds: { type: integer }
+        signing_key_rotation_mode: { type: string }
+        signing_key_rotation_interval: { type: string }
+        mfa_policy: { type: string }
+        accept_provider_mfa: { type: boolean }
+        provider_mfa_ttl_seconds: { type: integer }
+        refresh_absolute_expiry:
+          type: object
+          description: |
+            Always the full object; `mode` reads back as `rolling` when unset.
+          properties:
+            mode: { type: string }
+            daily_cutoff_local: { type: string }
+            timezone: { type: string }
+            applies_to_service: { type: boolean }
 
     TransferOwnerRequest:
       type: object
-      required: [new_owner_email]
+      description: |
+        ADR-076 §3 DIRECT owner-pointer transfer (this replaced the ADR-063
+        propose→accept handshake — there is no pending proposal / accept step).
+        `owner_user_id` names the recipient, who must be an ACTIVE existing
+        member of THIS tenant (§4 lockout guard). `outgoing_owner_role` is the
+        base role the outgoing owner keeps (default `member`); `leave_entirely`
+        instead deactivates the outgoing owner. `new_owner_email` is a
+        TRANSITIONAL fallback for the pre-WP7 UI (resolved to a member when
+        `owner_user_id` is absent); the SDKs already post `owner_user_id`.
       properties:
-        new_owner_email: { type: string }
+        owner_user_id: { type: string, format: uuid, description: Active member of this tenant to make owner. }
+        outgoing_owner_role: { type: string, enum: [admin, member, viewer], description: 'Base role the outgoing owner keeps (default member).' }
+        leave_entirely: { type: boolean, description: Deactivate the outgoing owner instead of demoting them. }
+        new_owner_email: { type: string, description: Transitional pre-WP7 fallback used only when owner_user_id is absent. }
 
     Invitation:
       type: object
@@ -1206,6 +1775,92 @@ components:
         role: { type: string, enum: [owner, admin, member, viewer] }
         status: { type: string, enum: [pending, accepted, revoked, expired] }
         expires_at: { type: integer, format: int64 }
+
+    ServiceAccount:
+      type: object
+      description: A kind=service account (ADR-071 §1).
+      properties:
+        id: { type: string, format: uuid }
+        handle: { type: string, description: The email-shaped login handle. }
+        role: { type: string }
+        status: { type: string, enum: [active, suspended, deactivated] }
+        kind: { type: string, enum: [service] }
+        display_name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ServiceAccountCreateRequest:
+      type: object
+      required: [handle]
+      properties:
+        handle:
+          type: string
+          description: |
+            Email-shaped login handle (must contain `@`). Unique-in-tenant
+            (`409` on collision); the platform's responsibility if it picks
+            a real person's email (ADR-071 § Residual risk accepted).
+        role:
+          type: string
+          description: |
+            Tenant role for the account. Must not be `owner` or
+            `platform_api` (ADR-071 §2). Defaults to `member`.
+        display_name:
+          type: string
+          description: Optional; defaults to the handle.
+
+    ServiceAccountResetHandleRequest:
+      type: object
+      required: [handle]
+      properties:
+        handle:
+          type: string
+          description: The new email-shaped login handle (unique-in-tenant).
+
+    Source:
+      type: object
+      description: >-
+        A platform app/source (ADR-072 §1). `allowed_methods` is mapping-2 —
+        the login methods this app surfaces.
+      properties:
+        id: { type: string, format: uuid }
+        platform_id: { type: string, format: uuid }
+        type: { type: string, enum: [web, android, ios, desktop, bot] }
+        label: { type: string }
+        allowed_methods:
+          type: array
+          items: { type: string, enum: [google, microsoft, apple, facebook, firebase, otp] }
+        enabled: { type: boolean }
+        created_at: { type: integer, format: int64, description: unix seconds }
+
+    SourceList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Source' }
+
+    CreateSourceRequest:
+      type: object
+      required: [platform_id, type, label]
+      properties:
+        platform_id: { type: string, format: uuid }
+        type: { type: string, enum: [web, android, ios, desktop, bot] }
+        label: { type: string }
+        allowed_methods:
+          type: array
+          items: { type: string, enum: [google, microsoft, apple, facebook, firebase, otp] }
+          description: >-
+            A `bot` source may list only `otp`; a human source may never list
+            `otp` (mapping-1 invariant, ADR-072 §0).
+
+    PatchSourceRequest:
+      type: object
+      description: Sparse update; at least one field required.
+      properties:
+        label: { type: string }
+        allowed_methods:
+          type: array
+          items: { type: string, enum: [google, microsoft, apple, facebook, firebase, otp] }
+        enabled: { type: boolean }
 
     InvitationCreateRequest:
       type: object
@@ -1217,9 +1872,12 @@ components:
           enum: [owner, admin, member, viewer]
           default: member
           description: |
-            Tenant role assigned on accept. Defaults to `member`. Only
-            owners may invite at `admin` or `owner` (admins are limited to
-            `member` / `viewer`). Invalid values return 400 `invalid_role`.
+            Tenant role assigned on accept. Defaults to `member` (or the
+            org/realm `default_invitation_role` when configured). Only
+            owners may invite at `owner`. A role not in the realm catalog
+            returns 400 `unknown_role`; a disabled (or org-overridden-off)
+            role returns 400 `role_disabled` — there is no `invalid_role`
+            code on this endpoint.
 
     User:
       type: object
@@ -1232,13 +1890,13 @@ components:
         status: { type: string, enum: [active, suspended, invited, deactivated] }
         mfa_methods:
           type: array
-          items: { type: string, enum: [totp, otp_internal] }
+          items: { type: string, enum: [totp, otp] }
           description: |
             Per-user MFA enrollment (v0.6.0). When non-empty (or when
             unioned with the user's role's `required_mfa_methods` is
             non-empty), the first-factor login response gates with
             `mfa_required: true` and `methods[]` listing the union.
-            TOTP confirm/disable mirrors into this array; `otp_internal`
+            TOTP confirm/disable mirrors into this array; `otp`
             entries are added/removed by the partner via the user
             patch surface.
 
@@ -1289,16 +1947,79 @@ components:
 
     PlatformSummary:
       type: object
+      description: |
+        Partner/owner-facing platform shape — the `myPlatformDTO` returned by
+        GET /platforms/mine (inside PlatformListPage) and PATCH /platforms/{id}.
+        Distinct from `AdminPlatformSummary`, the internal-ops ADR-048 fleet row.
+
+        Field groups: the always-present identity block; the SDK block
+        (`public_ref`/`audience`, ADR-064) read via `realm.Info()`; the MFA/origin
+        policy block primed by the Settings panes; and the dashboard-enrichment
+        block, which is populated ONLY on the multi-identity user path — the cheap
+        SDK audience-discovery path omits it so `realm.Info()` stays one lookup.
       properties:
         id: { type: string, format: uuid }
         domain: { type: string }
         admin_tenant_id: { type: string, format: uuid }
         display_name: { type: string }
+        public_ref:
+          type: string
+          description: |
+            ADR-064 — the partner-facing platform handle. Omitted on paths that
+            don't resolve it.
+        audience:
+          type: string
+          description: |
+            ADR-064 — the frozen token audience `realmid:<public_ref>`. This is
+            what SDK `Verify` checks the `aud` claim against.
         mfa_session_ttl_seconds:
           type: integer
           description: |
             SPEC §10.4 — realm-wide default MFA freshness window. Future SDK
             versions auto-pick this via `realm.info()`. Omitted = SDK default.
+        mfa_policy:
+          type: string
+          enum: [disabled, enabled, enforced]
+          description: |
+            ADR-075 — platform-level MFA tri-state (see `RealmConfigPatch.mfa_policy`).
+            Surfaced here so the Settings MFA tab can prime the control (see also
+            GET /platforms/{id}/config, the full read surface). Omitted = `disabled`.
+        accept_provider_mfa:
+          type: boolean
+          description: |
+            ADR-078 — whether an upstream provider's MFA assertion satisfies this
+            platform's MFA requirement. Surfaced so Settings→MFA can prime it.
+        provider_mfa_ttl_seconds:
+          type: integer
+          description: ADR-078 — re-MFA freshness window for an accepted provider MFA.
+        origin_enforcement:
+          type: string
+          enum: ["", off, required]
+          description: |
+            ADR-065 — per-realm browser-Origin policy, read by SDK middleware via
+            `realm.Info()` to decide whether to run the confused-deputy guard.
+        slug:
+          type: string
+          description: Dashboard enrichment; omitted on the SDK audience-discovery path.
+        status:
+          type: string
+          enum: [active, suspended, deactivated]
+          description: Dashboard enrichment; omitted on the SDK audience-discovery path.
+        domains:
+          type: array
+          items: { type: string }
+          description: Dashboard enrichment; omitted on the SDK audience-discovery path.
+        tenants_count:
+          type: integer
+          description: |
+            Dashboard enrichment. Present-and-`0` means a genuine zero (e.g. a
+            freshly-created platform); OMITTED means "not computed" on this path.
+            Clients must distinguish the two — rendering absent as `0` is a bug.
+        users_count:
+          type: integer
+          description: |
+            Dashboard enrichment. Same present-`0` vs omitted contract as
+            `tenants_count` — absent is "not computed", not zero.
 
     PlatformListPage:
       type: object
@@ -1310,13 +2031,19 @@ components:
         next_cursor: { type: string, nullable: true }
         total: { type: integer, nullable: true }
 
-    PlatformSummary:
+    AdminPlatformSummary:
       type: object
       description: |
         Rich GET /admin/platforms row per ADR-048 §1. The base realm is
         omitted from the list. Counts are rolled up server-side; the
-        owner sub-object is the role=owner user inside the platform's
-        admin tenant.
+        owner sub-object is the platform's owner user inside its admin
+        tenant (resolved via tenants.owner_user_id per ADR-076).
+
+        NOTE: distinct from `PlatformSummary` (the partner/owner-facing
+        shape returned by GET /platforms/mine and PATCH /platforms/{id}).
+        Both schemas were previously named `PlatformSummary`, so this ops
+        row silently won every $ref under YAML last-key-wins and the two
+        partner endpoints were mis-documented. Do not re-merge them.
       required:
         [id, display_name, slug, status, signup_mode, domains, owner,
          tenants_count, users_count, last_activity_at, created_at]
@@ -1348,23 +2075,139 @@ components:
       properties:
         items:
           type: array
-          items: { $ref: '#/components/schemas/PlatformSummary' }
+          items: { $ref: '#/components/schemas/AdminPlatformSummary' }
         next_cursor: { type: string, nullable: true }
         total: { type: integer }
 
     AdminStats:
       type: object
       description: |
-        Four-tile dashboard summary per ADR-048 §2. Cached in-process for
-        30 seconds; refreshed lazily on first request after expiry.
+        Internal-ops fleet summary (ADR-048 §2, extended for the fleet-health
+        strip). Cached in-process for 30 seconds; refreshed lazily on first
+        request after expiry.
+
+        Every `platforms_*` count EXCLUDES the base realm — RealmID's own
+        control plane is not a partner platform — matching
+        `GET /admin/platforms`.
       required:
-        [platforms_count, tenants_count, users_count, sessions_active, events_24h]
+        [platforms_count, platforms_active, platforms_suspended,
+         platforms_new_7d, tenants_count, users_count, sessions_active,
+         sessions_24h, events_24h]
       properties:
-        platforms_count: { type: integer }
-        tenants_count: { type: integer }
-        users_count: { type: integer }
-        sessions_active: { type: integer }
-        events_24h: { type: integer }
+        platforms_count:
+          type: integer
+          description: Non-base realms, any status.
+        platforms_active:
+          type: integer
+          description: Non-base realms with `status='active'`.
+        platforms_suspended:
+          type: integer
+          description: |
+            Non-base realms with `status='suspended'`. The remainder
+            (`platforms_count - active - suspended`) is `deactivated`.
+        platforms_new_7d:
+          type: integer
+          description: Non-base realms created within the trailing 7 days.
+        tenants_count:
+          type: integer
+          description: Non-deleted tenants across those platforms.
+        users_count:
+          type: integer
+          description: Every `users` row across those platforms' tenants.
+        sessions_active:
+          type: integer
+          description: |
+            Point-in-time GAUGE — cross-realm count of live (non-revoked,
+            non-expired) sessions, ALL classes.
+        sessions_24h:
+          type: integer
+          description: |
+            FLOW metric — sessions with `class='user'` **created** in the
+            trailing 24 hours, i.e. human interactive sign-ins. Machine
+            sessions (service accounts, platform-API bots) are excluded, and a
+            token REFRESH does not create a session row, so this is sign-ins,
+            not requests.
+
+            Deliberately not named "tokens": the issuer keeps no token-mint
+            counter, and a refresh mints an access token without creating a
+            session — a "tokens" label would be a number nobody could
+            reconcile against any other surface.
+        events_24h:
+          type: integer
+          description: "`audit_log` rows in the trailing 24 hours."
+
+    PlatformMFACoverage:
+      type: object
+      description: |
+        MFA enrollment coverage for a platform, reported as its raw parts so a
+        client can render "8 of 40" rather than only a rounded percentage.
+      required: [covered_users, eligible_users, percent]
+      properties:
+        eligible_users:
+          type: integer
+          description: |
+            DENOMINATOR — users across this platform's tenants with
+            `status='active'` **and** `kind='human'`. An invited, suspended or
+            deactivated user cannot be asked to enroll, and a service account
+            (ADR-071 `kind='service'`) cannot hold an authenticator at all, so
+            neither belongs in the denominator.
+        covered_users:
+          type: integer
+          description: |
+            NUMERATOR — the subset of `eligible_users` holding a `user_mfa` row
+            with `confirmed_at IS NOT NULL`. A STARTED-but-unconfirmed
+            enrollment does NOT count. ADR-078 provider-native MFA acceptance
+            does NOT count either: that is a per-session proof, not enrollment
+            state, so a platform relying on it will legitimately read 0%.
+        percent:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            `covered_users / eligible_users * 100`, rounded to one decimal.
+            `null` when `eligible_users == 0` — there is no coverage of an
+            empty population, and `0` would misread as "nobody has MFA".
+
+    PlatformStats:
+      type: object
+      description: |
+        Per-platform KPI rollup for the admin console's platform overview.
+        Cached in-process for 30 seconds per platform.
+      required:
+        [platform_id, generated_at, orgs_count, users_count, sessions_24h,
+         mfa_coverage]
+      properties:
+        platform_id: { type: string, format: uuid }
+        generated_at:
+          type: integer
+          format: int64
+          description: |
+            Unix seconds at which these numbers were computed. May be up to 30
+            seconds old (the cache window) — render it if the freshness
+            matters.
+        orgs_count:
+          type: integer
+          description: |
+            Non-deleted tenants in this platform's realm — the same number
+            `tenants_count` reports for this platform on `GET /admin/platforms`.
+            The platform's own admin tenant is NOT included: per ADR-015 every
+            admin tenant lives in the BASE realm.
+        users_count:
+          type: integer
+          description: |
+            Every `users` row across those tenants. Identical to the
+            `users_count` already emitted for this platform by
+            `GET /admin/platforms` and `GET /platforms/mine`, so all three
+            surfaces show one number.
+        sessions_24h:
+          type: integer
+          description: |
+            Sessions with `class='user'` **created** in the trailing 24 hours
+            in this platform's realm — human interactive sign-ins. Same
+            definition as `AdminStats.sessions_24h`, scoped to one platform.
+            Machine sessions are excluded and a refresh does not create a row.
+        mfa_coverage:
+          $ref: '#/components/schemas/PlatformMFACoverage'
 
     AuditEvent:
       type: object
@@ -1462,23 +2305,74 @@ components:
           type: array
           items: { type: string }
           description: |
-            Opaque partner-defined permission strings. Stored on the role
-            but NOT inlined into JWTs in this ADR (see §2 of ADR-040).
-            Surfaced here so partners can render + edit a permissions
-            matrix in their own admin UI.
+            Permission strings from the closed `resource:action` catalog
+            (see `GET /platforms/{id}/permissions`). Since ADR-074 they
+            are ENFORCED by the issuer: resolved from the DB at request
+            time (never inlined into JWTs), so a grant/revoke takes
+            effect on the next request. Writes reject strings outside
+            the catalog with `400 unknown_permission`; legacy free-form
+            strings already stored stay inert (no effect, never
+            granted).
         is_system:
           type: boolean
-          description: "true for {owner, member} (immutable); false for everything else."
+          description: "true for {owner, member, platform_api} (name/permissions immutable); false for everything else."
+        disabled:
+          type: boolean
+          description: |
+            true when the role has been disabled by a realm admin — hidden from
+            the invite/assignment surface, but existing holders keep it. The
+            roles list hides `platform_api` entirely by default (pass
+            `?include_system=true` to include it).
+        disabled_at:
+          type: integer
+          description: "Unix seconds when the role was disabled; omitted when enabled."
         required_mfa_methods:
           type: array
-          items: { type: string, enum: [totp, otp_internal] }
+          items: { type: string, enum: [totp, otp] }
           description: |
-            Per-role MFA requirement (v0.6.0). At login time the auth
-            server unions this with the user's `mfa_methods`; if the
-            union is non-empty the first-factor response carries
-            `mfa_required: true`. AutoMahn's `sales_agent` role sets
-            this to `["otp_internal"]` so every SA auto-gates without
-            per-user toggles.
+            Per-role MFA requirement (v0.6.0; **writable** since ADR-075). At
+            login time the auth server unions this with the user's `mfa_methods`
+            and filters by the realm-enabled methods; if the result is non-empty
+            the switch-tenant response gates on MFA (a monotonic floor — a role
+            can only add a requirement, never remove one). Only the two real
+            methods (`totp`, `otp`) are accepted; unknown/unsupported methods
+            (e.g. `webauthn`, `sms`) return 400 `unknown_mfa_method`. AutoMahn's
+            `sales_agent` role sets this to `["otp"]` so every SA auto-gates
+            without per-user toggles.
+        assignable_to:
+          type: array
+          items: { type: string, enum: [human, service] }
+          description: |
+            ADR-081 principal typing: the `users.kind` values that may hold this
+            role. Always a NON-EMPTY array (§ Amendment 2 — every role
+            declares; a DB CHECK enforces it). An empty array can only come
+            from an issuer older than v0.57.0, where it meant "any".
+        migrated_holders:
+          type: integer
+          description: |
+            ADR-081 §2.5 — present ONLY on the PATCH response that narrowed
+            `assignable_to` so humans may no longer hold the role. The number of
+            human holders reassigned in that same transaction.
+        migrated_holders_to:
+          type: string
+          description: |
+            ADR-081 §2.5 — the role those holders were migrated to. Present only
+            alongside `migrated_holders`.
+        can_invite_roles:
+          type: array
+          items: { type: string }
+          description: |
+            ADR-076 WP4 invitation **scope**: the role names a holder of this
+            role may invite new members at (create only). Orthogonal to the
+            `invitations:manage` **capability** — a member may create an
+            invitation only if their role holds `invitations:manage` AND the
+            target role is in this list (owner + a realm M2M principal are
+            implicit-all and bypass the scope). `owner` is never a valid entry
+            (ownership moves via transfer, not invitation) — writes reject it
+            with `400 owner_not_invitable`; an unknown role name returns
+            `400 unknown_invite_role`. The seeded `admin` role carries every
+            non-owner, non-bot role name (back-compat for its
+            `invitations:manage`). Always an array (never null).
         created_at: { type: integer, description: "Unix seconds." }
         updated_at: { type: integer, description: "Unix seconds." }
 
@@ -1491,6 +2385,42 @@ components:
           items: { $ref: '#/components/schemas/Role' }
         next_cursor: { type: string, nullable: true }
         total: { type: integer, nullable: true }
+
+    SigningKeysResponse:
+      type: object
+      description: Owner-scoped view of the realm's signing keyring + rotation policy.
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            properties:
+              kid: { type: string }
+              created_at: { type: integer, description: "Unix seconds." }
+              active_until: { type: integer, description: "Unix seconds — signing cutoff." }
+              retire_at: { type: integer, description: "Unix seconds — JWKS cutoff." }
+              is_current: { type: boolean, description: "true for the key currently used to sign new tokens." }
+        rotation:
+          type: object
+          properties:
+            mode: { type: string, enum: [auto, manual] }
+            interval:
+              type: string
+              enum: ['1w', '1mo', '1y']
+              description: "Auto-rotation cadence; omitted when unset or mode=manual."
+            next_rotation_at:
+              type: integer
+              description: "Unix seconds the worker next mints a replacement (current key's active_until); omitted in manual mode."
+
+    RotateSigningKeyResponse:
+      type: object
+      required: [kid, retired_kids]
+      properties:
+        kid: { type: string, description: "The newly minted key's kid." }
+        retired_kids:
+          type: array
+          items: { type: string }
+          description: "kids present on the keyring before this rotation (still published until their RetireAt)."
 
     FederationBinding:
       type: object
@@ -1540,18 +2470,42 @@ components:
 
     CreateRoleRequest:
       type: object
-      required: [name]
+      required: [name, display_name]
       properties:
         name: { type: string, description: "lowercase alphanumeric + _- (2-32 chars)" }
-        display_name: { type: string }
+        display_name:
+          type: string
+          description: Required, non-blank (400 `display_name_required`).
         permissions:
           type: array
           items: { type: string }
         required_mfa_methods:
           type: array
-          items: { type: string, enum: [totp, otp_internal] }
+          items: { type: string, enum: [totp, otp] }
           description: |
             Per-role MFA requirement (v0.6.0). Defaults to `[]`.
+        can_invite_roles:
+          type: array
+          items: { type: string }
+          description: |
+            ADR-076 WP4 invitation scope (defaults to `[]`). Each entry must be
+            a known non-owner role name in the realm (`owner` → 400
+            `owner_not_invitable`; unknown → 400 `unknown_invite_role`). Inert
+            unless the role also holds `invitations:manage`.
+        assignable_to:
+          type: array
+          items: { type: string, enum: [human, service] }
+          description: |
+            ADR-081 principal typing: which `users.kind` values may hold this
+            role. **NO UNCONSTRAINED ROLES** (§ Amendment 2) — a stored role
+            always declares, enforced by a DB CHECK.
+            **Omitting the key** defaults to `["human","service"]` (so existing
+            clients are unaffected); sending an **explicit `[]`** returns 400
+            `assignable_to_required`. Unknown values return 400
+            `unknown_principal_kind`. Naming both kinds is preserved as an
+            explicit pair — it is a decision, not the absence of one. Assigning
+            a role to a principal it does not admit returns 400
+            `role_not_assignable_to_kind` on every assignment path.
 
     PatchRoleRequest:
       type: object
@@ -1563,9 +2517,28 @@ components:
           items: { type: string }
         required_mfa_methods:
           type: array
-          items: { type: string, enum: [totp, otp_internal] }
+          items: { type: string, enum: [totp, otp] }
           description: |
             Per-role MFA requirement (v0.6.0). Send `[]` to clear.
+        can_invite_roles:
+          type: array
+          items: { type: string }
+          description: |
+            ADR-076 WP4 invitation scope. Send `[]` to clear. Same validation as
+            create (`owner_not_invitable` / `unknown_invite_role`).
+        assignable_to:
+          type: array
+          items: { type: string, enum: [human, service] }
+          description: |
+            ADR-081 principal typing. **`[]` is rejected** (400
+            `assignable_to_required`) — there is no "clear back to any"; name
+            the kinds instead. Omitting the key preserves the stored value.
+            **Narrowing this so humans may no longer hold the role migrates the
+            role's existing human holders** — in the same transaction — to the
+            realm's `default_invitation_role` (when set and itself
+            human-assignable), else to `member`. The response then carries
+            `migrated_holders` + `migrated_holders_to`, and each migration is
+            audited. Existing holders are never stranded without a role.
 
     RenameRoleRequest:
       type: object
@@ -1600,8 +2573,35 @@ components:
       type: object
       required: [scope]
       properties:
-        scope: { type: string }
+        scope:
+          type: string
+          default: service
+          description: >-
+            **Cosmetic metadata only — does NOT set the key's class.**
+            Persisted to `api_keys.scope` and echoed back, but the
+            `/auth/login` class check (`isPlatformKey`) ignores it and
+            derives the class **solely from the role of the bound bot
+            user** (see `user_id`): `platform_api` → platform-class
+            (`grant_type=platform_api_key`), anything else →
+            service-class (`grant_type=api_key`). Passing
+            `scope: platform` does **not** make a service key
+            platform-class. (Footgun; tracked for fix — make it
+            authoritative or drop it.)
         label: { type: string }
+        user_id:
+          type: string
+          format: uuid
+          description: >-
+            Optional. Binds the key to a specific bot user, which
+            determines the key's class (ADR-041). If omitted, defaults
+            to the realm's `platform_api` bot user (→ platform-class
+            key). If the realm has **no** `platform_api` bot user
+            (e.g. a realm provisioned outside `POST /platforms`), the
+            default cannot resolve and the call returns
+            `400 no_default_bot_user` — pass a `user_id` explicitly, or
+            have the bot user backfilled (see operator-runbook
+            "ensure platform_api bot user"). Binding to a human/owner
+            user yields a **service-class** key.
 
     APIKey:
       type: object
@@ -1610,7 +2610,12 @@ components:
         value:
           type: string
           description: Raw key, returned only on create.
-        scope: { type: string }
+        scope:
+          type: string
+          description: >-
+            Echoed `scope` metadata from create — cosmetic, not the
+            authoritative class (see CreateAPIKeyRequest.scope). The
+            real class is derived from the bound bot user's role.
         label: { type: string }
 
   responses:
@@ -1641,13 +2646,16 @@ paths:
         ADR-051 (v0.7.0). Single credential-exchange endpoint. The
         body's `grant_type` selects the credential exchange and the
         subject class of the issued tokens. See `LoginRequest` for
-        the per-grant fields, inbound bearer rules, and the legacy
-        `method` deprecation alias.
+        the per-grant fields and inbound bearer rules. The legacy
+        `method` alias is removed (sunset 2026-08-01) — a body without
+        `grant_type` 400s `missing_grant_type`.
 
         Inbound bearer:
         - **User grants** (`provider_token`, `password`,
-          `otp_internal`) require `Authorization: Bearer <platform
-          access token>`. The realm is resolved from the bearer's
+          `otp`) require `Authorization: Bearer <platform
+          access token>`. NOTE: `password` is **reserved, not
+          implemented** — it unconditionally returns
+          `400 unknown_method` (ADR-042 slot). The realm is resolved from the bearer's
           `realm_id` claim; body `realm_id` is ignored. ADR-046
           `aud` validation still applies on `provider_token` /
           `google`.
@@ -1661,6 +2669,16 @@ paths:
       security:
         - BearerPlatformToken: []
         - {}
+      parameters:
+        - in: header
+          name: X-Device-Name
+          required: false
+          schema: { type: string, maxLength: 120 }
+          description: >
+            Optional human-readable device label persisted on the created
+            session and surfaced in GET /auth/sessions (ADR-062). Control
+            characters are stripped and the value is capped at 120 chars.
+            Only the user grants record it.
       requestBody:
         required: true
         content:
@@ -1668,10 +2686,33 @@ paths:
             schema: { $ref: '#/components/schemas/LoginRequest' }
       responses:
         '200':
-          description: OK
+          description: |
+            OK — every successful credential exchange returns
+            `status:"ok"` **including a refresh token even when MFA is
+            still pending** (MFA is flagged per-tenant via
+            `tenants[].mfa_required`; the `412 mfa_required`
+            precondition is raised later, on `POST /auth/token`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400':
+          description: |
+            bad_json (malformed body)
+            | missing_grant_type (no `grant_type`; the legacy `method`
+            alias was removed at its 2026-08-01 sunset)
+            | bad_grant_type (unrecognised `grant_type`)
+            | missing_provider (`grant_type=provider_token` without
+            `provider`)
+            | unknown_method (provider/method not enabled for the realm;
+            ALSO the unconditional response to `grant_type=password` —
+            reserved, not implemented, ADR-042)
+            | bad_tenant_id (`tenant_id` not in the resolved realm)
+            | missing_api_key (api-key grants without `api_key`)
+            | missing_subject_token | bad_subject_token_type
+            (token-exchange grant, ADR-057).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401':
           description: |
             unauthorized (missing or invalid platform token; user
@@ -1683,13 +2724,22 @@ paths:
             | key_class_mismatch (declared `grant_type` doesn't
             match the api-key's class — `api_key` vs
             `platform_api_key`; ADR-051)
-            | user_not_invited.
+            | revoked_api_key (api-key grants; key soft-revoked)
+            | keyless_api_key (api-key not bound to a bot user).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
           description: |
-            realm_mismatch | signup_domain_not_allowed | user_suspended.
+            user_not_invited (known user, no membership in the resolved
+            realm) | signup_domain_not_allowed | user_suspended.
+            (A `realm_mismatch` 403 was previously documented here but
+            is not emitted by this handler.)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: realm_not_found (bearer's realm does not resolve)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1703,12 +2753,21 @@ paths:
             session_limit_reached (concurrent session cap hit) |
             first_login_pending_approval (first login on a recently-
             vacated contact slot awaits tenant-owner approval; ADR-042 P2).
+            NOTE: `mfa_required` is NOT raised here — see the 200
+            description and `POST /auth/token`.
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: '#/components/schemas/PreconditionSessionLimit'
                   - $ref: '#/components/schemas/PreconditionFirstLoginPending'
+        '501':
+          description: |
+            federation_disabled (token-exchange grant while workload
+            identity federation is not enabled; ADR-057)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /auth/token:
     post:
@@ -1756,9 +2815,23 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TokenResponse' }
+        '400':
+          description: |
+            missing_tenant_id (refresh subject is a multi-tenant user and
+            the body carries no `tenant_id`) | bad_request (a
+            `custom_claims` key is not in the realm's
+            `access_token_custom_claim_keys` allowlist) | bad_json.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: not_a_member | user_suspended | deactivated
+          description: |
+            not_a_member | user_suspended. NOTE: a **deactivated** user
+            also returns `user_suspended` — the previously-documented
+            separate `deactivated` code is collapsed into
+            `user_suspended` (suspended and deactivated map to the same
+            error in `authsvc`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1872,6 +2945,56 @@ paths:
         '409':
           description: already_enrolled — reset before re-enrolling
 
+  /auth/mfa:
+    delete:
+      tags: [Auth]
+      summary: Self-disable MFA (step-up gated)
+      description: |
+        ADR-061 counterpart to `POST /auth/mfa/enroll` — disables MFA for
+        the calling user. Auth (`requireAuthAsUser`): the user's own
+        access JWT, **or** a partner **platform bearer**
+        (`scope=platform`) carrying the user's identity in
+        `X-On-Behalf-Of-User` / `X-User-Token` — the production BFF
+        path (ADR-050). The partner cannot impersonate arbitrarily on
+        the legacy header path — it must possess the user's access JWT;
+        either way the operation resolves to and acts as that user.
+
+        Step-up: the caller MUST present a currently valid TOTP `code` in
+        the body, so a stolen access token alone cannot disable MFA on the
+        victim. On success the enrollment is reset, `totp` is pruned from
+        `users.mfa_methods` (`otp` entries are preserved), and every
+        session's MFA-freshness anchor for this user is cleared — the next
+        MFA-protected operation gets `412 mfa_required` and forces
+        re-enrollment.
+
+        Returns 200 (not 204) per the ADR-069 uniform-200 envelope so the
+        `{status}` body survives.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: A currently valid TOTP code (step-up proof).
+      responses:
+        '200':
+          description: OK — MFA disabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [disabled] }
+        '400':
+          description: missing_code | not_enrolled
+        '401':
+          description: invalid code, or bearer is not a user JWT
+
   /auth/mfa/verify:
     post:
       tags: [Auth]
@@ -1896,6 +3019,79 @@ paths:
           description: Invalid challenge token or code
         '429':
           description: mfa_too_many_fails
+
+  /auth/mfa/recovery:
+    post:
+      tags: [Auth]
+      summary: Redeem a recovery (backup) code in place of TOTP (ADR-077 §2)
+      description: |
+        A primary-authenticated user who lost their TOTP authenticator submits a
+        single-use recovery code in place of the TOTP step-up. Requires the same
+        `mfa_challenge_token` the MFA gate mints (so it NEVER substitutes for
+        primary auth — the code alone is useless). On success it satisfies the
+        MFA gate for this (session, tenant) and mints tokens exactly like
+        `/auth/mfa/verify`, **consumes** the code, and **forces fresh
+        re-enrollment** (the old authenticator is presumed lost) — the response
+        sets `reenroll_required:true` and the enrollment is cleared, so the next
+        login drives ADR-061 enrollment (regenerating the code set). Rate-limited
+        on the same counter as TOTP. Closes review gap I-02 (recovery codes were
+        generated but redeemed nothing).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mfa_challenge_token, code]
+              properties:
+                mfa_challenge_token: { type: string }
+                code: { type: string, description: "A single-use recovery code from enrollment." }
+      responses:
+        '200':
+          description: |
+            OK — access + refresh tokens (with the new `mfa_at`) plus
+            `reenroll_required:true`. Same token fields as MFAVerifyResponse.
+        '401':
+          description: Invalid challenge token or recovery code
+        '429':
+          description: mfa_too_many_fails
+
+  /auth/mfa/authenticators:
+    get:
+      tags: [Auth]
+      summary: List the current user's enrolled MFA authenticators
+      description: |
+        Returns the caller's enrolled MFA authenticator(s) and how many backup
+        codes remain. One TOTP enrollment per user today, so the array has 0 or 1
+        entries; the shape is forward-compatible with multiple factors. A read —
+        NOT MFA-gated. Access-token authed.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: |
+            OK — { authenticators: [{ type, confirmed, created_at, confirmed_at }],
+            backup_codes_remaining }
+
+  /auth/mfa/recovery/regenerate:
+    post:
+      tags: [Auth]
+      summary: Regenerate (rotate) the current user's recovery codes
+      description: |
+        Mints a fresh set of backup/recovery codes for the current user,
+        invalidating the previous set (including any still-unconsumed codes).
+        **Gated on a FRESH TOTP within the elevated window** — the route is
+        registered `RequireFresh`, so a token without a recent `mfa_at` gets the
+        412 `mfa_required` step-up envelope until the user re-completes TOTP; a
+        stolen long-lived session cannot silently rotate the codes. Requires a
+        confirmed enrollment. Codes are shown once and also emailed (ADR-079).
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: "OK — { status: ok, recovery_codes: [...] }"
+        '409':
+          description: not_enrolled — no confirmed authenticator
+        '412':
+          description: mfa_required — a fresh TOTP step-up is needed first
 
   /auth/mfa/challenge:
     post:
@@ -1947,12 +3143,26 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OTPIssueResponse' }
         '400':
-          description: invalid_purpose | invalid_subject_ref | invalid_scope
+          description: |
+            invalid_purpose | invalid_subject_ref | invalid_scope |
+            unsupported_delivery_mode (`delivery_mode` other than
+            `view_bff` — the RI-delivered modes are not yet available;
+            ADR-071 §4).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
           description: missing or invalid bearer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            forbidden — ADR-071 §5 login-OTP mint-gate: a
+            `purpose=login` OTP may be minted only by an owner/admin,
+            only for a `kind=service` subject in the caller's own
+            tenant (a missing / cross-tenant / non-service subject
+            collapses to the same code — no oracle).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2080,6 +3290,48 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /tenants/{id}/users/{uid}/sessions/revoke:
+    post:
+      tags: [Sessions]
+      summary: >-
+        Admin force-logout of a specific user — revoke ALL of the target
+        user's sessions in the tenant's realm. Distinct from the self-service
+        DELETE /auth/sessions (which only touches the caller's own sessions).
+        Owner/admin only (sessions:revoke; owner implicit-all).
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: uid
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: "OK — status=ok, revoked=<count>"
+        '404':
+          description: user not found (or not in this tenant)
+
+  /platforms/{id}/sessions/revoke-all:
+    post:
+      tags: [Sessions]
+      summary: >-
+        Realm-wide mass logout — revoke EVERY session in the realm (e.g. breach
+        response). The DB revocation is authoritative; the Redis active-session
+        sets are cleared realm-wide so no user trips the session-limit counter
+        on next login. Owner/admin only (sessions:revoke on the realm).
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: "OK — status=ok, revoked=<count>"
+
   # ---------------------------------------------------------------- JWKS
 
   /{realm}/.well-known/jwks.json:
@@ -2103,6 +3355,22 @@ paths:
                     type: array
                     items:
                       type: object
+        '404':
+          description: |
+            realm_not_found — unknown realm; any resolution error
+            (not-found, malformed uuid) collapses to this uniform 404
+            (CODE_GAPS G-003).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: |
+            realm_suspended — the realm is suspended or deactivated;
+            JWKS stops serving (existing access tokens become
+            unverifiable by partner APIs).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /{realm}/.well-known/openid-configuration:
     get:
@@ -2160,6 +3428,11 @@ paths:
         DV row to the realm.
 
         DNS TXT only.
+
+        Idempotent: re-claiming a domain with a still-pending claim
+        returns the SAME pending TXT record instead of erroring, so an
+        interrupted onboarding can resume (pair with
+        `GET /domains/pending`).
       security: [{ BearerAccess: [] }]
       requestBody:
         required: true
@@ -2189,23 +3462,65 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StatusOK' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '400':
+          description: |
+            verification_failed — the DNS TXT lookup did not (yet)
+            produce the expected record; the primary failure mode
+            (retry after DNS propagation). The claim stays pending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: domain_not_found (no pending claim for this domain by the caller)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /domains/pending:
+    get:
+      tags: [Platforms]
+      summary: List the caller's in-progress (pending) domain claims
+      description: |
+        Returns the caller's non-expired pending domain verifications so a
+        UI can resume one after a page refresh dropped the client-side claim
+        state. Each row carries the same TXT record the original claim
+        returned. Newest first.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/PendingDomain' }
 
   /platforms:
     post:
       tags: [Platforms]
-      summary: Create a platform realm bound to a verified domain
+      summary: Create a platform realm (custom domain optional, ADR-073)
       description: |
-        Creates a partner platform realm + admin tenant + bot user, binds
-        the partner's verified apex via `domain_mappings`, and (per the
-        platform-name auto-bind feature) ALSO binds
-        `<slug>.realmid.dev` to the new realm — the auto-bound row reuses
-        the apex's `verification_id` because RealmID has implicit DNS
-        control over its own zone. The audit row carries
-        `trusted_by_parent: true, parent_domain: realmid.dev,
-        auto_bound: true`. The auto-bind is skipped when the partner's
-        bound apex is itself under `realmid.dev` to avoid a double row.
+        Creates a partner platform realm + admin tenant + bot user.
+
+        **`domain` is optional (ADR-073 Release A).**
+
+        - **With `domain`** (a verified custom apex): binds the apex via
+          `domain_mappings`, ALSO binds `<slug>.realmid.dev` (the
+          auto-bound row reuses the apex's `verification_id` because
+          RealmID has implicit DNS control over its own zone; audit row
+          carries `trusted_by_parent: true, parent_domain: realmid.dev,
+          auto_bound: true`). Requires a caller-owned verified
+          `domain_verifications` row (else `412 domain_not_verified`).
+        - **Without `domain`** (domainless): the realm's routing domain is
+          set to its `<slug>.realmid.dev` hosted-login subdomain, ONLY that
+          mapping is bound (with a NULL `verification_id`), and no domain
+          proof is required. A custom apex can be added later via
+          `POST /platforms/{id}/origins` (claim → verify → bind), which
+          promotes it to the realm's primary domain.
+
         Reserved slugs (`console`, `app`, `auth`, `api`, `www`, `status`,
         `admin`) return `409 reserved_slug`.
       security: [{ BearerAccess: [] }]
@@ -2215,19 +3530,35 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/CreatePlatformRequest' }
       responses:
-        '200':
-          description: OK
+        '201':
+          description: Created
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CreatePlatformResponse' }
+        '400':
+          description: |
+            missing_fields (`display_name` or `slug` absent) |
+            invalid_slug (1–63 chars, lowercase a-z, 0-9, hyphen, no
+            leading/trailing hyphen) | bad_json.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
             Conflict. Possible codes:
-              - `already_bound` / `domain_taken` — domain already mapped.
+              - `domain_taken` — domain already mapped.
               - `reserved_slug` — slug is on the first-party reserved
                 list (`console`, `app`, `auth`, `api`, `www`, `status`,
                 `admin`).
               - `slug_taken` — another platform already owns this slug.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '412':
+          description: |
+            domain_not_verified — a custom `domain` was supplied but the
+            caller holds no verified `domain_verifications` row for it
+            (claim + verify first via `/domains/claim` + `/domains/verify`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2245,7 +3576,8 @@ paths:
         Renames a platform's display label. The platform's display_name and
         its admin tenant's display_name are kept in lockstep, so callers do
         not need to drill into the admin tenant to change the platform label.
-        Owner-gated against the platform's admin tenant.
+        Owner-gated against the platform's admin tenant (tenant lifecycle
+        stays owner-only — NOT opened by the ADR-074 permission gates).
       security: [{ BearerAccess: [] }]
       requestBody:
         required: true
@@ -2299,6 +3631,23 @@ paths:
       tags: [Platforms]
       summary: Create a tenant inside a platform realm
       security: [{ BearerAccess: [] }]
+      description: |
+        Creates an organization (tenant) inside the platform's realm. Since
+        ADR-073 Amendment C this is also the tenant rung of a bulk migration:
+
+        - **Bring-your-own `id`** (any UUID — a derived UUIDv5 is legal) makes
+          the create idempotent and re-runnable. Absent ⇒ a UUIDv7 is minted
+          and returned. An `id` that already exists **in this realm** RECONCILES
+          it (updates `display_name` + `allowed_domains` only — never the owner
+          pointer or `created_at`); one that exists **in another realm** is
+          rejected.
+        - **Inline `owner` is REQUIRED when creating** a new tenant (ADR-073 C.3:
+          `owner_user_id` is NOT NULL — a tenant is born with an owner). It is
+          seated atomically with the tenant, provisioned as a verified ACTIVE
+          human with the dormant `member` role. On RECONCILE `owner` is optional;
+          if supplied it must MATCH the seated owner (`owner_already_set`
+          otherwise) — reconcile never re-seats ownership.
+        - **`created_at`** preserves the source "org since" age.
       requestBody:
         required: true
         content:
@@ -2307,16 +3656,71 @@ paths:
               type: object
               required: [display_name]
               properties:
+                id:
+                  type: string
+                  format: uuid
+                  description: |
+                    Optional caller-supplied tenant id (ADR-073 C.1). Absent ⇒
+                    mint UUIDv7. Present + exists in this realm ⇒ reconcile;
+                    present + exists in another realm ⇒ `cross_realm_tenant_id`.
                 display_name: { type: string }
+                allowed_domains:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Optional signup-domain allowlist seeded on the new
+                    tenant (see `TenantConfigPatch.allowed_domains`).
+                created_at:
+                  type: string
+                  format: date-time
+                  description: |
+                    Optional RFC3339 creation timestamp (ADR-073 C.4); absent ⇒
+                    server time. Ignored on reconcile.
+                owner:
+                  $ref: '#/components/schemas/InlineOwner'
       responses:
-        '200':
-          description: OK
+        '201':
+          description: Created (or reconciled)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Tenant' }
+        '400':
+          description: |
+            `missing_display_name` | `bad_json` |
+            `owner_required` (owner is mandatory when creating a new tenant) |
+            `invalid_tenant_id` (id is not a UUID) |
+            `cross_realm_tenant_id` (id exists in another realm) |
+            `invalid_created_at` (not RFC3339) |
+            `owner_missing_identifier` | `owner_invalid_email` |
+            `owner_invalid_phone` | `owner_incomplete_provider` |
+            `owner_unknown_provider` | `owner_invalid_user_id` |
+            `cross_tenant_owner_id` (owner.user_id exists in another tenant) |
+            `owner_already_set` (a different owner is already seated)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `base_realm_no_orgs` — `pid` is the base realm, which holds
+            ONLY admin tenants (ADR-015); plain orgs cannot be created
+            there. Also returned when the caller does not administer the
+            platform realm.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: platform_not_found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
     get:
       tags: [Platforms]
       summary: List tenants in a platform realm
+      description: |
+        Rows carry the dashboard rollup columns `users_count` and
+        `last_activity_at` (see `Tenant`) — computed for the whole realm in one
+        aggregate, not per row. Both are ABSENT rather than `0` when
+        unavailable.
       security: [{ BearerAccess: [] }]
       responses:
         '200':
@@ -2324,6 +3728,51 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TenantListPage' }
+
+  /platforms/{pid}/stats:
+    parameters:
+      - in: path
+        name: pid
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Platforms]
+      summary: Platform KPI rollup (orgs, users, sessions·24h, MFA coverage)
+      description: |
+        Backs the platform-overview KPI strip in the admin console. Cached
+        in-process for 30 seconds per platform; `generated_at` reports the
+        snapshot time.
+
+        Every field's definition is spelled out on the `PlatformStats` /
+        `PlatformMFACoverage` schemas — read them before rendering a number.
+        In particular `sessions_24h` counts human sign-ins (session CREATION),
+        not requests or token mints, and `mfa_coverage` counts CONFIRMED
+        enrollments only.
+
+        **Authz (ADR-074):** the `users:read` permission. The platform owner
+        and the platform's own service/platform token are implicit-all; any
+        other member needs a realm role granting `users:read`. Per ADR-067
+        base-realm (RealmID) staff get no special path — they cannot read the
+        stats of a platform they do not own.
+      security:
+        - BearerAccess: []
+        - BearerService: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformStats' }
+        '403':
+          description: forbidden — missing `users:read` on this platform
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: platform_not_found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /platforms/{pid}/tenants/{tid}/invitations:
     post:
@@ -2345,8 +3794,8 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/PlatformInvite' }
       responses:
-        '200':
-          description: OK
+        '201':
+          description: Created
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Invitation' }
@@ -2378,8 +3827,8 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/CreateAPIKeyRequest' }
       responses:
-        '200':
-          description: OK
+        '201':
+          description: Created
           content:
             application/json:
               schema: { $ref: '#/components/schemas/APIKey' }
@@ -2434,6 +3883,48 @@ paths:
           description: api_key_not_found
 
   /platforms/{id}/config:
+    get:
+      tags: [Platform Admin]
+      summary: Read the platform realm's config (the PATCH allowlist, read-only)
+      description: |
+        Read counterpart of the PATCH below — added because the realm config
+        used to be write-only, forcing every consumer (console settings panes,
+        SDK, BFF) to PATCH blind against placeholder hints.
+
+        Authz mirrors PATCH exactly: the platform owner, or a realm role
+        granting `platform:config` (ADR-074). There is no read-only variant of
+        that permission — whoever may change the config may read it.
+
+        The response body carries **exactly** the key set `RealmConfigPatch`
+        accepts, never more: RealmConfig fields with no patch counterpart
+        (`suspended_at`, `suspend_reason` — internal-ops suspend state) are not
+        exposed here. No key is omitted; the zero value means "unset" and the
+        documented default applies (`0` for ints, `""` for strings, `false` for
+        booleans, `[]` for the claim-key allowlist). Values are returned as
+        stored — `""` is never normalised to a default, so a consumer can tell
+        "never configured" from "explicitly set to the default".
+        `refresh_absolute_expiry` is always the full object, with `mode`
+        reported as `rolling` when unset.
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  config: { $ref: '#/components/schemas/RealmConfigView' }
+        '403':
+          description: forbidden — missing permission `platform:config`
+        '404':
+          description: realm_not_found
     patch:
       tags: [Platform Admin]
       summary: Update the platform realm's config (allowlisted keys only)
@@ -2464,8 +3955,9 @@ paths:
       tags: [Platform Admin]
       summary: List workload identity federation bindings (ADR-057)
       description: |
-        Lists the platform's trust bindings. Owner-gated (same auth as the
-        other `/platforms/{id}/...` admin routes). Paginated envelope.
+        Lists the platform's trust bindings. Gated on the platform owner
+        or a realm role granting `federation:read` (ADR-074). Paginated
+        envelope.
       security: [{ BearerAccess: [] }]
       parameters:
         - in: query
@@ -2537,8 +4029,9 @@ paths:
       description: |
         Soft-deletes (revokes) the binding: it is marked `status=revoked` and
         immediately stops authenticating workloads, but the row is retained for
-        audit. Owner-gated. Idempotent only in that a second call on an
-        already-removed id returns 404.
+        audit. Gated on the platform owner or a realm role granting
+        `federation:manage` (ADR-074). Idempotent only in that a second
+        call on an already-removed id returns 404.
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -2564,6 +4057,100 @@ paths:
         '404':
           description: binding_not_found | federation_disabled
 
+  /platforms/{id}/permissions:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Platform Admin]
+      summary: List the grantable permission catalog (ADR-074)
+      description: |
+        Returns the fixed catalog of `resource:action` permission strings a
+        partner may grant to a custom (non-owner) role. The admin UI renders
+        this as a grouped checklist so it never hardcodes the list. Gated by
+        `roles:read` (owner + realm/platform tokens always pass). Not paginated
+        — the catalog is small and fixed.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  permissions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key:      { type: string, example: users:manage }
+                        resource: { type: string, example: users }
+                        action:   { type: string, example: manage }
+                        label:    { type: string, example: Manage users (role, status, contacts) }
+  /platforms/{id}/starter-roles:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Platform Admin]
+      summary: Opt into RealmID's starter role templates
+      description: |
+        Creates the named starter templates (`admin`, `viewer`) in this realm's
+        catalog, pre-filled with their ADR-074 permission sets — a shortcut for
+        authoring them by hand in the role editor.
+
+        Starter roles are **opt-in as of issuer v0.54.0**. A freshly-created
+        realm holds only the three system rows (`owner`, `member`,
+        `platform_api`); before v0.54.0 `admin` and `viewer` were seeded
+        unconditionally, which handed every realm a 23-permission operator role
+        it never asked for and created the name partner role-imports most often
+        collide with. The same opt-in is available at creation time via
+        `starter_roles` on `POST /platforms`.
+
+        Idempotent, and **never destructive**: seeding is ON CONFLICT DO
+        NOTHING, so a name the realm already holds — whether from an earlier
+        call or a partner-authored role that happens to be called `admin` — is
+        left completely untouched, with its own permissions. The response
+        echoes the rows that now exist under the requested names, so a caller
+        can see whether a pre-existing role was preserved.
+
+        Gated on `roles:manage`, the same permission as creating a role by hand.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [starter_roles]
+              properties:
+                starter_roles:
+                  type: array
+                  description: |
+                    Subset of the offered templates. An unknown name is
+                    rejected with 400 `unknown_starter_role` rather than
+                    silently skipped, so a typo cannot leave an owner believing
+                    they provisioned a role that does not exist.
+                  items: { type: string, enum: [admin, viewer] }
+      responses:
+        '200':
+          description: The roles now present under the requested names.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RoleObject' }
+        '400':
+          description: unknown_starter_role / missing_fields
+        '403':
+          description: missing permission roles:manage
+        '404':
+          description: realm_not_found
   /platforms/{id}/roles:
     parameters:
       - in: path
@@ -2575,7 +4162,8 @@ paths:
       summary: List role catalog (ADR-040)
       description: |
         Returns the platform realm's role catalog: the system rows `owner` + `member`
-        plus every custom role registered via POST. Owner-gated.
+        plus every custom role registered via POST. Gated on the platform
+        owner or a realm role granting `roles:read` (ADR-074).
       security: [{ BearerAccess: [] }]
       parameters:
         - in: query
@@ -2584,6 +4172,14 @@ paths:
         - in: query
           name: limit
           schema: { type: integer }
+        - in: query
+          name: include_system
+          schema: { type: boolean, default: false }
+          description: |
+            `true` re-includes the `platform_api` system role (the
+            ADR-041 API-key bot role, never human-assignable), which is
+            hidden from the catalog by default. For internal/debug
+            callers.
       responses:
         '200':
           description: OK
@@ -2600,13 +4196,13 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/CreateRoleRequest' }
       responses:
-        '200':
-          description: OK
+        '201':
+          description: Created
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Role' }
         '400':
-          description: invalid_role_name
+          description: invalid_role_name | display_name_required | unknown_permission (ADR-074) | unknown_mfa_method (ADR-075)
         '409':
           description: role_exists
 
@@ -2639,17 +4235,31 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Role' }
         '400':
-          description: system_role_immutable
+          description: system_role_immutable | display_name_required (cannot be cleared to blank) | unknown_permission (ADR-074) | unknown_mfa_method (ADR-075)
         '404':
           description: role_not_found
     delete:
       tags: [Platform Admin]
-      summary: Delete a custom role (ADR-040)
+      summary: Delete a custom role (ADR-040, migration ADR-074)
       description: |
         Returns 409 `role_in_use` when any user or pending invitation in
         any tenant of the platform's realm references the role. System
         roles return 400 `system_role_immutable`.
+
+        ADR-074/Phase 3: pass `?migrate_to=<role name>` to reassign every
+        holder of this role to the target role and delete it in ONE
+        transaction, bypassing the 409. The target must exist in the realm,
+        be enabled, not be `platform_api`, and differ from the role being
+        deleted (else 400 `unknown_migrate_target` / `migrate_target_disabled`
+        / `invalid_migrate_target`). The `role_protected` / `role_is_default`
+        / `last_active_role` guards still apply.
       security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: migrate_to
+          required: false
+          description: Role name to reassign this role's holders to before deletion.
+          schema: { type: string }
       responses:
         '200':
           description: OK
@@ -2657,11 +4267,11 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/StatusOK' }
         '400':
-          description: system_role_immutable
+          description: system_role_immutable | unknown_migrate_target | migrate_target_disabled | invalid_migrate_target
         '404':
           description: role_not_found
         '409':
-          description: role_in_use
+          description: role_in_use (only when migrate_to is absent)
 
   /platforms/{id}/roles/{roleId}/rename:
     parameters:
@@ -2699,6 +4309,248 @@ paths:
           description: role_not_found
         '409':
           description: target_exists
+
+  /platforms/{id}/roles/{roleId}/disable:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: roleId
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Platform Admin]
+      summary: Disable a role
+      description: |
+        Hides the role from the invite/assignment surface without deleting it
+        (existing holders keep the role). `owner` and `platform_api` are
+        protected (400 `role_protected`). Disabling the realm's current default
+        invitation role returns 400 `role_is_default`. The realm must keep at
+        least one enabled, human-assignable role (excluding owner/platform_api)
+        — else 400 `last_active_role`.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '400':
+          description: role_protected | role_is_default | last_active_role
+        '404':
+          description: role_not_found
+
+  /platforms/{id}/roles/{roleId}/enable:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: roleId
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Platform Admin]
+      summary: Re-enable a disabled role
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '404':
+          description: role_not_found
+
+  /platforms/{id}/integrations:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Platform Admin]
+      summary: List published integrations (ADR-082/083, SOURCE side)
+      description: |
+        Lists the integrations this platform publishes for other realms' orgs to
+        install. Gated on the platform owner or a realm role granting
+        `integrations:read` (ADR-083 §5 — NOT `roles:manage`).
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+    post:
+      tags: [Platform Admin]
+      summary: Register an integration (ADR-083 §4.1)
+      description: |
+        Registers a source integration once, at realm level. Gated on
+        `integrations:manage`. A target org later installs it (see
+        POST /tenants/{id}/integration-installations).
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slug, display_name]
+              properties:
+                slug: { type: string, description: '2-48 chars, lowercase alphanumerics + single hyphens; unique per realm' }
+                display_name: { type: string }
+                description: { type: string }
+                homepage_url: { type: string }
+                listed: { type: boolean, default: false, description: 'directory opt-in (ADR-083 §6.1; listing API deferred)' }
+      responses:
+        '201':
+          description: Created
+        '400':
+          description: invalid_slug | display_name_required
+        '409':
+          description: slug_taken
+
+  /platforms/{id}/integrations/{iid}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: iid
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Platform Admin]
+      summary: Update an integration (ADR-083 §4.1)
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                description: { type: string }
+                homepage_url: { type: string }
+                listed: { type: boolean }
+      responses:
+        '200':
+          description: OK
+        '404':
+          description: integration_not_found
+    delete:
+      tags: [Platform Admin]
+      summary: Delete (permanently disable) an integration — SOURCE half of two-ended revocation (ADR-082 §6.3)
+      description: |
+        Permanently disables the integration, halting every mint. Modelled as a
+        disable rather than a hard delete so the target orgs' inbound-access
+        history (ADR-083 §4.5) is not silently rewritten.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+        '404':
+          description: integration_not_found
+
+  /platforms/{id}/integrations/{iid}/disable:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: iid
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Platform Admin]
+      summary: Disable an integration (reversible; halts mints)
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+        '404':
+          description: integration_not_found
+
+  /platforms/{id}/integrations/{iid}/enable:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: iid
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Platform Admin]
+      summary: Re-enable a disabled integration
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+        '404':
+          description: integration_not_found
+
+  /platforms/{id}/signing-keys:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Platform Admin]
+      summary: List the realm's signing keys + rotation policy
+      description: |
+        Owner-scoped read of the realm's JWKS keyring: each key's kid,
+        created/active-until/retire timestamps, and which one is current, plus
+        the effective rotation policy (mode + interval + next auto-rotation).
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SigningKeysResponse' }
+        '404':
+          description: platform_not_found
+
+  /platforms/{id}/signing-keys/rotate:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Platform Admin]
+      summary: Self-serve rotate the realm's signing key
+      description: |
+        Realm-admin (platform owner) rotation of the realm's active signing
+        key. Mints a fresh key; prior keys stay published in JWKS through their
+        overlap window. Rate-limited to one rotation per 60s (429
+        `rate_limited`). Mirrors the base-staff
+        `/admin/platforms/{id}/signing-keys/rotate` route.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RotateSigningKeyResponse' }
+        '404':
+          description: platform_not_found
+        '429':
+          description: rate_limited
 
   # ----------------------------------------- Identity providers (ADR-046, v0.5.3)
   #
@@ -2844,13 +4696,19 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/CreateIdentityProviderRequest' }
       responses:
-        '200':
-          description: OK
+        '201':
+          description: Created
           content:
             application/json:
               schema: { $ref: '#/components/schemas/IdentityProvider' }
         '400':
-          description: missing_platform_id | unsupported_provider | unsupported_client_type | bad_request
+          description: |
+            missing_platform_id | unsupported_provider |
+            unsupported_client_type | bad_request | app_not_found
+            (`app_id` does not reference a known source) |
+            app_platform_mismatch (`app_id` belongs to a different
+            platform) | app_kind_mismatch (`app_id` references a bot
+            source; ADR-072 § Amendment)
         '404':
           description: realm_not_found | tenant_not_found
         '409':
@@ -2881,7 +4739,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/IdentityProvider' }
         '400':
-          description: empty_patch | bad_request
+          description: |
+            empty_patch | bad_request | app_not_found |
+            app_platform_mismatch | app_kind_mismatch (re-binding
+            `app_id`; ADR-072 § Amendment)
         '404':
           description: provider_not_found
     delete:
@@ -2896,6 +4757,119 @@ paths:
               schema: { $ref: '#/components/schemas/StatusOK' }
         '404':
           description: provider_not_found
+
+  # ---------------------------------------------------------------- Sources (ADR-072)
+
+  /sources:
+    get:
+      tags: [Platform Admin]
+      summary: List app/source registrations
+      description: |
+        Returns every source (including disabled) for a platform. A source is a
+        first-class client app (web/android/ios/desktop human app, or the `bot`
+        service-account app) and carries `allowed_methods` — ADR-072 mapping-2,
+        the login methods that app surfaces. Gated on
+        `requireRealmPermission(platform_id, "sources:read")` (ADR-074):
+        the platform owner, the realm's own M2M token, or a member whose
+        realm role grants `sources:read`.
+      parameters:
+        - in: query
+          name: platform_id
+          required: true
+          schema: { type: string, format: uuid }
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourceList' }
+        '400':
+          description: missing_platform_id
+        '403':
+          description: forbidden
+    post:
+      tags: [Platform Admin]
+      summary: Register an app/source
+      description: |
+        Creates a platform-level source. Validation (ADR-072 §0 — mapping-2 can
+        never weaken the mapping-1 safety invariant):
+
+        - `type` ∈ {web, android, ios, desktop, bot}
+        - a `bot` source may list only `otp` in `allowed_methods`
+        - a human source (web/android/ios/desktop) may never list `otp`; each
+          method must be a recognised human provider (google/microsoft/apple/
+          facebook/firebase)
+
+        The `bot` source is normally auto-provisioned when the first service
+        account is created (one per platform); this endpoint lets an owner
+        register sources explicitly. Writes are gated on
+        `requireRealmPermission(platform_id, "sources:manage")` (ADR-074).
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSourceRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Source' }
+        '400':
+          description: missing_platform_id | unsupported_type | method_violates_kind | bad_request
+        '403':
+          description: forbidden
+        '404':
+          description: realm_not_found
+
+  /sources/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Platform Admin]
+      summary: Update an app/source
+      description: |
+        Sparse update. At least one of `label`, `allowed_methods`, `enabled` is
+        required. A patched `allowed_methods` is re-validated against the
+        source's (immutable) type — mapping-2 can never weaken mapping-1.
+        Gated on `sources:manage` (ADR-074).
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchSourceRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Source' }
+        '400':
+          description: empty_patch | method_violates_kind | bad_request
+        '403':
+          description: forbidden
+        '404':
+          description: source_not_found
+    delete:
+      tags: [Platform Admin]
+      summary: Remove an app/source (`sources:manage`, ADR-074)
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatusOK' }
+        '403':
+          description: forbidden
+        '404':
+          description: source_not_found
 
   # ---------------------------------------------------------------- Tenants
 
@@ -2993,6 +4967,55 @@ paths:
         '200':
           description: OK
 
+  /platforms/{id}/login-attempts:
+    get:
+      tags: [Platforms]
+      summary: Login-history trail (platform owner; I-16)
+      description: |
+        Recent login attempts (success + failure) for the platform's realm —
+        the `design.md` §Login History trail. Realm-scoped: the realm is always
+        known on an attempt while the tenant often is not (a failed login never
+        resolves one). Each row carries the outcome (`success` / `invalid_token`
+        / `not_invited` / `suspended` / `error` — the CHECK-pinned vocabulary;
+        finer error classes collapse), the login identifier, the method, and a
+        timestamp. Gated on the ADR-074 realm permission `audit:read` (owner is
+        implicit-all); keyed off the login's realm so a platform owner sees only
+        their own end-users' attempts (ADR-067). `?limit` (default 100, max
+        1000).
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 100, maximum: 1000 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer, format: int64 }
+                        tenant_id: { type: string }
+                        realm_id: { type: string }
+                        identifier: { type: string }
+                        outcome: { type: string }
+                        method: { type: string }
+                        ip: { type: string }
+                        user_agent: { type: string }
+                        created_at: { type: string, format: date-time }
+        '403':
+          description: forbidden (not the tenant owner)
   /tenants/{id}/users:
     get:
       tags: [Tenants]
@@ -3028,6 +5051,50 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/UserListPage' }
 
+  /tenants/{id}/users/import:
+    post:
+      tags: [Tenants]
+      summary: Bulk-import pre-provisioned active users (ADR-073 Release B)
+      description: |
+        Provisions a batch of pre-trusted, **active** human users into one
+        tenant. Distinct from the invite flow (ADR-017): imported users are
+        `status='active'` with **verified** contacts, bound to their provider
+        identity on first SSO (by `provider_uid` when supplied, else by
+        email/phone match). Gated on
+        `requireTenantPermission(id, "users:manage")` (ADR-074): the
+        tenant's own owner, the realm's own M2M token, or a member whose
+        realm role grants `users:manage`.
+
+        **Two-phase, whole-file-atomic on validation.** Phase 1 validates every
+        row and writes nothing; any structural error → `committed:false` with a
+        per-row report and no writes. Phase 2 commits all only when phase 1 is
+        clean. **Both cases return HTTP 200** (ADR-069 uniform-200 envelope) —
+        the `committed` flag + `rows[]` report is authoritative, not the status.
+
+        **Identity (ADR-073 §B.2):** a row may carry its own `user_id` (a UUID)
+        which becomes `users.id`; a row without one gets a freshly-minted UUIDv7
+        **returned** in the row result. A `user_id` that already exists in
+        another tenant rejects the whole file (`cross_tenant_user_id`).
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportUsersRequest' }
+      responses:
+        '200':
+          description: |
+            Import report. `committed:true` = all rows written;
+            `committed:false` = validation rejected the file, nothing written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportUsersResponse' }
+
   /tenants/{id}/users/{uid}:
     get:
       tags: [Tenants]
@@ -3048,6 +5115,61 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/User' }
+    patch:
+      tags: [Tenants]
+      summary: Patch a user's contact identifiers (email/phone)
+      description: |
+        ADR-042 P2 admin contact-patch flow (`gPatchUserContact`). Gated
+        on `users:manage` (ADR-074). For each supplied non-empty value
+        the handler soft-releases the user's currently-active contact of
+        that kind, revokes its pending `contact_verifications`,
+        supersedes any pending contact-drift review, inserts the new
+        `user_contacts` row (unverified, `added_by=admin_entry`, with a
+        30-day `slot_recycled_until` so a first IdP login on the slot
+        triggers the owner-approval gate), rebuilds the user's contacts
+        snapshot, and emits `user.contact_changed`. The four steps are
+        idempotent but NOT wrapped in one transaction (hardening tracked
+        separately). At least one of `email` / `phone` is required; a
+        value equal to the current active contact is a no-op.
+
+        This IS the ADR-077 §5 identity-rebind seam. Authz is `users:manage`
+        (same-tenant) **or the direct parent** (break-glass, G-014 gate,
+        never a grandparent). Every change fires the ADR-079 **bidirectional
+        notification** (email old + new address; a phone change routes the
+        alarm to the account email on record). A cross-user collision is
+        rejected up front (409) so a failed rebind leaves the binding intact.
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: uid
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: At least one of email / phone required.
+              properties:
+                email: { type: string }
+                phone: { type: string }
+      responses:
+        '200':
+          description: OK — the updated user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400':
+          description: bad_json | missing_fields (neither email nor phone supplied)
+        '404':
+          description: user_not_found
+        '409':
+          description: identifier_collision (identifier already in use in this tenant)
 
   /tenants/{id}/users/{uid}/role:
     patch:
@@ -3092,7 +5214,7 @@ paths:
   /tenants/{id}/users/{uid}/status:
     patch:
       tags: [Tenants]
-      summary: Flip a user's status
+      summary: Flip a user's status (PUT is mounted as an alias of PATCH)
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -3117,6 +5239,89 @@ paths:
       responses:
         '200':
           description: OK
+
+  /tenants/{id}/integration-installations:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Platform Admin]
+      summary: List inbound integration access (ADR-083 §4.5, TARGET side)
+      description: |
+        The org owner's "who can act in my org, as what" list — every standing
+        inbound installation with its source realm, role and last-used stamp.
+        Gated on `org_grants:read`. This list is the sole way a new owner
+        discovers foreign access inherited across an ownership transfer
+        (ADR-082 §7.4), so a non-zero count must be surfaced at transfer.
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+    post:
+      tags: [Platform Admin]
+      summary: Install an integration into this org (ADR-083 §4.2)
+      description: |
+        Admits a foreign integration, materialising a kind=service principal in
+        this org that holds the chosen role. Gated on `org_grants:manage` (only
+        the org owner by default). RI hosts no consent screen — this endpoint IS
+        the consent surface, rendered by the partner's own console (ADR-083 §5).
+        The role MUST be authored specifically for service use — its
+        `assignable_to` must be exactly `["service"]` (ADR-082 §7.1); a role that
+        merely permits service (e.g. `["human","service"]`) is rejected.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [integration_id, role_id]
+              properties:
+                integration_id: { type: string, format: uuid }
+                role_id: { type: string, format: uuid, description: 'a role whose assignable_to is exactly ["service"]' }
+      responses:
+        '201':
+          description: Installed
+        '400':
+          description: invalid_integration_id | invalid_role_id | integration_disabled | invalid_role | role_not_installable | role_disabled | role_not_service_typed
+        '404':
+          description: integration_not_found | tenant_not_found
+        '409':
+          description: already_installed
+
+  /tenants/{id}/integration-installations/{iid}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: iid
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Platform Admin]
+      summary: Uninstall an integration — TARGET half of two-ended revocation (ADR-082 §6.3)
+      description: |
+        Revokes the edge so future mints fail, and suspends the service
+        principal. Live access tokens are NOT revoked (they are
+        signature-verified); the exposure is bounded by the fixed 600s
+        access-token TTL (ADR-083 §4.4). Gated on `org_grants:manage`.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+        '404':
+          description: installation_not_found
 
   /tenants/{id}/invitations:
     parameters:
@@ -3154,8 +5359,8 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/InvitationCreateRequest' }
       responses:
-        '200':
-          description: OK
+        '201':
+          description: Created
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Invitation' }
@@ -3177,6 +5382,246 @@ paths:
       responses:
         '200':
           description: OK
+
+  # ------------------------------------------------ Service accounts (ADR-071)
+
+  /tenants/{id}/service-accounts:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Service Accounts]
+      summary: List the tenant's service accounts (owner/admin or service_accounts:read)
+      description: |
+        Lists the `kind=service` accounts in the tenant (ADR-071 §10).
+        Caller must be owner/admin of the tenant, the realm's own M2M
+        token, OR a non-owner/admin whose realm role grants
+        `service_accounts:read` (or `service_accounts:manage`, which
+        implies read) (ADR-074 §I-06). Reached via the BFF on-behalf
+        pattern (platform bot + `X-On-Behalf-Of-User`).
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ServiceAccount' }
+    post:
+      tags: [Service Accounts]
+      summary: Provision a service account (owner/admin)
+      description: |
+        Creates a `kind=service` account (ADR-071 §2): active from birth,
+        no invite expiry (reaper-exempt), a single membership, a
+        caller-chosen role that is neither `owner` nor `platform_api`, and
+        an email-shaped login handle that is verified-at-creation and
+        unique-in-tenant (`409 handle_taken` on collision). The owner then
+        mints the first `view_bff` login OTP via `POST /auth/otp/issue`
+        (`purpose=login`). Owner/admin, or a realm role granting
+        `service_accounts:manage` (ADR-074 §I-06); the lifecycle
+        endpoints below share this write gate.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceAccountCreateRequest' }
+      responses:
+        '201':
+          description: |
+            Created — the ServiceAccount DTO only. **No OTP is returned
+            here**: the show-once `view_bff` login OTP is minted by a
+            separate `POST /auth/otp/issue` (`purpose=login`) call.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '400':
+          description: |
+            bad_json | invalid_handle (handle must be email-shaped,
+            containing `@`) | invalid_role (role may not be `owner` or
+            `platform_api`) | unknown_role / role_disabled (role not in
+            the realm catalog / disabled).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: handle_taken — login handle already in use in this tenant
+
+  /tenants/{id}/service-accounts/{said}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: said
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Service Accounts]
+      summary: Get one service account (owner/admin or service_accounts:read)
+      description: |
+        Caller must be owner/admin of the tenant, the realm's own M2M
+        token, OR a non-owner/admin whose realm role grants
+        `service_accounts:read` (or `service_accounts:manage`, which
+        implies read) (ADR-074 §I-06).
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '404':
+          description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
+
+  /tenants/{id}/service-accounts/{said}/reset-handle:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: said
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Service Accounts]
+      summary: Change the login handle (owner/admin)
+      description: |
+        Recovery path when a platform picked a handle colliding with a real
+        user's needs (ADR-071 §10). Inserts the new handle first (`409` on
+        collision) then releases the prior one, so the account is never
+        without a resolvable handle.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceAccountResetHandleRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '400':
+          description: bad_json | invalid_handle (must be email-shaped, containing `@`)
+        '404':
+          description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
+        '409':
+          description: handle_taken — login handle already in use in this tenant
+
+  /tenants/{id}/service-accounts/{said}/suspend:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: said
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Service Accounts]
+      summary: Suspend a service account (owner/admin)
+      description: Blocks new logins and revokes live sessions (ADR-071 §10).
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '404':
+          description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
+
+  /tenants/{id}/service-accounts/{said}/unsuspend:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: said
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Service Accounts]
+      summary: Unsuspend a service account (owner/admin)
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '404':
+          description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
+
+  /tenants/{id}/service-accounts/{said}/revoke:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: said
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Service Accounts]
+      summary: Revoke live sessions (rotate ≡ revoke, owner/admin)
+      description: |
+        Revokes the account's active sessions/refresh tokens without
+        deactivating (ADR-071 §10). The next agent run re-onboards via a
+        fresh OTP.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  revoked_sessions: { type: integer }
+        '404':
+          description: service_account_not_found
+
+  /tenants/{id}/service-accounts/{said}/deactivate:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: said
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Service Accounts]
+      summary: Deactivate a service account (soft delete, owner/admin)
+      description: |
+        Soft delete (`status=deactivated`, ADR-071 §10): revokes live
+        sessions and releases the handle slot. Preserves the audit trail;
+        there is no hard user delete.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '404':
+          description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
 
   # ------------------------------------------------ Contact Drift Review (v0.11.0)
 
@@ -3233,10 +5678,13 @@ paths:
     post:
       tags: [Contact Drift]
       summary: >-
-        Reject a drift review — distrust the IdP rewrite. The user is
-        deactivated and a fresh invite is issued carrying the ORIGINAL
-        contact value (role copied from the disabled user), preserving
-        admin authority (AutoMahn REQ-AUTH-L07/L08).
+        Reject a drift review (ADR-080 Part 3). SOFT by default: dismiss the
+        IdP-asserted change, keep the account and its original binding intact,
+        and notify the original address that a login-identity change was
+        declined (no teardown). An optional body {"hard": true} escalates to a
+        HARD reject that parks the account by severing its provider binding —
+        a deliberate "this looks like a takeover" action; the account row is
+        left active-but-unmapped, not deactivated or re-invited.
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -3247,9 +5695,88 @@ paths:
           name: reviewId
           required: true
           schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                hard: { type: boolean, default: false }
       responses:
         '200':
-          description: OK
+          description: "OK — status=rejected, mode=soft|hard"
+
+  /tenants/{id}/users/{uid}/contacts/{contactId}/delink:
+    post:
+      tags: [Contact Drift]
+      summary: >-
+        Delink a contact's provider binding (ADR-080 Part 2). Revokes every
+        active contact_verifications row bound to the contact, leaving the
+        user_contacts row itself ACTIVE but unmapped, so a new provider
+        identity can bind on the next verified login (subject to the Phase A
+        verified-email gate). This is the explicit owner action that unblocks
+        a `contact_admin_required` login — a different provider claiming an
+        address already bound to another identity — without ever silently
+        transferring the binding. Owner/admin only (users:manage). Idempotent.
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: uid
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: contactId
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: "OK — status=delinked, contact_id, revoked_bindings"
+        '404':
+          description: user or contact not found (or contact not owned by user)
+
+  /tenants/{id}/users/{uid}/hand-back:
+    post:
+      tags: [Contact Drift]
+      summary: >-
+        Hand back an account (ADR-080 Part 3). Reactivate the OLD account (uid)
+        and move the mistakenly-created NEW account's current email identity
+        onto it, then disable the new account — the explicit, audited recovery
+        for a drift/rebind that created a separate account. Ordering: release
+        the new account's email first (freeing the (tenant,email) slot),
+        reactivate + re-point the old account, disable the new one. The user's
+        next verified login rebinds the same provider UID to the old account.
+        Owner/admin only (users:manage).
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: uid
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from_user_id]
+              properties:
+                from_user_id: { type: string, format: uuid }
+      responses:
+        '200':
+          description: "OK — status=handed_back, user_id, email"
+        '400':
+          description: from_user_id missing / same user / source account has no email
+        '404':
+          description: target or source user not found
 
   # ----------------------------------------- First-login step-up gate (v0.11.0)
 
@@ -3363,6 +5890,12 @@ paths:
     delete:
       tags: [MFA Admin]
       summary: Reset a user's MFA (also clears mfacache for (user, tenant))
+      description: |
+        Admin/parent MFA reset. Authz is `users:manage` (same-tenant) **or the
+        direct parent** (ADR-077 §4 tier-2 break-glass, G-014 gate — never a
+        grandparent; a reset never grants login). Emails the affected user for
+        tamper-evidence (ADR-079), labelled by who reset it (self / admin /
+        parent).
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -3387,8 +5920,11 @@ paths:
         `is_realm_staff` is a per-request derivation (not a JWT claim) so
         staff demotion takes effect on the next /me call.
         `owned_platforms_count` counts admin tenants the caller owns.
-        `memberships` lists every tenant the caller belongs to across
-        realms (joined via shared email).
+        `memberships` lists the caller's tenants (matched via shared
+        email) **scoped to the session's own realm** — tenants that live
+        in other realms are excluded, since they are not switchable from
+        this session (a switch re-pins within the session realm and a
+        foreign-realm tenant fails MintForTenant with not_a_member).
       security: [{ BearerAccess: [] }]
       responses:
         '200':
@@ -3516,12 +6052,39 @@ paths:
     post:
       tags: [Platform Admin]
       summary: Verify the pending claim and bind the domain to the tenant
+      description: |
+        **Domain-contest surface (ADR-063 §4).** When the challenger
+        proves control but the domain is already held by an incumbent
+        mapping, the bind does not 409 — a **contest** is opened instead
+        and the 200 body is
+        `{status:"contest_open", contest_id, closes_at}` (7-day overlap
+        window; the incumbent's config never moves — only the domain
+        attachment is at stake, resolved by the contest worker). A
+        second verify while a contest is already open returns
+        `409 contest_open`. A plain conflict with no contest path
+        returns `409 domain_taken`.
       security: [{ BearerPlatformToken: [] }]
       responses:
-        '200': { description: OK — verified + bound (or pending if DNS not yet live) }
+        '200':
+          description: OK — verified + bound, pending if DNS not yet live, or contest opened
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      status: { type: string, enum: [verified, pending] }
+                      id: { type: string, format: uuid }
+                  - type: object
+                    description: ADR-063 §4 contest opened (see description).
+                    required: [status, contest_id, closes_at]
+                    properties:
+                      status: { type: string, enum: [contest_open] }
+                      contest_id: { type: string, format: uuid }
+                      closes_at: { type: string, format: date-time }
         '400': { description: verification_failed }
         '404': { description: domain_not_found | tenant_not_found }
-        '409': { description: domain_taken }
+        '409': { description: domain_taken | contest_open (a contest is already open for this domain) }
 
   /platforms/{pid}/tenants/{tid}/domains/{domain}:
     parameters:
@@ -3572,6 +6135,21 @@ paths:
 
         The DV lookup is owner-scoped to the realm, so any admin in
         this realm can have completed the claim/verify pair.
+
+        **Domain-contest surface (ADR-063 §4, I-09).** When the realm has
+        proven its OWN DNS control (a verified `domain_verifications` row —
+        not a trusted-by-parent borrow) of a domain a **different realm**
+        still holds, the bind does **not** 409 — a **contest** is opened
+        and the 201 body is `{status:"contest_open", contest_id, closes_at}`
+        (7-day overlap; the incumbent keeps routing and is emailed; only the
+        domain attachment is at stake). The contest worker transfers ONLY if
+        the incumbent's TXT proof is gone AND the challenger's still resolves
+        at close; a trusted-by-parent incumbent is rechecked at its parent
+        apex. Guards: a second bind while a contest is open → `409
+        contest_open`; a domain that just survived a contest is under an
+        anti-harassment lock → `409 contest_cooldown`; a conflict with no
+        challenger proof (trusted-by-parent, same realm, or a tenant
+        incumbent) stays `409 domain_taken`.
       security: [{ BearerPlatformToken: [] }]
       requestBody:
         required: true
@@ -3583,8 +6161,12 @@ paths:
               properties:
                 domain: { type: string }
       responses:
-        '200': { description: OK }
-        '409': { description: domain_taken }
+        '201':
+          description: |
+            Created — bound. When a cross-realm contest is opened instead
+            (ADR-063 §4), the body is `{status:"contest_open", contest_id,
+            closes_at}` rather than the bound-mapping shape.
+        '409': { description: domain_taken | contest_open | contest_cooldown }
         '412': { description: domain_not_verified }
 
   /platforms/{id}/origins/claim:
