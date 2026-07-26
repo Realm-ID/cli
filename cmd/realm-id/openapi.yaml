@@ -2520,6 +2520,15 @@ components:
         prefix:
           type: string
           description: Non-secret prefix derived from the stored hash; stable across logs.
+        label:
+          type: string
+          description: |
+            ADR-085 §7 — the label supplied at create, and **the only handle on a
+            key**. The plaintext is never echoed and `prefix` is derived from the
+            stored hash, so an `rk_live_…` found in a log or a deployment config
+            cannot be traced back to its row by value. Label bootstrap-minted keys
+            predictably or you will not be able to tell them apart later. Empty
+            string when the key was created without one.
         role: { type: string }
         created_at: { type: integer, description: Unix seconds }
         last_used_at:
