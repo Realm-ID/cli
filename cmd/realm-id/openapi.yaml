@@ -46,7 +46,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.15.0
+  version: 0.16.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -330,11 +330,12 @@ components:
           otp:               '#/components/schemas/LoginRequestOTP'
           api_key:           '#/components/schemas/LoginRequestAPIKey'
           platform_api_key:  '#/components/schemas/LoginRequestPlatformAPIKey'
+          user_api_key:      '#/components/schemas/LoginRequestUserAPIKey'
           urn:ietf:params:oauth:grant-type:token-exchange: '#/components/schemas/LoginRequestTokenExchange'
       properties:
         grant_type:
           type: string
-          enum: [provider_token, password, otp, api_key, platform_api_key, 'urn:ietf:params:oauth:grant-type:token-exchange']
+          enum: [provider_token, password, otp, api_key, platform_api_key, user_api_key, 'urn:ietf:params:oauth:grant-type:token-exchange']
         custom_claims:
           type: object
           additionalProperties: true
@@ -481,6 +482,54 @@ components:
       example:
         grant_type: api_key
         api_key: rk_svc_live_AbCdEf012345
+
+    LoginRequestUserAPIKey:
+      type: object
+      required: [grant_type, api_key]
+      description: |
+        ADR-084 end-user api-key exchange. **No inbound bearer** — the raw key
+        travels in `api_key`. Mints a **user-class** session for the key's bound
+        user, capped by the key's `permissions_cap`.
+
+        Three things are re-resolved HERE, at every exchange, rather than trusted
+        from the key row:
+
+        1. **The key itself** — revoked or past `expires_at` returns the same
+           envelope either way, so a holder cannot distinguish the two states.
+        2. **Live org membership** — for `org_scope=selected`, `org_ids` no
+           longer resolvable are dropped; for `all`, memberships are resolved
+           fresh. Revocation on membership loss is an async sweep, not
+           transactional (reachability of an org dies through many events across
+           other tenants' transactions), so a key may LIST an org it can no
+           longer MINT into.
+        3. **The MFA floor** — exempt if and only if MFA was proven at mint
+           (`minted_mfa_at IS NOT NULL`). Without that exemption a headless
+           script could never log in to a realm with a mandatory floor, making
+           user keys unusable in exactly the realms that care most.
+
+        The minted token carries `amr: ["api_key"]` with **no** `mfa` entry, so it
+        can never satisfy a downstream step-up gate.
+
+        A **partner-audience** key is class-rejected at RealmID's own admin
+        surface with `user_key_not_accepted_here`: its `permissions_cap` is
+        opaque to RealmID, so there is nothing to intersect and therefore
+        nothing to enforce — only to refuse.
+      properties:
+        grant_type: { type: string, enum: [user_api_key] }
+        api_key:
+          type: string
+          description: |
+            The raw user API key. Prefix `uk_live_`, deliberately distinct from
+            the admin key's `rk_live_`.
+        tenant_id:
+          type: string
+          format: uuid
+          description: |
+            Optional target org. Must be within the key's resolved scope, else
+            `403 org_not_in_key_scope`. Omitted on a single-org key = that org.
+      example:
+        grant_type: user_api_key
+        api_key: uk_live_AbCdEf012345
 
     LoginRequestPlatformAPIKey:
       type: object
@@ -1655,6 +1704,169 @@ components:
             requires the user (or one of the user's role assignments)
             to be enrolled in `otp` — see `users.mfa_methods`
             and `roles.required_mfa_methods`.
+
+        # ---- ADR-084 §10: user API keys (end-user keys) -------------------
+        user_api_keys:
+          type: object
+          description: |
+            ADR-084 end-user-API-key settings, grouped as ONE nested object
+            rather than a dozen `user_api_key_*` siblings. Governs **user**
+            keys only — the platform-bot key's lifecycle is ADR-085 and its
+            login switch is `platform_api_key_login_enabled` below.
+
+            **PATCH semantics are MERGE**: an omitted sub-key leaves the stored
+            value alone. This deliberately differs from
+            `refresh_absolute_expiry`, which replaces wholesale because its
+            fields are one coherent policy where a partial update is ambiguous;
+            these knobs are independent, so resetting eleven of them because
+            the caller patched the twelfth would be a footgun.
+
+            An unknown sub-key is rejected with `unknown_config_key` qualified
+            by the dotted path (e.g. `user_api_keys.enabld`) — silently
+            ignoring it would let a typo look like a successful write.
+          properties:
+            enabled:
+              type: boolean
+              description: |
+                Master switch. Default **false**: the feature is opt-in per
+                realm. While false every
+                `/tenants/{tid}/users/{uid}/user-api-keys` call returns
+                `412 user_api_keys_disabled`.
+            max_active:
+              type: integer
+              minimum: 1
+              maximum: 100
+              description: |
+                Maximum **active** keys per user — active meaning neither
+                revoked nor expired, so revoked and expired rows do not consume
+                slots. Default 5. `409 too_many_active_keys` at the limit.
+
+                Per ADR-084 §6 this is a **per-partition** quota, not
+                per-person: cross-tenant identity is an equivalence induced by
+                approved `contact_verifications` `(method, provider_uid)`
+                tuples — the IdP account, not the email address — so two IdP
+                accounts for one human are two identities by design (ADR-080's
+                anti-takeover posture) and each carries its own quota.
+            max_ttl_seconds:
+              type: integer
+              minimum: 300
+              maximum: 31536000
+              description: |
+                Hard ceiling on a key's TTL, applied at mint; above it returns
+                `400 ttl_exceeds_max`. Default 7776000 (90d).
+            default_ttl_seconds:
+              type: integer
+              minimum: 300
+              maximum: 31536000
+              description: |
+                TTL applied when a mint request omits `ttl_seconds`. Default
+                2592000 (30d). **Not** cross-validated against `max_ttl_seconds`
+                at PATCH time — both can arrive in one body in either order, so
+                a pairwise check would be order-dependent. The mint path clamps
+                default to max instead, which is the only place both values are
+                known for certain.
+            allow_non_expiring:
+              type: boolean
+              description: |
+                When false (default) a key must carry an expiry; requesting a
+                non-expiring key returns `400 non_expiring_not_allowed`. A
+                permanent user credential should be a conscious realm-level
+                decision, not what you get by omitting a field.
+            org_scope_default:
+              type: string
+              enum: ["", selected, all]
+              description: |
+                ADR-084 §6 — `org_scope` used when a mint request omits it.
+                `selected` (default) pins the key to a **frozen** allowlist of
+                org ids, defaulting to just the user's current org; memberships
+                acquired later do **not** widen the key. Setting this to `all`
+                still requires `allow_all_orgs`.
+            allow_all_orgs:
+              type: boolean
+              description: |
+                ADR-084 §6 — gates `org_scope=all`, default **false**. `all`
+                means "every org in this realm the user belongs to, now *and in
+                future*", resolved fresh at every exchange rather than
+                snapshotted (a snapshot would mean "all orgs as of Tuesday",
+                which is neither thing a user could mean). It is the one mode
+                that widens with no human in the loop — hence its own opt-in,
+                and the requirement that the mint UI label it
+                forward-inclusive. `400 all_orgs_not_allowed` when false.
+            max_permission_strings:
+              type: integer
+              minimum: 1
+              maximum: 256
+              description: |
+                Cap on the number of entries in `permissions_cap`. Default 32;
+                `400 too_many_permissions` above it.
+            max_permission_string_len:
+              type: integer
+              minimum: 1
+              maximum: 1024
+              description: |
+                Cap on the length of one `permissions_cap` entry. Default 128.
+                Shape validation only — for a partner audience the strings are
+                opaque to RealmID (ADR-084 §7.2).
+            admin_mint_allowed:
+              type: boolean
+              description: |
+                When false (default) `{uid}` on the mint route must be the
+                caller: keys are self-service only.
+                **Base-realm-staff-only to change**, in either direction — the
+                realm's own admin is the party this restrains, so they cannot
+                be the party who lifts it (same reasoning as
+                `require_bff_login`).
+
+                Default false because an admin minting a credential that
+                authenticates **as** a member is impersonation by another name,
+                and ADR-039 impersonation is deliberately unbuilt.
+            require_mfa_at_mint:
+              type: boolean
+              nullable: true
+              description: |
+                ADR-084 §8 — makes minting a step-up operation
+                (`RequireMFAOpts(mintPath, {RequireFresh: true})`), answering
+                `412 mfa_required` with a challenge.
+
+                **Defaults to ON**: `null` (never configured) means required
+                whenever the realm has MFA *enabled* — not merely enforced. So
+                `null` and `false` differ: `false` is an explicit downgrade.
+                That is why this is nullable rather than a plain boolean, which
+                could never be turned off.
+
+                This is one mechanism with §8.1's floor exemption: a key
+                exchange *is* a login, and in a realm with a mandatory MFA floor
+                a headless script can never present TOTP. So key exchange is
+                exempt from the realm MFA floor **if and only if** MFA was
+                proven at mint (`minted_mfa_at IS NOT NULL`). Weakening this
+                knob therefore weakens the exemption's justification, not just
+                the mint.
+            org_admin_visible:
+              type: boolean
+              nullable: true
+              description: |
+                Whether an org admin holding `user_api_keys:read` may see (and
+                with `user_api_keys:manage`, revoke) their members' keys.
+                **Defaults to ON** — `null` = never configured = visible;
+                `false` hides the surface. Nullable for the same reason as
+                above.
+
+        # ---- ADR-057 Amendment A.1 / ADR-085 §5 --------------------------
+        platform_api_key_login_enabled:
+          type: boolean
+          nullable: true
+          description: |
+            Gates `POST /auth/login` with `grant_type=platform_api_key` for this
+            realm. **Defaults to ON** (`null` = never configured = enabled), so
+            nothing changes for an existing realm.
+
+            Setting it false is what lets a realm that has completed its ADR-057
+            WIF migration go keyless **and mean it**: WIF's whole value is that
+            no long-lived secret sits in the deployed service, which is void if
+            a forgotten key still authenticates. The flip is
+            base-realm-staff-only in both directions and is audited; it is
+            blocked (or loudly warned) while active non-revoked keys exist —
+            **expired keys do not count as blocking**.
         refresh_absolute_expiry:
           type: object
           description: |
@@ -1740,6 +1952,29 @@ components:
         mfa_policy: { type: string }
         accept_provider_mfa: { type: boolean }
         provider_mfa_ttl_seconds: { type: integer }
+        # ADR-084 §10. Always the full object with every sub-key present, same
+        # "no key is ever omitted" rule the top level follows. The two nullable
+        # booleans default to TRUE, so `null` means "never configured" and
+        # therefore ON — NOT the same as `false`, which is an explicit downgrade.
+        user_api_keys:
+          type: object
+          description: |
+            ADR-084 end-user-API-key settings. Semantics, ranges and defaults for
+            each sub-key are documented on `RealmConfigPatch.user_api_keys`.
+          properties:
+            enabled: { type: boolean }
+            max_active: { type: integer }
+            max_ttl_seconds: { type: integer }
+            default_ttl_seconds: { type: integer }
+            allow_non_expiring: { type: boolean }
+            org_scope_default: { type: string }
+            allow_all_orgs: { type: boolean }
+            max_permission_strings: { type: integer }
+            max_permission_string_len: { type: integer }
+            admin_mint_allowed: { type: boolean }
+            require_mfa_at_mint: { type: boolean, nullable: true }
+            org_admin_visible: { type: boolean, nullable: true }
+        platform_api_key_login_enabled: { type: boolean, nullable: true }
         refresh_absolute_expiry:
           type: object
           description: |
@@ -2278,6 +2513,14 @@ components:
           type: integer
           nullable: true
           description: Unix seconds; present iff the key has been revoked.
+        expires_at:
+          type: integer
+          nullable: true
+          description: |
+            ADR-085 §3 — Unix seconds of the key's scheduled cutoff; `null` =
+            non-expiring. A key past its expiry behaves EXACTLY like a revoked
+            one at login and at M2M refresh, and returns the same error
+            envelope, so the two states are indistinguishable to a key holder.
 
     APIKeyListPage:
       type: object
@@ -2588,6 +2831,23 @@ components:
             platform-class. (Footgun; tracked for fix — make it
             authoritative or drop it.)
         label: { type: string }
+        ttl_seconds:
+          type: integer
+          minimum: 300
+          description: |
+            ADR-085 §3 — key lifetime in seconds. Omit **and** set
+            `non_expiring: true` for a permanent key; omitting both applies the
+            realm default. Expiry is enforced at three points and implementing
+            only the first is the trap: at create (here), at the login lookup,
+            and at every M2M refresh (§4).
+        non_expiring:
+          type: boolean
+          description: |
+            Explicitly request a key with no expiry. Rejected with
+            `400 non_expiring_not_allowed` when the realm already holds a
+            non-expiring platform key — at most one is permitted, so a
+            permanent key is a conscious act rather than what you get by
+            forgetting a field.
         user_id:
           type: string
           format: uuid
@@ -2617,6 +2877,152 @@ components:
             authoritative class (see CreateAPIKeyRequest.scope). The
             real class is derived from the bound bot user's role.
         label: { type: string }
+        expires_at:
+          type: integer
+          nullable: true
+          description: |
+            ADR-085 §3 — Unix seconds of the scheduled cutoff; `null` =
+            non-expiring, which is permitted for at most ONE platform key per
+            realm.
+
+    UserAPIKeyCreateRequest:
+      type: object
+      required: [label]
+      properties:
+        label:
+          type: string
+          description: |
+            Human label. **The only handle on a key**: listing returns a
+            non-secret hash prefix, never the plaintext, so a found
+            `uk_live_…` cannot otherwise be correlated to its row.
+        org_scope:
+          type: string
+          enum: [selected, all]
+          description: |
+            ADR-084 §6. `selected` (realm default) pins the key to a FROZEN
+            allowlist — memberships acquired later do NOT widen it. `all` is
+            **forward-inclusive**: every org in this realm the user belongs to,
+            now *and in future*, resolved fresh at each exchange rather than
+            snapshotted. `all` requires the realm's
+            `user_api_keys.allow_all_orgs`, else `400 all_orgs_not_allowed`,
+            and the minting UI must label it forward-inclusive.
+        org_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: |
+            The frozen allowlist for `org_scope=selected`; defaults to just the
+            user's current org. Every id must be a live membership of `{uid}`,
+            else `400 org_not_a_membership`. Ignored when `org_scope=all`.
+        permissions_cap:
+          type: array
+          items: { type: string }
+          description: |
+            **A CAP, NEVER A GRANT.** Effective authority is
+            `permissions_cap ∩ the principal's live permissions`, re-resolved
+            per request — so it can only ever UNDER-grant. Demote the holder
+            and the key shrinks with them; transfer the org (ADR-076) and the
+            cap still binds, because the intersection runs *before* owner
+            implicit-all.
+
+            The name is a control, not decoration: `permissions` in a decoded
+            token reads like an OAuth grant and invites
+            `if (tok.permissions.includes(p)) allow`, which is the stale-scope
+            hole. `permissions_cap` makes that line look wrong.
+
+            For `aud=realmid` the strings are validated at mint against the
+            ADR-074 catalog (`400 unknown_permission`) and enforced at the
+            issuer's gates. For a partner audience they are **opaque to
+            RealmID** — shape-validated only — and the intersection is the
+            REQUIRED partner integration pattern, not a suggestion. A partner
+            with no live permission model has nothing to intersect, and for
+            them the real controls are revocation, expiry, org pinning and the
+            revoke sweep.
+
+            RealmID never pattern-matches, expands, or orders these strings: no
+            wildcards, no hierarchy, no implied `*`. Bounded by
+            `user_api_keys.max_permission_strings` /
+            `max_permission_string_len`.
+        ttl_seconds:
+          type: integer
+          description: |
+            Lifetime in seconds. Omitted = the realm's
+            `user_api_keys.default_ttl_seconds`. Clamped to
+            `max_ttl_seconds`; above it returns `400 ttl_exceeds_max`. A
+            non-expiring key requires `user_api_keys.allow_non_expiring`, else
+            `400 non_expiring_not_allowed`.
+
+    UserAPIKey:
+      type: object
+      description: |
+        Create response. `value` is the plaintext and is shown **once** — it is
+        never stored and never returned again.
+      properties:
+        id: { type: string, format: uuid }
+        value:
+          type: string
+          description: |
+            Raw key, returned only on create. Prefix `uk_live_` is deliberately
+            distinct from the admin key's `rk_live_` so a leaked string is
+            classifiable at a glance and the two lookup paths cannot be
+            confused.
+        label: { type: string }
+        org_scope: { type: string, enum: [selected, all] }
+        org_ids:
+          type: array
+          items: { type: string, format: uuid }
+        permissions_cap:
+          type: array
+          items: { type: string }
+        expires_at:
+          type: integer
+          nullable: true
+          description: Unix seconds; `null` = non-expiring.
+
+    UserAPIKeyListItem:
+      type: object
+      description: |
+        Per-row list shape. The plaintext is never echoed — only the label and a
+        non-secret hash prefix, same discipline as the admin key list.
+      properties:
+        id: { type: string, format: uuid }
+        prefix:
+          type: string
+          description: Non-secret prefix derived from the stored hash.
+        label: { type: string }
+        org_scope: { type: string, enum: [selected, all] }
+        org_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: |
+            For `selected`, the frozen allowlist AS STORED. An org listed here
+            may no longer be resolvable: revocation on membership loss is an
+            async sweep, and live membership is re-intersected at every
+            exchange, so a key can LIST an org it can no longer MINT into
+            (ADR-084 §9).
+        permissions_cap:
+          type: array
+          items: { type: string }
+        minted_mfa_at:
+          type: integer
+          nullable: true
+          description: |
+            Unix seconds MFA was proven at mint; `null` = not proven. Load
+            bearing, not informational: key exchange is exempt from the realm
+            MFA floor **if and only if** this is set (ADR-084 §8.1).
+        created_at: { type: integer, description: Unix seconds }
+        last_used_at: { type: integer, nullable: true }
+        expires_at: { type: integer, nullable: true }
+        revoked_at: { type: integer, nullable: true }
+
+    UserAPIKeyListPage:
+      type: object
+      description: Paginated list envelope per SDK SPEC §7.
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/UserAPIKeyListItem' }
+        next_cursor: { type: string, nullable: true }
+        total: { type: integer, nullable: true }
 
   responses:
     Unauthorized:
@@ -3799,6 +4205,174 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Invitation' }
+
+  # ------------------------------------------------ User API keys (ADR-084)
+  #
+  # Self-service end-user API keys. The segment is `user-api-keys`, DELIBERATELY
+  # distinct from `api-keys`: under the CLI's generated-tree collision rule
+  # (broadest scope = fewest path params wins) a trailing `api-keys` segment
+  # would lose to /platforms/{id}/api-keys and these verbs would never
+  # generate — a partner typing `realm-id api-keys create` would silently hit
+  # the platform-bot mint instead. Mirrors how `starter-roles` stays out of the
+  # `roles` subtree, and yields `realm-id user-api-keys create|list`.
+  #
+  # AUDIENCE IS DERIVED, NEVER SUPPLIED: it is the realm the `{uid}` users row
+  # lives in. Base realm => `realmid`; any other realm => that realm. There is
+  # no request field to set wrong, and a partner cannot mint a RealmID-audience
+  # key because their users do not exist in the base realm.
+
+  /tenants/{tid}/users/{uid}/user-api-keys:
+    parameters:
+      - in: path
+        name: tid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: uid
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [User API Keys]
+      summary: Mint a user API key (plaintext returned once)
+      description: |
+        `{uid}` MUST be the caller unless the realm sets
+        `user_api_keys.admin_mint_allowed` (default false, base-realm-staff-only
+        to change) — an admin minting a credential that authenticates **as** a
+        member is impersonation by another name, and ADR-039 is deliberately
+        unbuilt.
+
+        Minting is a **step-up operation** when
+        `user_api_keys.require_mfa_at_mint` is on (the default whenever the realm
+        has MFA enabled): it answers `412 mfa_required` with a challenge. That is
+        one mechanism with the floor exemption — a key is by definition used with
+        no human present, so MFA can only bind at mint time, and key exchange is
+        exempt from the realm MFA floor only if MFA was proven here.
+
+        Key-derived tokens carry `amr: ["api_key"]` with **no** `mfa` entry, so a
+        key can never satisfy a step-up gate downstream.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserAPIKeyCreateRequest' }
+      responses:
+        '201':
+          description: Created — `value` is shown once and never again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAPIKey' }
+        '400':
+          description: |
+            `ttl_exceeds_max` · `non_expiring_not_allowed` ·
+            `all_orgs_not_allowed` · `org_not_a_membership` ·
+            `too_many_permissions` · `unknown_permission` (realmid audience only)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`forbidden` — minting for another user without `admin_mint_allowed`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`too_many_active_keys` — the per-user active quota is full.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '412':
+          description: '`user_api_keys_disabled` · `mfa_required` (step-up challenge).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [User API Keys]
+      summary: List a user's API keys
+      description: |
+        Returns the label plus a non-secret hash prefix — never the plaintext.
+        `{uid}` must be the caller, or an org admin holding `user_api_keys:read`
+        while the realm's `user_api_keys.org_admin_visible` is on (default).
+
+        `user_api_keys:read` / `:manage` are distinct from `api_keys:read` /
+        `:manage` on purpose: an org admin managing members' keys must not
+        thereby gain platform-key power.
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAPIKeyListPage' }
+        '403':
+          description: '`forbidden`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '412':
+          description: '`user_api_keys_disabled`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /tenants/{tid}/users/{uid}/user-api-keys/{id}:
+    parameters:
+      - in: path
+        name: tid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: uid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [User API Keys]
+      summary: Revoke a user API key (soft)
+      description: |
+        Soft revoke — sets `revoked_at`; the row is retained for audit and stops
+        consuming an active-quota slot.
+
+        Revocation is effective at the next **exchange**: the key can no longer
+        be swapped for a token. Any access token already minted from it remains
+        valid for the remainder of its TTL, which bounds the staleness window.
+        User keys mint **user-class** sessions that refresh via `MintForTenant`,
+        NOT `mintForM2MRefresh`, so ADR-085 §4's admin-key refresh re-check does
+        not apply here; if user keys are ever given a long-lived refresh, that
+        decision has to revisit this.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: |
+            Revoked (idempotent on an already-revoked key). Documented as 200,
+            not 204: ForceStatus200Middleware rewrites every DELETE so the
+            `{status:...}` body GoFr's native 204 would drop survives.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [revoked] }
+                  id: { type: string, format: uuid }
+        '403':
+          description: '`forbidden`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: No such key for this user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   # ----------------------------------------------------- Platform admin
   #

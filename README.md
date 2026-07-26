@@ -45,7 +45,17 @@ realm-id platforms list-mine
 realm-id roles list --platform plt_abc
 realm-id roles create --platform plt_abc --field name=editor --field description="Can edit"
 realm-id api-keys create --platform plt_abc --field label=provisioning   # mint
-realm-id api-keys delete --platform plt_abc --keyId key_123              # revoke (soft)
+# NOTE: there is no `api-keys delete`. DELETE is filtered out wholesale by the
+# ADR-062 §5 destructive-verb rule, so a partner who loses a key currently cannot
+# rotate from the CLI at all. ADR-085 §8 decides that revoke SHOULD be let
+# through (it is soft and re-mintable, and rotation is part of onboarding);
+# tracked in root TODO.md. Until then: `realm-id api --method DELETE`.
+
+# ADR-084 end-user API keys. Self-service: {uid} must be you unless the realm
+# sets user_api_keys.admin_mint_allowed.
+realm-id user-api-keys create --tenant ten_123 --uid usr_9 \
+  --field label=reports-bot --field permissions_cap:='["audit:read"]'
+realm-id user-api-keys list --tenant ten_123 --uid usr_9
 realm-id users list --tenant ten_123 --status active
 realm-id users set-role --tenant ten_123 --uid usr_9 --field role:=\"owner\"
 
@@ -107,8 +117,9 @@ bearer). Overrides: `REALM_ID_BFF`, `REALM_ID_ISSUER`, `REALM_ID_API_KEY`,
 
 Shipped: `auth` (device flow), `config`, the generic `api` passthrough, `schema`,
 and the **typed command tree** (platforms, tenants, users, invitations, api-keys,
-roles, federation-bindings, origins, domains, identity-providers, audit-events, +
-`admin …`) generated from the OpenAPI spec (ADR-062 §1). Destructive verbs
+user-api-keys, roles, federation-bindings, origins, domains, identity-providers,
+audit-events, + `admin …`) generated from the OpenAPI spec (ADR-062 §1).
+Destructive verbs
 (delete / signing-key rotate / suspend / ownership transfer) are intentionally
 absent pending machine-2FA (ADR-062 §5).
 

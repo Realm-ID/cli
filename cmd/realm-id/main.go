@@ -95,9 +95,9 @@ Usage:
   realm-id api <method> <path>     Raw authenticated request through the BFF (JSON)
   realm-id version                 Print the CLI version
 
-Resources: platforms, tenants, users, invitations, api-keys, roles,
-  federation-bindings, origins, domains, identity-providers, audit-events,
-  contact-verifications, contact-drift-reviews, mfa, admin
+Resources: platforms, tenants, users, invitations, api-keys, user-api-keys,
+  roles, federation-bindings, origins, domains, identity-providers,
+  audit-events, contact-verifications, contact-drift-reviews, mfa, admin
 
 Output: --output json|table (json when piped, table on a TTY)
 Scope:  --platform <id> (or active config) · --tenant <id>
@@ -158,7 +158,9 @@ type deviceTokenResp struct {
 }
 
 // resolveDeviceName picks the label sent with a device login, in order:
-//   --device-name <value>, then $REALM_ID_DEVICE_NAME, then the OS hostname.
+//
+//	--device-name <value>, then $REALM_ID_DEVICE_NAME, then the OS hostname.
+//
 // Falls back to "realm-id cli" when the hostname is unavailable. The label
 // helps a user tell this session apart in their session list (ADR-062).
 func resolveDeviceName(args []string) string {
