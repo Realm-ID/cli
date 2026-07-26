@@ -46,7 +46,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.16.0
+  version: 0.17.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -1864,9 +1864,26 @@ components:
             WIF migration go keyless **and mean it**: WIF's whole value is that
             no long-lived secret sits in the deployed service, which is void if
             a forgotten key still authenticates. The flip is
-            base-realm-staff-only in both directions and is audited; it is
-            blocked (or loudly warned) while active non-revoked keys exist —
-            **expired keys do not count as blocking**.
+            base-realm-staff-only in both directions; PATCHing it to `false`
+            while the realm still holds an ACTIVE platform key returns
+            `409 active_api_keys_exist` — **revoked and expired keys do not
+            block**, since they already authenticate nothing. Re-enabling is
+            never blocked.
+
+            Enforcement is at `POST /auth/login`: while `false`, a
+            `grant_type=platform_api_key` call returns
+            `403 platform_api_key_login_disabled`. 403 rather than 401 because
+            the credential is not what is wrong — the realm's policy is, and a
+            401 would send a client into a pointless re-auth loop.
+
+            Because the flip requires zero active keys, no live M2M session can
+            survive it: the keys behind those sessions must be revoked first,
+            and the ADR-085 §4 refresh re-check then kills the sessions.
+
+            The staff-only rule is enforced *inside* the config handler; the
+            handler's outer gate accepts base-realm staff as an alternative to
+            `platform:config`, without which this knob would be unsettable on
+            any partner realm.
         refresh_absolute_expiry:
           type: object
           description: |
@@ -2837,9 +2854,16 @@ components:
           description: |
             ADR-085 §3 — key lifetime in seconds. Omit **and** set
             `non_expiring: true` for a permanent key; omitting both applies the
-            realm default. Expiry is enforced at three points and implementing
-            only the first is the trap: at create (here), at the login lookup,
-            and at every M2M refresh (§4).
+            built-in **90-day** default. That default is deliberately NOT a
+            per-realm knob: a lifetime a partner can widen to "forever" from
+            their own console is not a control. Below the 300s floor the call
+            returns `400 invalid_ttl` rather than clamping — clamping upward
+            would hand back a key that outlives what was asked for. Sending
+            both `ttl_seconds` and `non_expiring` is also `400 invalid_ttl`.
+
+            Expiry is enforced at three points and implementing only the first
+            is the trap: at create (here), at the login lookup, and at every
+            M2M refresh (§4).
         non_expiring:
           type: boolean
           description: |
@@ -2848,6 +2872,11 @@ components:
             non-expiring platform key — at most one is permitted, so a
             permanent key is a conscious act rather than what you get by
             forgetting a field.
+
+            Applies to PLATFORM-class keys (those bound to a `platform_api`
+            bot). Owner-bound `scope=service` keys are excluded from both this
+            rule and the active-key cap: they are bounded by the human who
+            holds them, and ADR-085 §2 caps the machine credential, not people.
         user_id:
           type: string
           format: uuid
@@ -4406,6 +4435,19 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/APIKey' }
+        '400':
+          description: |
+            `invalid_ttl` (below the 300s floor, or `ttl_seconds` sent together
+            with `non_expiring`) · `non_expiring_not_allowed` (the realm already
+            holds a non-expiring platform key) · `scope_mismatch` ·
+            `invalid_user_for_api_key` · `no_default_bot_user`.
+        '409':
+          description: |
+            `too_many_api_keys` — ADR-085 §2 caps a realm at **2 active
+            platform keys**: one steady-state key plus one rotation slot.
+            Revoked and expired keys do not consume a slot. Per-workload
+            separation belongs to WIF bindings (uncapped, ADR-057), not to
+            extra keys.
     get:
       tags: [Platform Admin]
       summary: List API keys for a platform (SDK SPEC §6.5)

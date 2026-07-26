@@ -45,17 +45,28 @@ realm-id platforms list-mine
 realm-id roles list --platform plt_abc
 realm-id roles create --platform plt_abc --field name=editor --field description="Can edit"
 realm-id api-keys create --platform plt_abc --field label=provisioning   # mint
-# NOTE: there is no `api-keys delete`. DELETE is filtered out wholesale by the
-# ADR-062 §5 destructive-verb rule, so a partner who loses a key currently cannot
-# rotate from the CLI at all. ADR-085 §8 decides that revoke SHOULD be let
-# through (it is soft and re-mintable, and rotation is part of onboarding);
-# tracked in root TODO.md. Until then: `realm-id api --method DELETE`.
+realm-id api-keys revoke --platform plt_abc --keyId ak_123                # rotate
+# The verb is `revoke`, not `delete`: it sets revoked_at on a row that stays
+# readable, and a replacement is one `create` away. It is the ONE exemption from
+# the ADR-062 §5 destructive-verb filter (ADR-085 §8) — rotation is part of
+# onboarding, not an irreversible act, and without it a partner who lost a key
+# could not rotate from the CLI at all. Every other DELETE is still absent until
+# machine-2FA exists; reach those with `realm-id api --method DELETE`.
+#
+# Minting is capped: a realm holds at most 2 ACTIVE platform keys (one steady
+# state, one rotation slot) and at most 1 non-expiring — over it, create returns
+# 409 too_many_api_keys. Keys now expire by default (90 days; `--field
+# ttl_seconds=…` to choose, `--field non_expiring=true` for the one permanent
+# slot).
 
 # ADR-084 end-user API keys. Self-service: {uid} must be you unless the realm
 # sets user_api_keys.admin_mint_allowed.
 realm-id user-api-keys create --tenant ten_123 --uid usr_9 \
   --field label=reports-bot --field permissions_cap:='["audit:read"]'
 realm-id user-api-keys list --tenant ten_123 --uid usr_9
+realm-id user-api-keys revoke --tenant ten_123 --uid usr_9 --id uak_456
+# Revocation is the primary control for an end-user key (ADR-084 §9), so it is
+# exempt from the destructive-verb filter for the same reason api-keys revoke is.
 realm-id users list --tenant ten_123 --status active
 realm-id users set-role --tenant ten_123 --uid usr_9 --field role:=\"owner\"
 

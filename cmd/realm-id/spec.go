@@ -140,12 +140,31 @@ func skipPath(path string) bool {
 	return false
 }
 
+// revocablePaths are the DELETE surfaces ADR-085 §8 lets back through the
+// ADR-062 §5 filter. Both are SOFT: they set `revoked_at` on a row that stays
+// readable, and a replacement is one `create` away. §5 exists to keep
+// irreversible acts out of a machine-driven binary until machine-2FA exists —
+// and rotation is part of onboarding, not an irreversible act. Excluding it
+// meant a partner who lost a key could not rotate from the CLI at all, which
+// pushes them toward the worse workaround of never rotating.
+//
+// user-api-keys is included on the same reasoning: ADR-084 §9 and the partner
+// guide both name revocation as the primary control for an end-user key, so a
+// binary that cannot revoke one contradicts the advice we ship with it.
+//
+// Everything else stays filtered. The test in spec_test.go pins both halves.
+func isRevocable(path string) bool {
+	return strings.HasPrefix(path, "/platforms/") && strings.Contains(path, "/api-keys/") ||
+		strings.Contains(path, "/user-api-keys/")
+}
+
 // skipDestructive enforces ADR-062 §5: no delete, no signing-key rotate, no
 // suspend/unsuspend, no ownership/domain transfer (PUT …/owner). These are
-// absent from the binary until machine-2FA exists.
+// absent from the binary until machine-2FA exists. Key revocation is the one
+// documented exemption — see isRevocable.
 func skipDestructive(method, path string) bool {
 	if method == "DELETE" {
-		return true
+		return !isRevocable(path)
 	}
 	if method == "PUT" && strings.HasSuffix(path, "/owner") {
 		return true
@@ -210,6 +229,12 @@ func deriveCommand(method, path string) (group []string, verb string, ok bool) {
 			verb = "describe"
 		case "PATCH", "PUT":
 			verb = "update"
+		case "DELETE":
+			// Only reachable for the ADR-085 §8 exemptions — skipDestructive
+			// filters every other DELETE before this runs. `revoke`, not
+			// `delete`: the row survives, and naming it delete would tell a
+			// partner something false about what they just did.
+			verb = "revoke"
 		default:
 			return nil, "", false
 		}

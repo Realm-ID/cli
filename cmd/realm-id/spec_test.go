@@ -36,6 +36,13 @@ func TestDeriveCommand(t *testing.T) {
 		{"POST", "/domains/claim", "domains", "claim", true},
 		{"GET", "/admin/platforms", "admin platforms", "list", true},
 		{"POST", "/platforms/{id}/api-keys", "api-keys", "create", true},
+		// ADR-085 §8 — key REVOCATION is exempt from the destructive filter.
+		// Rotation is part of onboarding, not an irreversible act: a revoke is
+		// soft and re-mintable, and without it a partner who loses a key cannot
+		// rotate from the CLI at all. The verb is `revoke`, not `delete`, so the
+		// binary never implies the row is gone.
+		{"DELETE", "/platforms/{id}/api-keys/{keyId}", "api-keys", "revoke", true},
+		{"DELETE", "/tenants/{tid}/users/{uid}/user-api-keys/{id}", "user-api-keys", "revoke", true},
 		// destructive + non-CLI surfaces skip entirely
 		{"DELETE", "/tenants/{id}", "", "", false},
 		{"PUT", "/tenants/{id}/owner", "", "", false},
@@ -76,13 +83,19 @@ func TestBuildCommandsTree(t *testing.T) {
 		{"invitations", "create"}, {"api-keys", "list"},
 		{"federation-bindings", "list"}, {"origins", "list"},
 		{"roles", "rename"}, {"audit-events", "list"},
+		// ADR-085 §8 — the only two DELETEs the binary carries.
+		{"api-keys", "revoke"}, {"user-api-keys", "revoke"},
 	} {
 		find(t, tr, want.group, want.verb)
 	}
-	// No destructive verbs anywhere.
+	// No destructive verbs anywhere, except the two soft revokes ADR-085 §8
+	// exempts. Pinned as an exact allowlist rather than a `revoke`-name skip:
+	// a future DELETE that happened to derive the verb `revoke` would otherwise
+	// walk into the binary unnoticed.
+	softRevokes := map[string]bool{"api-keys revoke": true, "user-api-keys revoke": true}
 	for g, verbs := range tr.byGroup {
 		for v, c := range verbs {
-			if c.Method == "DELETE" {
+			if c.Method == "DELETE" && !softRevokes[g+" "+v] {
 				t.Errorf("DELETE leaked into tree: %s %s", g, v)
 			}
 			if strings.Contains(v, "delete") || v == "rotate" || v == "suspend" {
