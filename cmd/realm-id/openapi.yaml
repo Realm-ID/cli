@@ -4331,7 +4331,7 @@ paths:
         `{uid}` must be the caller, or an org admin holding `user_api_keys:read`
         while the realm's `user_api_keys.org_admin_visible` is on (default).
 
-        `user_api_keys:read` / `:manage` are distinct from `api_keys:read` /
+        `user_api_keys:read` / `:manage` are distinct from `platform_api_keys:read` /
         `:manage` on purpose: an org admin managing members' keys must not
         thereby gain platform-key power.
       security: [{ BearerAccess: [] }]
