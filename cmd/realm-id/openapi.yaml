@@ -4450,6 +4450,21 @@ paths:
             with `non_expiring`) · `non_expiring_not_allowed` (the realm already
             holds a non-expiring platform key) · `scope_mismatch` ·
             `invalid_user_for_api_key` · `no_default_bot_user`.
+        '403':
+          description: |
+            `api_key_cannot_mint_api_key` — the bearer was itself bootstrapped
+            by presenting a platform api-key, and a key may not mint its own
+            successor. The successor would survive revocation of the key that
+            made it (nothing links the two), so a leaked credential would become
+            permanent access — the same property ADR-089 removed at the
+            refresh-token surface.
+
+            Mint with an identity that is **not** a platform api-key: an
+            ADR-057 **WIF-bootstrapped** session (the recommended automated
+            rotation channel) or a **human owner/admin** login. Note this is
+            keyed on how the token was obtained (`azp`), not on scope — WIF also
+            mints `scope=platform`. `DELETE` and `GET` on this collection are
+            unrestricted.
         '409':
           description: |
             `too_many_api_keys` — ADR-085 §2 caps a realm at **2 active
