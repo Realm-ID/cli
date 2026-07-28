@@ -38,8 +38,24 @@ warning against concurrent `auth login`); these are the code fixes.
   `auth login`, so the CLI itself can no longer produce two live codes on one
   machine. The multi-machine / stale-tab case remains.)*
 
+## Broken today
+
+- [ ] **Service mode does not work against the issuer (pre-existing).** Tracked in
+  the root `TODO.md` § Infra / dev-loop; restated here because it is CLI code.
+  `resolveCredential` (`cmd/realm-id/commands.go:313`) sends the raw
+  `REALM_ID_API_KEY` (`rk_live_…`) as `Authorization: Bearer` to
+  `auth.realmid.dev`, on the in-code claim that the issuer accepts it as a
+  platform credential. **It does not** — `requireAuth` runs the bearer through
+  `LocalVerifier.Verify`, which rejects anything that is not a 3-part JWT, and
+  `LookupByPresented` is reachable only from `/auth/login`, the user-api-key
+  exchange and the integration mint. Confirmed live:
+  `curl -H 'Authorization: Bearer rk_live_…' auth.realmid.dev/me` →
+  `401 invalid bearer`. So only session mode (device flow → BFF passthrough) has
+  ever worked. Fix: perform the `/auth/login` exchange and bear the resulting
+  platform JWT; update the README's "issuer-direct" claim (~line 102) in the same
+  change. **Not caused by ADR-089** — the CLI never held a refresh token here.
+
 ## Chores
 
-- [ ] `cmd/realm-id/main.go` — pre-existing `gofmt -l` violation (doc-comment list
-  indentation on `resolveDeviceName` etc., a newer-Go gofmt reformat). Run
-  `gofmt -w` in a dedicated formatting pass.
+*(The `gofmt -l` violation on `cmd/realm-id/main.go` was verified clean on
+2026-07-28 — `gofmt -l cli/cmd` reports nothing. Item removed.)*
