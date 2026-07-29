@@ -59,8 +59,8 @@ realm-id api-keys revoke --platform plt_abc --keyId ak_123                # rota
 # ttl_seconds=…` to choose, `--field non_expiring=true` for the one permanent
 # slot).
 
-# ADR-084 end-user API keys. Self-service: {uid} must be you unless the realm
-# sets user_api_keys.admin_mint_allowed.
+# ADR-084 end-user API keys. Self-service, no override: {uid} must be you.
+# (ADR-091 removed the user_api_keys.admin_mint_allowed escape hatch.)
 realm-id user-api-keys create --tenant ten_123 --uid usr_9 \
   --field label=reports-bot --field permissions_cap:='["audit:read"]'
 realm-id user-api-keys list --tenant ten_123 --uid usr_9

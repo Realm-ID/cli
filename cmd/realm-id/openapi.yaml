@@ -37,10 +37,12 @@ info:
     `api_key`, `platform_api_key`). The legacy `method` field was a
     one-release deprecated alias for the user grants and is **removed**
     at its announced sunset (2026-08-01). All issued tokens carry an explicit
-    `subject_type ∈ {user, service, platform}`. Two new realm-config
-    keys, `service_refresh_rotates` and `platform_refresh_rotates`
-    (both default `false`), opt service / platform refresh tokens
-    into the user-style single-use rotation lifecycle.
+    `subject_type ∈ {user, service, platform}`. The realm-config key
+    `service_refresh_rotates` (default `false`) opts the ADR-071
+    service-account refresh token into the user-style single-use
+    rotation lifecycle. Its sibling `platform_refresh_rotates` was
+    removed by ADR-089, which withdrew the refresh token from every
+    credential-bootstrapped session.
 
     See ADR-035 (`issuer/docs/adr/035-post-v1-deferrals.md`) for features
     deferred past v1: HTTP rate limiting, cross-platform authorization
@@ -153,7 +155,7 @@ components:
         - `invalid_token` — malformed / expired bearer.
         - `wrong_scope` — bearer present but wrong class
           (e.g. user JWT where platform is required).
-        - `bff_bearer_required` — realm has `require_bff_login=true`
+        - `bff_bearer_required` — every realm requires the BFF escort (ADR-088)
           and the inbound platform bearer is missing. Emitted on
           `POST /auth/token` + `POST /auth/logout`. NOTE: `POST /auth/login`
           requires a platform bearer **unconditionally** (ADR-047 §2 — it
@@ -563,7 +565,9 @@ components:
         issuer, enforces `aud` (the global RI audience) + `iat`-freshness
         + one-time-use, then selects the unique `federation_binding`
         whose `match_claims` all hold and mints the **same**
-        `class="platform"` session the `platform_api_key` grant returns.
+        `class="platform"` session the `platform_api_key` grant returns —
+        including ADR-089's shape: an access token with **no**
+        `refresh_token`. Re-mint by exchanging a fresh assertion.
         401 on: unknown issuer, invalid/stale/replayed assertion, audience
         mismatch, or no matching binding.
       properties:
@@ -597,10 +601,15 @@ components:
            access_token / tenant_id / role / expires_in.
         3. **Api-key grants** (`subject_type:"service"` |
            `"platform"` via `grant_type=api_key` /
-           `platform_api_key`): refresh + access + expires_in +
-           `"tenants": []` (present but always empty). No tenant_id,
-           no role — the session is pinned to the api-key's bot
-           user / admin tenant. NOTE: a **service-account OTP login**
+           `platform_api_key`) and the token-exchange grant:
+           access + expires_in + `"tenants": []` (present but always
+           empty). **No `refresh_token`** — ADR-089: the credential
+           itself is re-presentable, so a refresh token would be a
+           weaker duplicate of one the caller already holds, and the
+           field is omitted entirely. Re-mint by calling this
+           endpoint again. No tenant_id, no role — the session is
+           pinned to the api-key's bot user / admin tenant.
+           NOTE: a **service-account OTP login**
            (`grant_type=otp` resolving a `kind=service` user,
            ADR-071) is *user-shaped*: it returns
            `subject_type:"service"` **with** tenants[] / tenant_id /
@@ -800,11 +809,13 @@ components:
       description: |
         Access + rotated-refresh response. `tenant_id` and `role`
         are present only when `subject_type=user`; absent for
-        `service` and `platform` refresh. `refresh_token` is
-        rotated unconditionally for users; for service/platform
-        only when the realm has opted in via
-        `service_refresh_rotates` / `platform_refresh_rotates`
-        (otherwise the same refresh is echoed back unchanged).
+        `service` refresh. ADR-089: a credential-bootstrapped
+        session (api key / WIF) has NO refresh token, so this
+        endpoint serves only users and ADR-071 service accounts.
+        `refresh_token` is rotated unconditionally for users; for
+        a service account only when the realm has opted in via
+        `service_refresh_rotates` (otherwise the same refresh is
+        echoed back unchanged).
       properties:
         status: { type: string, enum: [ok] }
         subject_type:
@@ -1586,16 +1597,6 @@ components:
           description: |
             ADR-071 §6 — platform ceiling a per-org service-TTL override
             cannot exceed, in seconds [300, 180d].
-        platform_refresh_rotates:
-          type: boolean
-          description: |
-            ADR-051 (v0.7.0). Same shape as
-            `service_refresh_rotates`, but for platform refresh
-            tokens issued by `POST /auth/login` with
-            `grant_type=platform_api_key`. Only meaningful on a
-            **base realm** (the platform's own realm); setting it
-            on a non-base realm is a no-op (PATCH accepts but
-            warns). Default `false`.
         mfa_session_ttl_seconds:
           type: integer
           minimum: 60
@@ -1662,15 +1663,6 @@ components:
             TTL). `>0` = a session whose provider MFA was proven longer ago than
             this no longer satisfies a step-up ("specific operation") check — the
             user must re-MFA (RI challenge if enrolled, else re-login).
-        require_bff_login:
-          type: boolean
-          description: |
-            ADR-041 — when true, every /auth/* call against this realm
-            requires `Authorization: Bearer <platform_token>` minted from
-            an API key bound to a `platform_api`/`owner` user in the
-            realm's admin tenant. Direct browser → RealmID `/auth/login`
-            is rejected with `bff_bearer_required`. The realm's webapp
-            must route through the partner backend.
         otp_length:
           type: integer
           minimum: 4
@@ -1807,19 +1799,6 @@ components:
                 Cap on the length of one `permissions_cap` entry. Default 128.
                 Shape validation only — for a partner audience the strings are
                 opaque to RealmID (ADR-084 §7.2).
-            admin_mint_allowed:
-              type: boolean
-              description: |
-                When false (default) `{uid}` on the mint route must be the
-                caller: keys are self-service only.
-                **Base-realm-staff-only to change**, in either direction — the
-                realm's own admin is the party this restrains, so they cannot
-                be the party who lifts it (same reasoning as
-                `require_bff_login`).
-
-                Default false because an admin minting a credential that
-                authenticates **as** a member is impersonation by another name,
-                and ADR-039 impersonation is deliberately unbuilt.
             require_mfa_at_mint:
               type: boolean
               nullable: true
@@ -1952,14 +1931,12 @@ components:
           description: Always an array, never null. `[]` = no custom claims accepted.
         mfa_session_ttl_seconds: { type: integer }
         default_invitation_role: { type: string }
-        require_bff_login: { type: boolean }
         origin_enforcement: { type: string }
         otp_length: { type: integer }
         otp_ttl_seconds: { type: integer }
         otp_login_enabled: { type: boolean }
         otp_mfa_enabled: { type: boolean }
         service_refresh_rotates: { type: boolean }
-        platform_refresh_rotates: { type: boolean }
         service_refresh_ttl_seconds: { type: integer }
         service_refresh_ttl_max_seconds: { type: integer }
         max_user_session_lifetime_seconds: { type: integer }
@@ -1988,7 +1965,6 @@ components:
             allow_all_orgs: { type: boolean }
             max_permission_strings: { type: integer }
             max_permission_string_len: { type: integer }
-            admin_mint_allowed: { type: boolean }
             require_mfa_at_mint: { type: boolean, nullable: true }
             org_admin_visible: { type: boolean, nullable: true }
         platform_api_key_login_enabled: { type: boolean, nullable: true }
@@ -2010,14 +1986,26 @@ components:
         `owner_user_id` names the recipient, who must be an ACTIVE existing
         member of THIS tenant (§4 lockout guard). `outgoing_owner_role` is the
         base role the outgoing owner keeps (default `member`); `leave_entirely`
-        instead deactivates the outgoing owner. `new_owner_email` is a
-        TRANSITIONAL fallback for the pre-WP7 UI (resolved to a member when
-        `owner_user_id` is absent); the SDKs already post `owner_user_id`.
+        instead deactivates the outgoing owner.
+
+        **Two caller paths (ADR-087).** The tenant's OWN owner picks a recipient
+        by `owner_user_id` from a roster they can read. The G-014 PARENT (a
+        platform owner acting on one of their realm's orgs) cannot read that
+        roster — ADR-067 keeps `GET /tenants/{id}/users` own-tenant only — so
+        they name `new_owner_email`, which is resolved inside the target tenant
+        and **PROVISIONED there as an active member if it does not exist**.
+        Provisioning happens on the parent path ONLY: on the owner path an
+        unmatched email is a typo, and returns `user_not_found`.
+
+        `suspend_outgoing_owner` settles the outgoing owner as `suspended`
+        instead of demoting them — chosen over deletion so a mistyped transfer
+        stays reversible (ADR-087 §4). Mutually exclusive with `leave_entirely`.
       properties:
         owner_user_id: { type: string, format: uuid, description: Active member of this tenant to make owner. }
         outgoing_owner_role: { type: string, enum: [admin, member, viewer], description: 'Base role the outgoing owner keeps (default member).' }
         leave_entirely: { type: boolean, description: Deactivate the outgoing owner instead of demoting them. }
-        new_owner_email: { type: string, description: Transitional pre-WP7 fallback used only when owner_user_id is absent. }
+        new_owner_email: { type: string, description: 'Recipient by email. Canonical for the G-014 parent path, which cannot read the roster; provisioned into the tenant when absent. Used only when owner_user_id is absent.' }
+        suspend_outgoing_owner: { type: boolean, description: 'Suspend the outgoing owner (recoverable) instead of demoting them. Mutually exclusive with leave_entirely.' }
 
     Invitation:
       type: object
@@ -3230,13 +3218,17 @@ paths:
         the api-key's bot user / admin tenant.
 
         Rotation policy (ADR-051): user refresh tokens always
-        rotate (ADR-031 reuse-detection). Service / platform refresh
-        tokens rotate only when the realm has opted in via
-        `service_refresh_rotates` / `platform_refresh_rotates`;
-        otherwise the same refresh is echoed back unchanged.
+        rotate (ADR-031 reuse-detection). An ADR-071 service-account
+        refresh token rotates only when the realm has opted in via
+        `service_refresh_rotates`; otherwise the same refresh is
+        echoed back unchanged. ADR-089: a credential-bootstrapped
+        session (`grant_type` ∈ {`api_key`, `platform_api_key`,
+        token-exchange}) has no refresh token — presenting one
+        returns `401 m2m_refresh_withdrawn`; re-mint via
+        `POST /auth/login` instead.
 
         **BFF gate (ADR-041).** When the refresh-bound session's realm
-        has `require_bff_login=true`, this endpoint requires a partner
+        is not the base realm, this endpoint requires a partner
         platform bearer in `Authorization` and the refresh token MUST be
         supplied in the **body** (the header is the platform JWT, not the
         refresh). The realm is resolved from the refresh-bound session, so
@@ -3397,11 +3389,13 @@ paths:
         ADR-061 counterpart to `POST /auth/mfa/enroll` — disables MFA for
         the calling user. Auth (`requireAuthAsUser`): the user's own
         access JWT, **or** a partner **platform bearer**
-        (`scope=platform`) carrying the user's identity in
-        `X-On-Behalf-Of-User` / `X-User-Token` — the production BFF
-        path (ADR-050). The partner cannot impersonate arbitrarily on
-        the legacy header path — it must possess the user's access JWT;
-        either way the operation resolves to and acts as that user.
+        (`scope=platform`) carrying the user's verified access JWT in
+        `X-User-Token` — the production BFF path (ADR-050). The partner
+        cannot impersonate: it must possess the user's access JWT, and the
+        operation resolves to and acts as that user. The bare
+        `X-On-Behalf-Of-User` id is **no longer accepted** for identity
+        (removed 2026-07-27; it was an unauthenticated assertion) — a
+        request carrying it gets `401 x_user_token_required`.
 
         Step-up: the caller MUST present a currently valid TOTP `code` in
         the body, so a stolen access token alone cannot disable MFA on the
@@ -3694,6 +3688,13 @@ paths:
       security:
         - BearerAccess: []
         - BearerRevocation: []
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
       responses:
         '200':
           description: OK
@@ -4053,6 +4054,13 @@ paths:
         may administer (UI-003). Service JWTs receive 401 since "my
         platforms" has no meaning for them.
       security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
       responses:
         '200':
           description: OK
@@ -4076,8 +4084,15 @@ paths:
       summary: Create a tenant inside a platform realm
       security: [{ BearerAccess: [] }]
       description: |
-        Creates an organization (tenant) inside the platform's realm. Since
-        ADR-073 Amendment C this is also the tenant rung of a bulk migration:
+        Creates an organization (tenant) inside the platform's realm.
+
+        **Gated on `tenants:manage` (ADR-091 D2).** Both `tenants:read` and
+        `tenants:manage` are new catalog entries in this release — org
+        lifecycle was previously reachable only through the realm-admin gate,
+        so it could not be delegated without granting realm administration.
+
+        Since ADR-073 Amendment C this is also the tenant rung of a bulk
+        migration:
 
         - **Bring-your-own `id`** (any UUID — a derived UUIDv5 is legal) makes
           the create idempotent and re-runnable. Absent ⇒ a UUIDv7 is minted
@@ -4161,11 +4176,23 @@ paths:
       tags: [Platforms]
       summary: List tenants in a platform realm
       description: |
+        **Gated on `tenants:read` (ADR-091 D2)**, a new catalog entry in this
+        release.
+
         Rows carry the dashboard rollup columns `users_count` and
         `last_activity_at` (see `Tenant`) — computed for the whole realm in one
         aggregate, not per row. Both are ABSENT rather than `0` when
         unavailable.
+
+        Paginated (SPEC §7), oldest-first: `limit` defaults to 50, capped at 200.
       security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 200 }
       responses:
         '200':
           description: OK
@@ -4218,47 +4245,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /platforms/{pid}/tenants/{tid}/invitations:
-    post:
-      tags: [Platforms]
-      summary: Invite someone into a platform tenant
-      security: [{ BearerAccess: [] }]
-      parameters:
-        - in: path
-          name: pid
-          required: true
-          schema: { type: string, format: uuid }
-        - in: path
-          name: tid
-          required: true
-          schema: { type: string, format: uuid }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/PlatformInvite' }
-      responses:
-        '201':
-          description: Created
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Invitation' }
-
-  # ------------------------------------------------ User API keys (ADR-084)
-  #
-  # Self-service end-user API keys. The segment is `user-api-keys`, DELIBERATELY
-  # distinct from `api-keys`: under the CLI's generated-tree collision rule
-  # (broadest scope = fewest path params wins) a trailing `api-keys` segment
-  # would lose to /platforms/{id}/api-keys and these verbs would never
-  # generate — a partner typing `realm-id api-keys create` would silently hit
-  # the platform-bot mint instead. Mirrors how `starter-roles` stays out of the
-  # `roles` subtree, and yields `realm-id user-api-keys create|list`.
-  #
-  # AUDIENCE IS DERIVED, NEVER SUPPLIED: it is the realm the `{uid}` users row
-  # lives in. Base realm => `realmid`; any other realm => that realm. There is
-  # no request field to set wrong, and a partner cannot mint a RealmID-audience
-  # key because their users do not exist in the base realm.
-
   /tenants/{tid}/users/{uid}/user-api-keys:
     parameters:
       - in: path
@@ -4273,11 +4259,13 @@ paths:
       tags: [User API Keys]
       summary: Mint a user API key (plaintext returned once)
       description: |
-        `{uid}` MUST be the caller unless the realm sets
-        `user_api_keys.admin_mint_allowed` (default false, base-realm-staff-only
-        to change) — an admin minting a credential that authenticates **as** a
-        member is impersonation by another name, and ADR-039 is deliberately
-        unbuilt.
+        `{uid}` MUST be the caller. Keys are self-service, with no override —
+        an admin minting a credential that authenticates **as** a member is
+        impersonation by another name, and ADR-039 is deliberately unbuilt.
+
+        **Changed in ADR-091**: the `user_api_keys.admin_mint_allowed` escape
+        hatch is **removed**. It is no longer a config key at all — PATCHing it
+        answers `400 unknown_config_key` rather than being silently dropped.
 
         Minting is a **step-up operation** when
         `user_api_keys.require_mfa_at_mint` is on (the default whenever the realm
@@ -4309,7 +4297,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: '`forbidden` — minting for another user without `admin_mint_allowed`.'
+          description: '`forbidden` — minting for a user other than the caller.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -4450,6 +4438,21 @@ paths:
             with `non_expiring`) · `non_expiring_not_allowed` (the realm already
             holds a non-expiring platform key) · `scope_mismatch` ·
             `invalid_user_for_api_key` · `no_default_bot_user`.
+
+            **New in ADR-091 (D3/D6):**
+
+            - `platform_mgmt_api_is_wif_only` — the `platform_mgmt_api` role is
+              reachable over ADR-057 WIF only and can never hold an api key. A
+              long-lived secret for the role that rotates secrets defeats the
+              rotation it exists to perform.
+            - `ambiguous_bot_user` — the realm has more than one candidate bot
+              user, so the binding cannot be inferred. Previously the code took
+              `candidates[0]`, which made the credential's identity depend on
+              row order. Name the `user_id` explicitly.
+
+            A key now binds **only** to the realm's `platform_api` bot; the
+            admin tenant's OWNER is refused, closing the path by which a key
+            could carry a human's authority.
         '403':
           description: |
             `api_key_cannot_mint_api_key` — the bearer was itself bootstrapped
@@ -4465,6 +4468,13 @@ paths:
             keyed on how the token was obtained (`azp`), not on scope — WIF also
             mints `scope=platform`. `DELETE` and `GET` on this collection are
             unrestricted.
+
+            `platform_api_key_login_disabled` — **new in ADR-091 (D6.4)**: a
+            realm that has turned platform-api-key login off now refuses the
+            MINT as well, not only the login. Previously a key could still be
+            created in a keyless realm, which produced exactly the forgotten,
+            never-exercised secret that ADR-085 §3's default expiry exists to
+            age out.
         '409':
           description: |
             `too_many_api_keys` — ADR-085 §2 caps a realm at **2 active
@@ -4640,7 +4650,17 @@ paths:
                 match_claims:
                   type: object
                   additionalProperties: { type: string }
-                mapped_role: { type: string, default: platform_api }
+                mapped_role:
+                  type: string
+                  default: platform_api
+                  description: |
+                    The realm role a workload assuming this binding acts as.
+
+                    **Validated since ADR-091 (D2)**: the name must resolve in
+                    the binding's GOVERNING realm — which for an admin tenant is
+                    the BASE realm, not the platform realm. An unresolvable name
+                    is refused with `400 invalid_mapped_role` instead of being
+                    stored and silently minting a role that grants nothing.
                 scope:
                   type: array
                   items: { type: string }
@@ -4654,7 +4674,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/FederationBinding' }
         '400':
-          description: unknown_issuer | unconstrained_binding | missing_mandatory_claim
+          description: |
+            `unknown_issuer` | `unconstrained_binding` |
+            `missing_mandatory_claim` | `invalid_mapped_role` (ADR-091 D2 — the
+            role does not resolve in the governing realm)
         '403':
           description: not_authorized (caller is not a realm admin / owner)
         '404':
@@ -4759,7 +4782,10 @@ paths:
         echoes the rows that now exist under the requested names, so a caller
         can see whether a pre-existing role was preserved.
 
-        Gated on `roles:manage`, the same permission as creating a role by hand.
+        **Owner-only (ADR-091 D3).** `roles:manage` was RETIRED from the
+        permission catalog: authority over a realm's role vocabulary is not
+        delegable, because a role that can edit roles can widen itself. This is
+        an explicit owner-pointer check, not an unmatchable permission string.
       security: [{ BearerAccess: [] }]
       requestBody:
         required: true
@@ -4788,7 +4814,7 @@ paths:
         '400':
           description: unknown_starter_role / missing_fields
         '403':
-          description: missing permission roles:manage
+          description: '`forbidden` — realm owner only (ADR-091 D3)'
         '404':
           description: realm_not_found
   /platforms/{id}/roles:
@@ -5017,7 +5043,9 @@ paths:
       description: |
         Lists the integrations this platform publishes for other realms' orgs to
         install. Gated on the platform owner or a realm role granting
-        `integrations:read` (ADR-083 §5 — NOT `roles:manage`).
+        `integrations:read` (ADR-083 §5). Publishing an integration is a
+        delegable capability; editing the realm's role vocabulary is not
+        (ADR-091 D3 retired `roles:manage` and made roles owner-only).
       security: [{ BearerAccess: [] }]
       parameters:
         - in: query
@@ -5517,7 +5545,19 @@ paths:
     get:
       tags: [Tenants]
       summary: List tenants (membership-filtered)
+      description: |
+        Paginated (SPEC §7). The listing is oldest-first, so a freshly created
+        tenant lands on the LAST page — a caller looking for a specific row must
+        follow `next_cursor` rather than reading page 1. `limit` defaults to 50
+        and is capped at 200.
       security: [{ BearerAccess: [] }, { BearerService: [] }]
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 200 }
       responses:
         '200':
           description: OK
@@ -5606,6 +5646,14 @@ paths:
       responses:
         '200':
           description: OK
+        '400':
+          description: recipient_not_member | recipient_not_active | already_owner | conflicting_outgoing_disposition | invalid_identifier
+        '403':
+          description: caller is neither the tenant's owner nor its G-014 parent
+        '404':
+          description: user_not_found (unmatched email on the owner path)
+        '409':
+          description: identifier_collision
 
   /platforms/{id}/login-attempts:
     get:
@@ -6040,7 +6088,8 @@ paths:
         token, OR a non-owner/admin whose realm role grants
         `service_accounts:read` (or `service_accounts:manage`, which
         implies read) (ADR-074 §I-06). Reached via the BFF on-behalf
-        pattern (platform bot + `X-On-Behalf-Of-User`).
+        pattern (platform bot + the user's verified `X-User-Token`; the
+        bare `X-On-Behalf-Of-User` id was removed 2026-07-27).
       security: [{ BearerAccess: [] }]
       responses:
         '200':
@@ -6565,6 +6614,23 @@ paths:
         in other realms are excluded, since they are not switchable from
         this session (a switch re-pins within the session realm and a
         foreign-realm tenant fails MintForTenant with not_a_member).
+
+        `permissions` (ADR-090) is the caller's FULLY RESOLVED effective
+        permission set for that membership — the role's stored grant, or
+        the whole catalog when the caller owns the tenant, intersected
+        with the token's ADR-084 `permissions_cap` when one is present.
+        There is no implicit-all marker to expand client-side: a console
+        decides an affordance with a plain membership test and no policy
+        logic of its own. Empty for a disabled or unresolvable role.
+
+        Two readings to keep straight. (1) For every membership OTHER than
+        the session's current tenant the set is PROSPECTIVE — "what you
+        would hold after switching here" — because a session acts only in
+        the tenant it is pinned to. (2) The realm-surface permissions
+        (`federation:*`, `sources:*`, `domains:*`, `identity_providers:*`,
+        `platform:config`, …) are additionally gated on sitting in the
+        realm's admin tenant, so pair them with `is_admin_tenant`; a role
+        may grant them on an org membership where they are unreachable.
       security: [{ BearerAccess: [] }]
       responses:
         '200':
@@ -6584,12 +6650,36 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [tenant_id, platform_id, display_name, role]
+                      required: [tenant_id, platform_id, display_name, role, is_owner, is_admin_tenant, permissions]
                       properties:
                         tenant_id: { type: string, format: uuid }
                         platform_id: { type: string, format: uuid }
                         display_name: { type: string }
                         role: { type: string }
+                        owner_user_id:
+                          type: string
+                          format: uuid
+                          description: >-
+                            The tenant's ADR-076 ownership pointer. Omitted when
+                            un-pointed.
+                        is_owner:
+                          type: boolean
+                          description: >-
+                            Resolved owner-ness of the CALLER for this membership.
+                            Never a JWT claim. Means ownership only — never use it
+                            as a permission proxy; read `permissions` for that.
+                        is_admin_tenant:
+                          type: boolean
+                          description: >-
+                            This tenant is the admin tenant of the realm that
+                            governs it, i.e. the realm-surface gates are reachable
+                            from it at all (ADR-090).
+                        permissions:
+                          type: array
+                          description: >-
+                            Effective ADR-074 permissions for this membership,
+                            cap-intersected. See the endpoint description.
+                          items: { type: string }
         '401':
           description: unauthorized
         '404':
