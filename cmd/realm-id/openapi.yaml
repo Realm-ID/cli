@@ -48,7 +48,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.19.0
+  version: 0.20.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -4279,6 +4279,14 @@ paths:
           and returned. An `id` that already exists **in this realm** RECONCILES
           it (updates `display_name` only — never the owner pointer or
           `created_at`); one that exists **in another realm** is rejected.
+        - **`signup_mode`** (ADR-045) is honoured on create; absent ⇒ `closed`.
+          It was documented and accepted by every SDK from ADR-073 Amendment C
+          but **silently dropped server-side until 2026-08-02** — every org came
+          out `closed`. On RECONCILE it is idempotent-or-refused, never applied:
+          the same value is a no-op, a different one is
+          `409 signup_mode_immutable_on_reconcile`. A re-run import must not
+          clobber a policy the org changed in the console since, and dropping
+          the field silently is the defect being fixed.
         - **Inline `owner` is REQUIRED when creating** a new tenant (ADR-073 C.3:
           `owner_user_id` is NOT NULL — a tenant is born with an owner). It is
           seated atomically with the tenant, provisioned as a verified ACTIVE
@@ -4302,6 +4310,17 @@ paths:
                     mint UUIDv7. Present + exists in this realm ⇒ reconcile;
                     present + exists in another realm ⇒ `cross_realm_tenant_id`.
                 display_name: { type: string }
+                signup_mode:
+                  type: string
+                  enum: [closed, allowlist, open]
+                  description: |
+                    Optional ADR-045 signup policy; absent ⇒ `closed`. `open` is
+                    reserved for the base admin tenant and is refused here
+                    (`400 invalid_signup_mode`) — this route cannot reach that
+                    tenant at all, since orgs may not be created under the base
+                    realm. Refused rather than downgraded: honouring a field by
+                    writing something else is the same class of defect as
+                    ignoring it. On reconcile see the 409 below.
                 created_at:
                   type: string
                   format: date-time
@@ -4327,7 +4346,9 @@ paths:
             `owner_invalid_phone` | `owner_incomplete_provider` |
             `owner_unknown_provider` | `owner_invalid_user_id` |
             `cross_tenant_owner_id` (owner.user_id exists in another tenant) |
-            `owner_already_set` (a different owner is already seated)
+            `owner_already_set` (a different owner is already seated) |
+            `invalid_signup_mode` (not closed|allowlist|open, or `open` on a
+            non-base-admin tenant)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -4347,6 +4368,11 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
+            `signup_mode_immutable_on_reconcile` — a BYO-`id` reconcile supplied
+            a `signup_mode` that differs from the tenant's current one. Nothing
+            is written. Use `PATCH /tenants/{id}/config`; the same value is a
+            no-op, so repeated imports stay idempotent.
+
             `single_tenant_membership` — the realm sets
             `single_tenant_membership` (ADR-092 D4) and the inline `owner`'s
             email already holds an ACTIVE membership in another tenant of this
