@@ -48,7 +48,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.17.0
+  version: 0.18.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -1391,9 +1391,6 @@ components:
         id: { type: string, format: uuid }
         realm_id: { type: string, format: uuid }
         display_name: { type: string }
-        allowed_domains:
-          type: array
-          items: { type: string }
         status: { type: string, enum: [active, suspended, deactivated] }
         config:
           $ref: '#/components/schemas/TenantConfig'
@@ -1442,9 +1439,12 @@ components:
           enum: [closed, allowlist, open]
           description: |
             ADR-045 auto-provisioning policy:
-              - `closed`    invitation-only; `allowed_domains` ignored.
+              - `closed`    invitation-only; domain grants ignored.
               - `allowlist` first-time login matches when the verified email
-                            domain is in `allowed_domains`.
+                            domain has an ACTIVE, proven `tenant_domains`
+                            grant for this tenant (ADR-094 D10). A tenant
+                            with no such grant matches nobody — a legal,
+                            fail-closed state.
               - `open`      every authenticated user is provisioned (incl.
                             phone-only). Allowed only on the base realm's
                             admin tenant; rejected at config-write time
@@ -1465,23 +1465,14 @@ components:
           type: string
           enum: [closed, allowlist, open]
           description: |
-            Auto-provisioning policy (ADR-045). Cross-field invariants
-            enforced at write time:
-              - `allowlist` requires non-empty `allowed_domains`.
-              - `open` requires empty `allowed_domains`.
+            Auto-provisioning policy (ADR-045). One write-time invariant
+            remains:
               - `open` is rejected on every tenant other than the base
                 realm's admin tenant (`signup_mode_invalid_for_tenant`).
-              - `closed` accepts any `allowed_domains` value; the server
-                normalizes the column to `[]` on write.
-        allowed_domains:
-          type: array
-          items: { type: string }
-          description: |
-            Hostnames permitted to auto-provision under
-            `signup_mode='allowlist'`. Each entry must be a bare hostname
-            (lower-cased; no scheme, port, or path); invalid entries
-            return 400 `invalid_domain`. The list is replaced wholesale on
-            every patch and is ignored when `signup_mode != 'allowlist'`.
+
+            **BREAKING (ADR-094 R3):** `allowed_domains` is no longer a key
+            here and now returns 400 `unknown_config_key`. Domain grants are
+            claimed and proven through the domains API.
         role_overrides:
           type: array
           items: { type: string }
@@ -4097,9 +4088,8 @@ paths:
         - **Bring-your-own `id`** (any UUID — a derived UUIDv5 is legal) makes
           the create idempotent and re-runnable. Absent ⇒ a UUIDv7 is minted
           and returned. An `id` that already exists **in this realm** RECONCILES
-          it (updates `display_name` + `allowed_domains` only — never the owner
-          pointer or `created_at`); one that exists **in another realm** is
-          rejected.
+          it (updates `display_name` only — never the owner pointer or
+          `created_at`); one that exists **in another realm** is rejected.
         - **Inline `owner` is REQUIRED when creating** a new tenant (ADR-073 C.3:
           `owner_user_id` is NOT NULL — a tenant is born with an owner). It is
           seated atomically with the tenant, provisioned as a verified ACTIVE
@@ -4123,12 +4113,6 @@ paths:
                     mint UUIDv7. Present + exists in this realm ⇒ reconcile;
                     present + exists in another realm ⇒ `cross_realm_tenant_id`.
                 display_name: { type: string }
-                allowed_domains:
-                  type: array
-                  items: { type: string }
-                  description: |
-                    Optional signup-domain allowlist seeded on the new
-                    tenant (see `TenantConfigPatch.allowed_domains`).
                 created_at:
                   type: string
                   format: date-time
