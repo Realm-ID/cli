@@ -48,7 +48,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.18.0
+  version: 0.19.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -654,6 +654,38 @@ components:
         tenant_id: { type: string, format: uuid }
         role: { type: string }
         expires_in: { type: integer, format: int64 }
+        tenant_choice_required:
+          type: boolean
+          description: >
+            ADR-092 D5. The caller holds two or more ACTIVE memberships in a
+            realm whose `single_tenant_membership` is on, and must settle the
+            picker via POST /me/tenant-choice. Optional; omitted when false.
+
+            This login SUCCEEDED — an access token is still issued, and the
+            field is a reconciliation prompt, not an authentication failure.
+            Treating it as an auth error would strand exactly the users the
+            drain exists to resolve, leaving them no credential to answer with.
+        tenant_choices:
+          type: array
+          description: >
+            ADR-092 D5. The memberships the picker may choose between; present
+            only alongside `tenant_choice_required`. The chosen membership is
+            KEPT and the others are suspended (recoverable) with their sessions
+            revoked.
+          items:
+            type: object
+            properties:
+              tenant_id: { type: string, format: uuid }
+              display_name: { type: string }
+              is_owner:
+                type: boolean
+                description: >
+                  This membership CANNOT be given up — `tenants.owner_user_id`
+                  is NOT NULL, so revoking it would leave the tenant ownerless.
+                  The server refuses such a choice with 409
+                  `owner_cannot_be_revoked`; clients should not offer it, and
+                  must still handle the refusal since the client is not the
+                  authority.
         refresh_exp:
           type: integer
           format: int64
@@ -1444,7 +1476,8 @@ components:
                             domain has an ACTIVE, proven `tenant_domains`
                             grant for this tenant (ADR-094 D10). A tenant
                             with no such grant matches nobody — a legal,
-                            fail-closed state.
+                            fail-closed state, since a grant can be revoked
+                            or fail re-verification with no write here.
               - `open`      every authenticated user is provisioned (incl.
                             phone-only). Allowed only on the base realm's
                             admin tenant; rejected at config-write time
@@ -1471,8 +1504,15 @@ components:
                 realm's admin tenant (`signup_mode_invalid_for_tenant`).
 
             **BREAKING (ADR-094 R3):** `allowed_domains` is no longer a key
-            here and now returns 400 `unknown_config_key`. Domain grants are
-            claimed and proven through the domains API.
+            here and now returns 400 `unknown_config_key`. The domains that
+            drive auto-provisioning are `tenant_domains` grants, claimed and
+            proven through `/platforms/{pid}/tenants/{tid}/domains` — a
+            settable allowlist required no proof of control, which is what
+            let a domain confer access nobody had demonstrated. The two
+            domain invariants went with the column: a grant can be revoked,
+            or fail re-verification, without any write to `signup_mode`, so
+            enforcing them here would have refused a state the system
+            reaches on its own.
         role_overrides:
           type: array
           items: { type: string }
@@ -1491,11 +1531,103 @@ components:
             `role_overrides` and is not `owner`. Empty string clears it (falls
             back to the realm default).
 
+    SSODomainGrant:
+      type: object
+      description: |
+        One row of `tenant_domains` (ADR-094): an organization's grant to
+        auto-provision users from an email domain, together with the evidence
+        backing it.
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        domain:
+          type: string
+          description: |
+            Normalized lowercase hostname. Subdomains are SEPARATE entities and
+            match exactly (D13) — a grant on `acme.com` does not cover
+            `eng.acme.com`. This deliberately differs from ADR-049 routing,
+            where a verified apex covers its subdomains; two rules coexist for
+            two purposes, and harmonizing them would silently widen SSO.
+        method:
+          type: string
+          enum: [dns_txt, html_file, meta_tag, platform_approval, self_asserted]
+        status:
+          type: string
+          enum: [claimed, pending, active, suspended, rejected, revoked, failed]
+          description: |
+            Only `active` provisions. `suspended` is recoverable and is what the
+            D9 resolution ladder and org soft-delete leave behind; `failed` is a
+            proven grant whose re-check failed for 7 consecutive days, which is
+            what releases the domain to a challenger.
+        verified:
+          type: boolean
+          description: |
+            TRUE only for REAL proof. Derived from `verified_at`, never from
+            `status` or `method`, so an approved or self-asserted grant can
+            never read as proven. A schema CHECK enforces the same thing at the
+            storage layer.
+        verified_at: { type: string, format: date-time, nullable: true }
+        approved_at: { type: string, format: date-time, nullable: true }
+        rejected_reason: { type: string, nullable: true }
+        requested_at: { type: string, format: date-time }
+        last_checked_at: { type: string, format: date-time, nullable: true }
+        check_failing_since:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            When the current run of consecutive re-check failures began; cleared
+            on the first success. The grant goes `failed` 7 days after this.
+        cooldown_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: Re-requesting this domain is refused until this passes.
+        created_at: { type: string, format: date-time }
+
     RealmConfigPatch:
       type: object
       description: Allowlist — unknown keys return 400 `unknown_config_key`.
       properties:
         concurrent_session_limit: { type: integer, minimum: 0 }
+        single_tenant_membership:
+          type: boolean
+          description: |
+            ADR-092 D4. When true a person may belong to at most ONE tenant in
+            this realm. Default false.
+
+            Counts ACTIVE memberships only — an invitation is a users row with
+            status='invited', and a suspended row is what the D5 picker leaves
+            behind; treating either as a violation would contradict D5, which
+            deliberately lets a user keep and decline their invites.
+
+            Does NOT apply to the base realm or to a realm's admin tenant: a
+            platform's admin tenant lives in the base realm while its orgs live
+            in the platform realm (ADR-015/ADR-067), so staff legitimately span
+            both.
+
+            Turning it ON is permitted even while users still hold two active
+            memberships; the D5 picker drains them at each next login. Read
+            `single_tenant_pending_reconciliation` on GET /platforms/{id}/config
+            to see how many are still outstanding — a user who never logs in
+            never resolves.
+
+            A conflicting membership is an ERROR, never an automatic move. Every
+            ADMINISTERED membership-creating path refuses with `409
+            single_tenant_membership` and the user must leave their current
+            organization first: `POST /tenants/{id}/invitations`,
+            `POST /platforms/{pid}/tenants` (the inline owner), and
+            `PUT /tenants/{id}/owner`. Bulk import
+            (`POST /tenants/{id}/users/import`) reports the same code per row,
+            which rejects the whole file (uniform-200, no 409).
+
+            JIT / domain auto-provisioning at `POST /auth/login` is the one path
+            with no operator on it: the second membership is simply NOT CREATED
+            and the login SUCCEEDS on the membership the user already holds.
+            Failing it would lock a compliant user out of their own org because
+            another org proved their email domain — and per D5 a domain-eligible
+            org is not an active membership and violates nothing. The refusal is
+            audited as `user.auto_provision_refused`.
         session_eviction_policy: { type: string, enum: [reject] }
         access_ttl_seconds:
           type: integer
@@ -1687,6 +1819,51 @@ components:
             requires the user (or one of the user's role assignments)
             to be enrolled in `otp` — see `users.mfa_methods`
             and `roles.required_mfa_methods`.
+
+        # ---- ADR-094 D4: per-org domain SSO -------------------------------
+        domain_sso:
+          type: object
+          description: |
+            ADR-094 per-org domain-SSO standard, grouped as ONE nested object
+            rather than two flat siblings, per the convention `user_api_keys`
+            below also follows.
+
+            **PATCH semantics are MERGE** — send one sub-key and the other is
+            left alone. (The stored object is then replaced wholesale, but the
+            handler fills the omitted field from the current value first, so a
+            partial patch never silently resets the other half.)
+
+            `evidence` — how much proof activates a grant:
+
+            * `dns_required` (DEFAULT) — only DNS/file/meta proof activates.
+            * `platform_approved` — the platform owner may additionally attest.
+            * `self_asserted` — an org's own unverified claim activates.
+
+            Proof is ALWAYS accepted, at every level; the setting only decides
+            how far BELOW proof the platform is willing to go.
+
+            `uniqueness` — may one domain back more than one org:
+
+            * `exclusive` (DEFAULT) — at most one active grant per domain.
+            * `shared` — several orgs may hold it.
+
+            `shared` is refused with `409 incoherent_domain_policy` while the
+            realm also sets `single_tenant_membership`: a shared domain offers
+            several candidate orgs to a new user while single-tenant membership
+            admits exactly one, so the assignment would fall out of candidate
+            ORDER — arbitrary org capture, for every new user, with nothing to
+            make anyone notice.
+
+            An ABSENT or partially-set object reads back as the STRICT defaults,
+            never as empty strings. Forgetting to configure must not be the
+            permissive path.
+          properties:
+            evidence:
+              type: string
+              enum: [dns_required, platform_approved, self_asserted]
+            uniqueness:
+              type: string
+              enum: [exclusive, shared]
 
         # ---- ADR-084 §10: user API keys (end-user keys) -------------------
         user_api_keys:
@@ -1911,6 +2088,7 @@ components:
         counterpart (`suspended_at`, `suspend_reason`) are NOT exposed.
       properties:
         concurrent_session_limit: { type: integer }
+        single_tenant_membership: { type: boolean }
         session_eviction_policy: { type: string }
         access_ttl_seconds: { type: integer }
         refresh_ttl_seconds: { type: integer }
@@ -1958,6 +2136,17 @@ components:
             max_permission_string_len: { type: integer }
             require_mfa_at_mint: { type: boolean, nullable: true }
             org_admin_visible: { type: boolean, nullable: true }
+        # ADR-094 D4. Always the full object; an unconfigured realm reads back
+        # the STRICT defaults (dns_required + exclusive), never empty strings —
+        # forgetting to configure must not read as the permissive setting.
+        domain_sso:
+          type: object
+          description: |
+            ADR-094 per-org domain-SSO standard. Semantics and enums are
+            documented on `RealmConfigPatch.domain_sso`.
+          properties:
+            evidence: { type: string }
+            uniqueness: { type: string }
         platform_api_key_login_enabled: { type: boolean, nullable: true }
         refresh_absolute_expiry:
           type: object
@@ -4156,6 +4345,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `single_tenant_membership` — the realm sets
+            `single_tenant_membership` (ADR-092 D4) and the inline `owner`'s
+            email already holds an ACTIVE membership in another tenant of this
+            realm. Creating an org always creates a membership (its owner), so
+            org-create is a membership-creating path. Refused, never moved: the
+            user must leave their current organization first. Nothing is
+            written — the tenant is not created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
     get:
       tags: [Platforms]
       summary: List tenants in a platform realm
@@ -4555,6 +4756,24 @@ paths:
                 properties:
                   id: { type: string, format: uuid }
                   config: { $ref: '#/components/schemas/RealmConfigView' }
+                  single_tenant_pending_reconciliation:
+                    type: integer
+                    description: >
+                      ADR-092 D4. How many people still hold MORE THAN ONE
+                      active membership in this realm. Present only while
+                      `single_tenant_membership` is on.
+
+                      It sits BESIDE `config`, never inside it, because it is
+                      derived read-only state rather than a setting — placing
+                      it in the settings bag would imply it is settable.
+
+                      It exists because the knob may be turned on while users
+                      still span tenants (the D5 picker drains them at each
+                      next login). Without this number a realm can report
+                      `single_tenant_membership: true` while N users are still
+                      non-compliant — and a user who never logs in never
+                      resolves — so "is this realm actually single-tenant yet?"
+                      could only be guessed at.
         '403':
           description: forbidden — missing permission `platform:config`
         '404':
@@ -5637,7 +5856,16 @@ paths:
         '404':
           description: user_not_found (unmatched email on the owner path)
         '409':
-          description: identifier_collision
+          description: |
+            `identifier_collision` |
+            `single_tenant_membership` — the realm sets
+            `single_tenant_membership` (ADR-092 D4) and the recipient already
+            holds an ACTIVE membership in another tenant of this realm. Applies
+            both when the parent path would PROVISION the named email into the
+            org and when the recipient is an existing member: an owned org is
+            what the D5 picker cannot drain (`owner_user_id` is NOT NULL), so
+            the transfer would make a transient violation permanent. Refused,
+            never moved — nothing is written.
 
   /platforms/{id}/login-attempts:
     get:
@@ -5747,6 +5975,14 @@ paths:
         which becomes `users.id`; a row without one gets a freshly-minted UUIDv7
         **returned** in the row result. A `user_id` that already exists in
         another tenant rejects the whole file (`cross_tenant_user_id`).
+
+        **ADR-092 D4:** when the realm sets `single_tenant_membership`, a row
+        whose email already holds an ACTIVE membership in another tenant of the
+        realm fails phase 1 with `single_tenant_membership` — which rejects the
+        WHOLE file, so nothing is written. There is no HTTP 409 here: the row
+        report is the error channel (uniform-200). A row that RECONCILES an
+        existing member of THIS tenant creates no membership and is exempt, so
+        re-running an import over an already-migrated realm still works.
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -6664,12 +6900,518 @@ paths:
                             Effective ADR-074 permissions for this membership,
                             cap-intersected. See the endpoint description.
                           items: { type: string }
+                        pending_first_signin:
+                          type: boolean
+                          description: >-
+                            ADR-093 D6 — this membership was found by
+                            CORRELATION (a verified email) but never CLAIMED:
+                            the row carries no approved provider tuple, so
+                            `POST /auth/token` for this tenant answers
+                            `not_a_member`. It is a real invitation or bulk
+                            import that its holder has not signed into yet.
+                            Render it as pending, not as somewhere to go —
+                            hiding it would make an invitation invisible to
+                            its recipient. Absent means false.
         '401':
           description: unauthorized
         '404':
           description: user_not_found
 
   # ---- ADR-049 §A.7: domain CRUD ----
+
+  /me/invitations/{tenantId}/reject:
+    post:
+      tags: [Auth]
+      summary: Decline an invitation to a tenant (ADR-092 D5)
+      description: |
+        Authenticated by the caller's own **realm** session (BearerAccess),
+        not a session in the target tenant — someone declining an invitation
+        has no session there and never will. The target membership is proven
+        to be the caller's by the same verified-email correlation `/me` uses
+        (ADR-093 D3); an unverified address cannot claim a membership.
+
+        Records the outcome rather than deleting it: the invitation moves to
+        `status='rejected'` with a `responded_at`, and the membership row it
+        would have created is ended. Because the live-invite unique index is
+        partial (`WHERE status='pending'`), the rejected row does not occupy
+        the slot and the tenant MAY invite the same person again later; the
+        rejection survives as history beside the new offer.
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Invitation declined
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string, format: uuid }
+                  status: { type: string, enum: [rejected] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            No such membership for this caller. Deliberately does not
+            distinguish "no such tenant" from "not your tenant" — the
+            difference would make this an existence oracle for tenant ids.
+        '409':
+          description: |
+            `not_invited` — the membership is not a pending invitation (an
+            active member wanting out uses the leave endpoint instead), or
+            `not_pending` — the invitation was already answered, revoked or
+            expired.
+        '501':
+          description: '`invitations_unavailable` — invitation lifecycle store not configured.'
+      security:
+        - BearerAccess: []
+  /me/memberships/{tenantId}/leave:
+    post:
+      tags: [Auth]
+      summary: Leave a tenant you are a member of (ADR-092 D5)
+      description: |
+        Authenticated by the caller's own **realm** session (BearerAccess).
+        This is the recovery path out of a suspended membership, which is why
+        it cannot require a session in the tenant being left: that would make
+        the recovery require the very access it is recovering from.
+
+        Reuses ADR-076's `leave_entirely` disposition — the membership is
+        deactivated — rather than introducing a third verb for the same idea.
+        Live sessions for that membership are revoked, otherwise the caller
+        would keep working there on an already-minted token until it expired
+        and leaving would be cosmetic for up to a TTL.
+
+        The tenant's OWNER is refused. `tenants.owner_user_id` is NOT NULL
+        (ADR-073 Amendment C), so an owner leaving would strand the tenant and
+        the database would reject it; ownership must be transferred first.
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Membership ended
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string, format: uuid }
+                  status: { type: string, enum: [left] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such membership for this caller. }
+        '409':
+          description: |
+            `owner_cannot_leave` — transfer ownership (ADR-076) before
+            leaving, or `already_left` — the membership is already ended.
+      security:
+        - BearerAccess: []
+  /me/tenant-choice:
+    post:
+      tags: [Auth]
+      summary: Settle the single-tenant picker (ADR-092 D5)
+      description: |
+        Answers the picker raised by `tenant_choice_required` on the login
+        response: keep the named membership, give up the others in that realm.
+
+        The unchosen memberships are **suspended, not deleted** (ADR-087's
+        precedent). A login-time picker is a fast decision made under mild
+        pressure and should not be the most destructive operation in the
+        product; `POST /me/memberships/{tenantId}/leave` remains the deliberate
+        way out, and an admin can restore a suspended member.
+
+        Their sessions are **revoked**. Otherwise the person keeps working in an
+        organization they just gave up, on an already-minted access token, until
+        it expires — the change would be cosmetic for up to a token TTL.
+
+        An **owned** organization cannot be given up: `tenants.owner_user_id` is
+        NOT NULL, so revoking the owner's membership would leave it ownerless.
+        Ownership must be transferred (ADR-076) first. The refusal is checked
+        BEFORE anything is mutated, so a rejected choice never leaves the caller
+        partially reconciled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id]
+              properties:
+                tenant_id:
+                  type: string
+                  format: uuid
+                  description: The membership to KEEP.
+      responses:
+        '200':
+          description: Choice applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string, format: uuid }
+                  status: { type: string, enum: [chosen] }
+                  released:
+                    type: integer
+                    description: How many memberships were suspended.
+        '400': { description: '`tenant_required` — tenant_id is required.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such membership for this caller. }
+        '409':
+          description: |
+            `owner_cannot_be_revoked` — the caller owns another organization in
+            this realm and must transfer it first; or
+            `single_tenant_not_required` — this realm does not require
+            single-tenant membership, so there is nothing to settle.
+      security:
+        - BearerAccess: []
+  # ---- ADR-094: per-org domain SSO grants -------------------------------
+  # Distinct from /platforms/{pid}/tenants/{tid}/domains above, which is ADR-049
+  # ROUTING (`domain_mappings`: who is served at this hostname). These paths
+  # answer a different question — which org may a verified address at this
+  # domain be auto-provisioned into — and read a different table
+  # (`tenant_domains`). Before ADR-094 the login resolver read the routing
+  # table, so a domain bound for routing silently conferred SSO.
+  #
+  # AUTHORIZATION (ADR-094 D11): the tenant-scoped operations below accept the
+  # ORGANIZATION's own owner/admin (`domains:manage` resolved in the tenant)
+  # OR the PLATFORM's. The platform-scoped approval queue accepts the platform
+  # only. A BFF acting for a signed-in human forwards the user's verified access
+  # JWT as `X-User-Token`; the bot credential itself never needs the permission.
+  /platforms/{pid}/tenants/{tid}/sso-domains:
+    parameters:
+      - in: path
+        name: pid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: tid
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Platform Admin]
+      summary: List an organization's SSO domain grants
+      security: [{ BearerPlatformToken: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/SSODomainGrant' }
+                  next_cursor: { type: string, nullable: true }
+        '401': { description: unauthorized }
+        '403': { description: forbidden }
+        '404': { description: tenant_not_found }
+    post:
+      tags: [Platform Admin]
+      summary: Claim a domain for organization SSO
+      description: |
+        Creates the grant record. There is no NULL-evidence path (D5): an
+        unproven claim is a ROW carrying a status and a method, so an audit can
+        always say who asserted what, when, and under which standard.
+
+        `method` defaults to `dns_txt`. Which methods are permitted is decided
+        by the platform's `domain_sso.evidence` — proof is accepted at every
+        level, attestation only where the platform allows it
+        (`400 method_not_enabled` otherwise).
+
+        For a proof method the response carries the DNS record / file the caller
+        must publish, and the grant sits in `claimed` until
+        `POST .../{domain}/verify` succeeds. `self_asserted` activates
+        immediately; `platform_approval` lands in `pending` for the platform
+        owner.
+
+        Freemail and public-suffix domains are refused with
+        `400 domain_not_eligible` on EVERY evidence level — a grant on
+        `gmail.com` or on `co.uk` would auto-provision a large fraction of the
+        internet into one org.
+      security: [{ BearerPlatformToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain: { type: string, example: acme.com }
+                method:
+                  type: string
+                  enum: [dns_txt, html_file, meta_tag, platform_approval, self_asserted]
+                  default: dns_txt
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  grant: { $ref: '#/components/schemas/SSODomainGrant' }
+                  instructions:
+                    type: object
+                    description: |
+                      Present only for a proof method — the DNS record or file
+                      the caller must publish before verifying.
+        '400': { description: domain_not_eligible | method_not_enabled | invalid_method }
+        '401': { description: unauthorized }
+        '403': { description: forbidden }
+        '404': { description: tenant_not_found }
+        '409': { description: grant_exists | domain_owned_elsewhere | dns_proof_supersedes }
+        '429': { description: too_many_pending_claims | domain_request_cooldown }
+
+  /platforms/{pid}/tenants/{tid}/sso-domains/{domain}/verify:
+    parameters:
+      - in: path
+        name: pid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: tid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: domain
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Platform Admin]
+      summary: Run the proof check for an SSO domain grant
+      description: |
+        Performs the real DNS / file / meta check — the issuer carries no
+        verification bypass, by design.
+
+        On success the grant goes `active` and `verified_at` is written. That
+        write is where D8 applies: if another org in this platform already holds
+        the domain PROVEN, a partial unique index rejects it and the caller gets
+        `409 domain_owned_elsewhere`. The refusal comes from the constraint, not
+        from a pre-check, so two orgs verifying concurrently cannot both win.
+
+        Incumbency is not permanent — a proven grant is re-checked every 24h and
+        goes `failed` after 7 consecutive days of failure, at which point it
+        leaves the index and a challenger can verify.
+
+        A FAILED check is not an error: the response returns `verified: false`
+        with the grant unchanged apart from `last_checked_at`.
+      security: [{ BearerPlatformToken: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  grant: { $ref: '#/components/schemas/SSODomainGrant' }
+                  verified: { type: boolean }
+        '400': { description: not_a_proof_method | method_not_enabled }
+        '401': { description: unauthorized }
+        '403': { description: forbidden }
+        '404': { description: tenant_not_found | grant_not_found }
+        '409': { description: domain_owned_elsewhere }
+
+  /platforms/{pid}/tenants/{tid}/sso-domains/{domain}/request:
+    parameters:
+      - in: path
+        name: pid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: tid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: domain
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Platform Admin]
+      summary: Ask the platform owner to attest an SSO domain
+      description: |
+        Flow 2 of ADR-094 D11 — for an org that cannot publish DNS. Distinct
+        from a claim because it is a different act: a claim says "I will prove
+        this", a request says "I cannot prove this, please vouch for me".
+
+        Available only where `domain_sso.evidence` permits `platform_approval`
+        (`400 method_not_enabled` otherwise), and refused with
+        `409 dns_proof_supersedes` when another org has actually PROVEN the
+        domain — proof outranks attestation, so the grant would be suspended by
+        the D9 ladder the moment it ran.
+      security: [{ BearerPlatformToken: [] }]
+      responses:
+        '200':
+          description: OK — grant is pending platform approval
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSODomainGrant' }
+        '400': { description: domain_not_eligible | method_not_enabled }
+        '401': { description: unauthorized }
+        '403': { description: forbidden }
+        '404': { description: tenant_not_found }
+        '409': { description: dns_proof_supersedes | domain_owned_elsewhere }
+        '429': { description: too_many_pending_claims | domain_request_cooldown }
+
+  /platforms/{pid}/tenants/{tid}/sso-domains/{domain}:
+    parameters:
+      - in: path
+        name: pid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: tid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: domain
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Platform Admin]
+      summary: Revoke an SSO domain grant
+      description: |
+        Open to BOTH principals: an org may give up its own grant, and the
+        platform owner may take one away.
+
+        The row is marked `revoked`, which frees the grant slot so the domain
+        can be claimed again later — after a 7-day cooldown. That is longer than
+        the 24h cooldown after a rejection, because a revoke ends a grant that
+        was previously good, which is the stronger signal.
+
+        `verified_at` is deliberately left in place: it records that proof once
+        happened, which remains true. `status` is what stops the row
+        provisioning or holding the domain.
+      security: [{ BearerPlatformToken: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSODomainGrant' }
+        '401': { description: unauthorized }
+        '403': { description: forbidden }
+        '404': { description: tenant_not_found | grant_not_found }
+
+  /platforms/{pid}/sso-domains:
+    parameters:
+      - in: path
+        name: pid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: query
+        name: status
+        required: false
+        schema: { type: string }
+        description: |
+          Comma-separated status filter, e.g. `pending` for the approval queue.
+          Omitted returns every grant in the platform.
+    get:
+      tags: [Platform Admin]
+      summary: List every SSO domain grant in a platform (approval queue)
+      description: |
+        Platform-scoped, so platform-gated: an org owner has no business
+        enumerating every other org's domains (ADR-067, the same reasoning that
+        keeps rosters org-private).
+      security: [{ BearerPlatformToken: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/SSODomainGrant' }
+                  next_cursor: { type: string, nullable: true }
+        '400': { description: invalid_status }
+        '401': { description: unauthorized }
+        '403': { description: forbidden }
+
+  /platforms/{pid}/sso-domains/{id}/approve:
+    parameters:
+      - in: path
+        name: pid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Platform Admin]
+      summary: Approve a pending SSO domain request
+      description: |
+        Platform-only, and not by convention alone: an org approving its own
+        request would make the request flow a no-op with extra steps.
+
+        The grant becomes `active` with `method=platform_approval`.
+        `verified_at` stays NULL — an approval is an ATTESTATION, not proof, and
+        a schema CHECK refuses any other reading. Eligibility and the platform's
+        evidence level are re-checked at approval, because approval is the act
+        that makes the grant live and either may have changed since the request.
+
+        A grant from another platform answers `404`, not `403`: distinguishing
+        the two would make this route an existence oracle for other platforms'
+        grant ids.
+      security: [{ BearerPlatformToken: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSODomainGrant' }
+        '400': { description: domain_not_eligible | method_not_enabled }
+        '401': { description: unauthorized }
+        '403': { description: forbidden }
+        '404': { description: grant_not_found }
+        '409': { description: dns_proof_supersedes | domain_owned_elsewhere }
+
+  /platforms/{pid}/sso-domains/{id}/reject:
+    parameters:
+      - in: path
+        name: pid
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Platform Admin]
+      summary: Reject a pending SSO domain request
+      description: |
+        Sets the grant to `rejected` and starts a 24h cooldown, during which the
+        same org cannot re-request the domain (`429 domain_request_cooldown`).
+        A rejection is often quickly remediable — fix the DNS record, talk to
+        the platform owner — so the cooldown is friction against a retry loop,
+        not a penalty.
+      security: [{ BearerPlatformToken: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSODomainGrant' }
+        '401': { description: unauthorized }
+        '403': { description: forbidden }
+        '404': { description: grant_not_found }
 
   /platforms/{pid}/tenants/{tid}/domains:
     parameters:
@@ -6990,12 +7732,27 @@ paths:
   /domains/resolve:
     get:
       tags: [Auth]
-      summary: Public domain resolver (unauthenticated)
+      summary: Resolve a domain within your own realm
       description: |
-        ADR-049 §A.7.3. Single index hit on `domain_mappings`. Returns
-        `{ entity_type, entity_id, realm_id }` joined through `tenants`
-        for `entity_type='tenant'`. Used for tooling, support, and the
-        SDK's origin-cache seeding.
+        ADR-049 §A.7.3, **amended 2026-08-02 (spec 0.19.0)**. Single index
+        hit on `domain_mappings`. Returns `{ entity_type, entity_id,
+        realm_id }`, joined through `tenants` for `entity_type='tenant'`.
+
+        **BREAKING:** this endpoint used to be unauthenticated. It now
+        requires a platform token and answers **only for that token's own
+        realm** — it was otherwise a customer-enumeration oracle (probe a
+        domain list, learn who the platform's customers are and the UUIDs
+        their admin paths key on).
+
+        A domain bound to a *different* realm returns the **same `404
+        not_found`** as a domain nobody has bound. The two cases are
+        deliberately indistinguishable; a distinct `403` would still
+        confirm the domain is live.
+
+        The surviving use is the post-claim "did my DNS land?" check,
+        where the caller holds their own realm's token. There is no
+        cross-realm lookup.
+      security: [{ BearerPlatformToken: [] }]
       parameters:
         - in: query
           name: domain
@@ -7014,7 +7771,8 @@ paths:
                   entity_id: { type: string, format: uuid }
                   realm_id: { type: string, format: uuid }
         '400': { description: missing_domain }
-        '404': { description: not_found }
+        '401': { description: missing or invalid platform bearer }
+        '404': { description: not_found — unbound, OR bound in another realm }
 
   # ---- Internal ops console (UI v2 G3) -----------------------------------
   # Base-realm staff only. See the "Internal ops" tag description.
