@@ -2,6 +2,12 @@
 
 Open work only; shipped items live in `CHANGELOG.md` / git tags.
 
+> **Re-verified 2026-08-03** against the tree — all four items still stand, with
+> the cited line numbers refreshed: `resolveCredential`
+> (`cmd/realm-id/commands.go:312-317`) still returns the raw `rk_live_…` as the
+> bearer for the issuer, and `authWhoami` (`cmd/realm-id/main.go:501-512`) still
+> prints `/me` verbatim with no `exp` decode.
+
 ---
 
 ## Device-flow DX (Traide integration feedback, 2026-06-29)
@@ -42,7 +48,7 @@ warning against concurrent `auth login`); these are the code fixes.
 
 - [ ] **Service mode does not work against the issuer (pre-existing).** Tracked in
   the root `TODO.md` § Infra / dev-loop; restated here because it is CLI code.
-  `resolveCredential` (`cmd/realm-id/commands.go:313`) sends the raw
+  `resolveCredential` (`cmd/realm-id/commands.go:312-317`) sends the raw
   `REALM_ID_API_KEY` (`rk_live_…`) as `Authorization: Bearer` to
   `auth.realmid.dev`, on the in-code claim that the issuer accepts it as a
   platform credential. **It does not** — `requireAuth` runs the bearer through
@@ -55,7 +61,5 @@ warning against concurrent `auth login`); these are the code fixes.
   platform JWT; update the README's "issuer-direct" claim (~line 102) in the same
   change. **Not caused by ADR-089** — the CLI never held a refresh token here.
 
-## Chores
-
-*(The `gofmt -l` violation on `cmd/realm-id/main.go` was verified clean on
-2026-07-28 — `gofmt -l cli/cmd` reports nothing. Item removed.)*
+*(No open chores. The `gofmt -l` violation on `cmd/realm-id/main.go` was verified
+clean 2026-07-28 and the item was removed; this line goes at the next sweep.)*
