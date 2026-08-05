@@ -178,7 +178,10 @@ func runCommand(cfg *Config, cmd command, args []string) int {
 		return failCode(berr, exitUsage)
 	}
 
-	base, bearer := resolveCredential(cfg)
+	base, bearer, cerr := resolveCredential(cfg)
+	if cerr != nil {
+		return failCode(cerr, exitForbidden)
+	}
 	if bearer == "" {
 		return failCode(fmt.Errorf("no credential: set REALM_ID_API_KEY or run `realm-id auth login`"), exitForbidden)
 	}
@@ -298,8 +301,8 @@ func inferScalar(s string) any {
 // resolveCredential picks the base URL + bearer for a typed command.
 //
 // Two modes, two hosts (ADR-062 §4):
-//   - Service mode: a static API key (REALM_ID_API_KEY, rk_live_…) authenticates
-//     issuer-direct — the issuer accepts it as a platform credential.
+//   - Service mode: a static API key (REALM_ID_API_KEY, rk_live_…) is EXCHANGED
+//     for a short-lived platform JWT at the issuer, and that JWT is the bearer.
 //   - Session mode: the device-flow session token (rsid_…) is a *BFF* session
 //     credential, not an issuer access JWT — the issuer rejects it. Typed
 //     commands therefore route through the BFF's `/api/*` admin passthrough,
@@ -309,11 +312,66 @@ func inferScalar(s string) any {
 //     before forwarding, so we prepend it here. (`realm-id api` stays a raw
 //     escape hatch and is deliberately NOT prefixed — it must also reach
 //     native BFF routes like /me and /switch-tenant.)
-func resolveCredential(cfg *Config) (base, bearer string) {
+//
+// Service mode used to send the RAW `rk_live_…` as the bearer, on the in-code
+// claim that "the issuer accepts it as a platform credential". It does not, and
+// never did: requireAuth runs the bearer through LocalVerifier.Verify, which
+// rejects anything that is not a 3-part JWT, and LookupByPresented is reachable
+// only from /auth/login, the user-api-key exchange and the integration mint.
+// Confirmed live — `Authorization: Bearer rk_live_…` against /me answers
+// `401 invalid bearer`. So service mode had never worked against any typed
+// command; only session mode ever did. (Not an ADR-089 regression: this lane
+// never held a refresh token.)
+func resolveCredential(cfg *Config) (base, bearer string, err error) {
 	if k := envOr("REALM_ID_API_KEY", ""); k != "" {
-		return cfg.issuerURL(), k
+		tok, xerr := exchangeAPIKey(cfg, k)
+		if xerr != nil {
+			return "", "", xerr
+		}
+		return cfg.issuerURL(), tok, nil
 	}
-	return cfg.bffURL() + "/api", cfg.SessionToken
+	return cfg.bffURL() + "/api", cfg.SessionToken, nil
+}
+
+// platformTokenCache holds the exchanged platform JWT for the lifetime of the
+// PROCESS. A CLI invocation runs one command, so this is at most one exchange
+// per run and there is nothing to expire against: the token outlives the
+// request it was minted for.
+//
+// It is deliberately NOT persisted to the config file. Per ADR-089 this lane
+// returns an access token with NO refresh token — the api key IS the renewable
+// credential — so caching the JWT on disk would add a second bearer at rest and
+// buy nothing: re-exchanging costs one request and cannot fail in a way holding
+// a stale token would fix. A long-running caller that needs re-minting is the
+// SDK's sessionManager, not this.
+var platformTokenCache string
+
+// exchangeAPIKey trades the raw platform api key for a short-lived platform
+// access token (ADR-051 two-endpoint surface): the same bootstrap a partner
+// backend performs, which is exactly what the CLI is standing in for here.
+func exchangeAPIKey(cfg *Config, apiKey string) (string, error) {
+	if platformTokenCache != "" {
+		return platformTokenCache, nil
+	}
+	var out struct {
+		AccessToken string `json:"access_token"`
+	}
+	status, raw, err := jsonRequest(http.MethodPost, cfg.issuerURL()+"/auth/login", "",
+		map[string]string{"grant_type": "platform_api_key", "api_key": apiKey}, &out)
+	if err != nil {
+		return "", fmt.Errorf("exchanging REALM_ID_API_KEY for a platform token: %w", err)
+	}
+	if status/100 != 2 {
+		return "", fmt.Errorf("exchanging REALM_ID_API_KEY for a platform token: %s: %s",
+			http.StatusText(status), strings.TrimSpace(string(raw)))
+	}
+	if out.AccessToken == "" {
+		// A 2xx with no token means the contract moved under us; say so rather
+		// than sending an empty bearer and reporting a confusing 401.
+		return "", fmt.Errorf("issuer returned no access_token for grant_type=platform_api_key")
+	}
+	platformTokenCache = out.AccessToken
+	return platformTokenCache, nil
 }
 
 func printCommandHelp(w io.Writer, cmd command) {

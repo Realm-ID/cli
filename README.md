@@ -98,10 +98,17 @@ rebuild. Mapping: REST resource → noun, method → verb (`list`/`describe`/`cr
   `key:=rawjson` injects a typed value), or JSON piped on stdin.
 - **Output** — `--output json|table`; defaults to **table on a TTY, JSON when piped**
   so agents always get parseable output.
-- **Where it talks** — the typed tree is the issuer's admin contract, so it runs
-  **issuer-direct** (`auth.realmid.dev`). With `REALM_ID_API_KEY=rk_live_…` set it
-  uses that platform key (ADR-062 §4 Service mode); otherwise it falls back to the
-  `auth login` session bearer.
+- **Where it talks** — the typed tree is the issuer's admin contract. With
+  `REALM_ID_API_KEY=rk_live_…` set it runs **issuer-direct**
+  (`auth.realmid.dev`, ADR-062 §4 Service mode): the key is **exchanged once per
+  invocation** for a short-lived platform JWT via
+  `POST /auth/login {grant_type: platform_api_key}`, and that JWT is the bearer.
+  The raw key is never sent as a bearer — the issuer rejects any bearer that is
+  not a 3-part JWT, so doing so answers `401 invalid bearer`. Per ADR-089 the
+  exchange returns **no refresh token** (the key itself is the renewable
+  credential), so the token is held in memory for the process and never written
+  to disk. Without the key, commands fall back to the `auth login` session
+  bearer and route through the BFF's `/api/*` passthrough.
 - **Collisions** — where a hierarchical API flattens to the same `resource verb`
   (e.g. platform- vs tenant-scoped `identity-providers list`), the broadest-scope
   variant wins; the narrower ones stay reachable via `realm-id api`.

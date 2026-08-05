@@ -46,20 +46,27 @@ warning against concurrent `auth login`); these are the code fixes.
 
 ## Broken today
 
-- [ ] **Service mode does not work against the issuer (pre-existing).** Tracked in
-  the root `TODO.md` § Infra / dev-loop; restated here because it is CLI code.
-  `resolveCredential` (`cmd/realm-id/commands.go:312-317`) sends the raw
-  `REALM_ID_API_KEY` (`rk_live_…`) as `Authorization: Bearer` to
-  `auth.realmid.dev`, on the in-code claim that the issuer accepts it as a
-  platform credential. **It does not** — `requireAuth` runs the bearer through
-  `LocalVerifier.Verify`, which rejects anything that is not a 3-part JWT, and
-  `LookupByPresented` is reachable only from `/auth/login`, the user-api-key
-  exchange and the integration mint. Confirmed live:
-  `curl -H 'Authorization: Bearer rk_live_…' auth.realmid.dev/me` →
-  `401 invalid bearer`. So only session mode (device flow → BFF passthrough) has
-  ever worked. Fix: perform the `/auth/login` exchange and bear the resulting
-  platform JWT; update the README's "issuer-direct" claim (~line 102) in the same
-  change. **Not caused by ADR-089** — the CLI never held a refresh token here.
+> **FIXED 2026-08-05 — "Service mode does not work against the issuer."**
+> `resolveCredential` now performs the ADR-051 exchange
+> (`POST /auth/login {grant_type: platform_api_key}`) and bears the returned
+> platform JWT; the raw `rk_live_...` is never sent as a bearer. Cached per
+> PROCESS, not persisted — ADR-089 returns no refresh token on this lane, so the
+> key is the renewable credential and a JWT on disk would be a second bearer at
+> rest for no gain. The README's "it uses that platform key" line is corrected in
+> the same change.
+>
+> **The finding worth keeping: the old test was PROTECTING the bug.**
+> `TestResolveCredential` asserted `bearer == "rk_live_1"` — it restated the
+> implementation, so it passed for exactly as long as service mode was broken and
+> would have failed the moment anyone fixed it. Nothing had ever put a server on
+> the other end of service mode. The replacement asserts the CONTRACT against an
+> httptest issuer (exchange path, grant type, no Authorization on the bootstrap
+> call, bearer is the JWT and explicitly NOT the raw key, no re-exchange) and is
+> mutation-verified. RCA in `DECISIONS.md` 2026-08-05.
+>
+> This does NOT close "the CLI can act as the BFF" (root `TODO.md`): presenting
+> the ADR-088 escort bearer plus a forwarded `X-User-Token` for on-behalf calls
+> is still unbuilt. Service mode now works for platform-authority commands.
 
 *(No open chores. The `gofmt -l` violation on `cmd/realm-id/main.go` was verified
 clean 2026-07-28 and the item was removed; this line goes at the next sweep.)*
