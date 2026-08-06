@@ -102,6 +102,18 @@ func actionVerb(method, seg string) (string, bool) {
 	case "mine":
 		return "list-mine", true
 	case "config":
+		// Method-aware, unlike the segments above: /platforms/{id}/config
+		// serves BOTH a GET and a PATCH. Keying on the segment alone put them
+		// on one verb, and because they carry the same number of path params
+		// the collision tie-break in buildCommands could not separate them
+		// either — it fell through to Go's randomized map iteration, so
+		// `platforms set-config` bound to GET or PATCH per RUN.
+		//
+		// `isAction` calls this with an empty method purely to ask "is this a
+		// verb segment?", which still answers true via the write branch.
+		if method == "GET" {
+			return "get-config", true
+		}
 		return "set-config", true
 	case "role":
 		return "set-role", true

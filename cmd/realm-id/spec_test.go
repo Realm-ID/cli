@@ -128,3 +128,79 @@ func TestParamClassification(t *testing.T) {
 		t.Errorf("roles list {id} role = %q, want platform", rc.Params[0].Role)
 	}
 }
+
+// A read and a write on the same action path must not collapse onto one verb.
+//
+// `actionVerb` used to key on the trailing segment ALONE, so GET and PATCH on
+// /platforms/{id}/config both derived `platforms set-config`. The collision
+// tie-break keeps the variant with the fewest path params; these have the same
+// count, so it fell through to whichever method `pi.byMethod()` yielded first —
+// a Go map iteration, which is randomized. The command bound to GET or PATCH
+// per RUN, and a run that bound GET accepted the operator's values and issued a
+// read.
+func TestActionVerbSeparatesReadFromWrite(t *testing.T) {
+	cases := []struct{ method, path, wantGroup, wantVerb string }{
+		{"GET", "/platforms/{id}/config", "platforms", "get-config"},
+		{"PATCH", "/platforms/{id}/config", "platforms", "set-config"},
+	}
+	for _, tc := range cases {
+		g, v, ok := deriveCommand(tc.method, tc.path)
+		if !ok {
+			t.Fatalf("%s %s was skipped", tc.method, tc.path)
+		}
+		if got := strings.Join(g, " "); got != tc.wantGroup || v != tc.wantVerb {
+			t.Errorf("%s %s → %q %q, want %q %q", tc.method, tc.path, got, v, tc.wantGroup, tc.wantVerb)
+		}
+	}
+	// The point is that they DIFFER. Asserting the two names above would still
+	// pass if some later edit mapped both to the same new name.
+	_, readVerb, _ := deriveCommand("GET", "/platforms/{id}/config")
+	_, writeVerb, _ := deriveCommand("PATCH", "/platforms/{id}/config")
+	if readVerb == writeVerb {
+		t.Errorf("read and write on /platforms/{id}/config share verb %q", readVerb)
+	}
+}
+
+// buildCommands must be a pure function of the spec.
+//
+// This is the GENERAL guard, and it is deliberately not a list of known
+// collisions: it walks whatever the embedded spec contains, so a future path
+// that collides is caught without anyone remembering to add a case. Ranging
+// over a Go map is randomized per run, so repeating the build surfaces any
+// binding that depends on that order.
+func TestBuildCommandsIsDeterministic(t *testing.T) {
+	type binding struct{ method, path string }
+
+	first := map[string]binding{}
+	cmds, _, err := buildCommands()
+	if err != nil {
+		t.Fatalf("buildCommands: %v", err)
+	}
+	for _, c := range cmds {
+		first[strings.Join(c.Group, " ")+" "+c.Verb] = binding{c.Method, c.Path}
+	}
+	if len(first) == 0 {
+		t.Fatal("no commands built — the guard would pass vacuously")
+	}
+
+	for i := 0; i < 50; i++ {
+		got, _, err := buildCommands()
+		if err != nil {
+			t.Fatalf("buildCommands (run %d): %v", i, err)
+		}
+		if len(got) != len(cmds) {
+			t.Fatalf("run %d built %d commands, first run built %d", i, len(got), len(cmds))
+		}
+		for _, c := range got {
+			key := strings.Join(c.Group, " ") + " " + c.Verb
+			want, ok := first[key]
+			if !ok {
+				t.Fatalf("run %d produced %q, absent from the first run", i, key)
+			}
+			if c.Method != want.method || c.Path != want.path {
+				t.Fatalf("run %d: %q bound to %s %s, first run bound %s %s — build is order-dependent",
+					i, key, c.Method, c.Path, want.method, want.path)
+			}
+		}
+	}
+}

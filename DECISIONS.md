@@ -4,6 +4,91 @@ Rationale log for the `realm-id` CLI. WHAT-shipped lives in git/CHANGELOG; this
 file records WHY. See the root `Realm-ID/project` DECISIONS.md for cross-cutting
 context.
 
+## 2026-08-06 — re-vendor the spec to 0.24.0; `platforms describe` costs a `cp`
+
+The vendored `openapi.yaml` was pinned at spec `0.20.0` while the issuer had
+reached `0.24.0`. Re-vendored (the `//go:generate` line in `spec.go` is the
+whole procedure) and reviewed the resulting command-tree diff rather than just
+the endpoint that motivated it — a re-vendor pulls in four versions of drift.
+
+**Net effect: three commands added, none removed, none renamed.**
+`platforms describe` (`GET /platforms/{id}`), `admin platforms describe`
+(`GET /admin/platforms/{id}`), and `invitations accept` (the ADR-095 endpoint
+that shipped in issuer `v0.83.0`). The diff was taken between two builds that
+BOTH carried the `set-config` fix below, so it isolates spec drift.
+
+**Why this closes a "needs an SDK wrapper" item.** `sdk/TODO.md` recorded
+`GET /platforms/{id}` as owed to the partner SDKs because "it is the read the
+CLI's `platforms describe` needs". The CLI does not use the Go SDK at all —
+`go.mod` requires only `gopkg.in/yaml.v3`, and requests go through its own
+`newRequest`. Commands are DERIVED from the embedded spec at runtime by
+`buildCommands`, and `deriveCommand` already maps a trailing `{param}` + GET to
+`describe`. So the feature needed no SDK, no new resource type and no `SPEC.md`
+change — it needed a file copy.
+
+**Consequence for the SDK item:** with its only named consumer served, adding a
+partner-facing `platforms` resource to go/ts/java has no identified caller.
+Recorded as closed-unless-asked in `sdk/TODO.md` rather than left open, because
+an item that describes work nobody needs is indistinguishable from one that is
+merely unstarted.
+
+## 2026-08-06 — `platforms set-config` bound to GET or PATCH at random, per run
+
+**RCA — a write command that sometimes performed a read**
+
+**Symptom** — `realm-id platforms set-config` was bound to `GET
+/platforms/{id}/config` on some invocations and `PATCH` on others, from the
+SAME binary and the SAME embedded spec. Observed directly: eight consecutive
+runs of one build printed the GET summary five times and the PATCH summary
+three times. On a run that bound GET, the command accepts the operator's
+config values, issues a read, and reports success — the change silently does
+not happen. (That impact is read off the code path; it was not executed
+against a live issuer.)
+
+**Root cause** — `actionVerb` mapped a trailing path segment to a verb using
+the SEGMENT ALONE, ignoring the HTTP method: `case "config": return
+"set-config", true`. `/platforms/{id}/config` serves both a GET (issuer
+v0.52.0) and a PATCH, so both derived the identical `(group, verb)` key
+`platforms set-config`. `buildCommands` resolves such a collision by keeping
+the variant with the FEWEST path params — but these two are the same path, so
+their param counts are equal, the comparison `len(c.Params) < len(prev.Params)`
+is false, and it keeps whichever arrived first. That order comes from ranging
+`pi.byMethod()`, a Go map, whose iteration order is deliberately randomized.
+
+**Why it wasn't caught** — three reinforcing reasons, and the third is the
+general one:
+1. `TestDeriveCommand` is a table of hand-picked `(method, path)` cases and
+   nobody added a `/config` row. It could only ever cover the pairs someone
+   thought of — the hand-maintained-subject-list failure, again.
+2. Every test asserted `deriveCommand` in ISOLATION, where the bug is
+   invisible: `deriveCommand("GET", …)` and `deriveCommand("PATCH", …)` each
+   return a stable answer. The defect only exists in `buildCommands`, where the
+   two answers COLLIDE, and nothing tested that function's output was stable.
+3. Randomized failures do not look like failures. A 50/50 binding presents as
+   "it worked yesterday", which reads as user error rather than a bug.
+
+**Fix** — `actionVerb` is method-aware for `config`: `GET` → `get-config`,
+writes → `set-config`. Verified this renames nothing else: `config` is the only
+action segment in the whole spec carrying more than one non-DELETE method, and
+the only other GET-bearing action paths (`/domains/resolve`, `/platforms/mine`)
+already map to `resolve` / `list-mine`. `isAction` calls this with an empty
+method purely to ask "is this a verb segment?" and still answers true.
+
+**Prevention** — `TestBuildCommandsIsDeterministic` builds the command tree 51
+times and fails if any `(group, verb)` binds to a different `(method, path)`
+than the first run. It is deliberately NOT a list of known collisions: it walks
+whatever the embedded spec contains, so a future colliding path is caught
+without anyone remembering to add a case — which is exactly what did not happen
+here. It also guards the re-vendor: a spec bump that introduces a collision now
+fails the build instead of shipping a coin-flip. `t.Fatal` on an empty command
+set stops it passing vacuously if the spec ever fails to parse.
+
+**Not fixed here, deliberately** — the collision RESOLUTION is still silent for
+genuinely different paths (the platform- vs tenant-scoped variants it was
+written for). Those are deterministic, because they differ in param count, so
+they are out of scope for this bug; the dropped variants stay reachable via
+`realm-id api`.
+
 ## 2026-08-05 — service mode never worked, and the test was holding it that way
 
 **RCA — `REALM_ID_API_KEY` typed commands always 401'd**

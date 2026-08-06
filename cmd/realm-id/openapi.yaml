@@ -48,7 +48,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.20.0
+  version: 0.24.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -985,19 +985,39 @@ components:
             behavior of the partner OTP primitive.
         delivery_mode:
           type: string
-          enum: [view_bff]
+          enum: [view_bff, email]
           default: view_bff
           description: |
-            Mint transport (ADR-071 §4). **v1 ships `view_bff` only**
-            (default when omitted): the plaintext code is returned to
-            the authorized caller in the response `value` and relayed
-            out-of-band. RI-delivered modes (`sms`/`whatsapp`/`email`)
-            are deferred behind the credential-custodian/KMS work and
-            currently return `400 unsupported_delivery_mode`.
+            Mint transport (ADR-071 §4, threaded by ADR-095 D7).
+
+            `view_bff` (the default when omitted) returns the plaintext code
+            to the authorized caller in the response `value`, to be relayed
+            out-of-band. This is unchanged, and an omitted field still means
+            exactly this.
+
+            `email` has RealmID deliver the code to the SUBJECT. The caller
+            does **not** receive the plaintext — `value` is omitted from the
+            response and `delivered` reports `email`. Returning the code as
+            well would make the mode confer nothing.
+
+            **`email` is refused for `purpose=login`** with
+            `400 unsupported_delivery_mode`: that path targets a `kind=service`
+            account (ADR-071 §5), which has no mailbox, so there is no correct
+            destination for the message.
+
+            Errors: `400 unsupported_delivery_mode` (unknown mode, or `email`
+            on a login OTP); `400 no_delivery_address` (the subject has no
+            email on record — the issue FAILS rather than returning an id for
+            a code nobody will receive); `503 delivery_unavailable` (the mode
+            is legal but this deployment has no transport wired).
+
+            `sms`/`whatsapp` remain deferred behind the
+            credential-custodian/KMS work and still return
+            `400 unsupported_delivery_mode`.
 
     OTPIssueResponse:
       type: object
-      required: [id, value, expires_at, purpose, subject_ref]
+      required: [id, expires_at, purpose, subject_ref]
       properties:
         id: { type: string, format: uuid }
         value:
@@ -1007,6 +1027,17 @@ components:
             6, range 4..10). The caller is responsible for delivery (UI
             display, partner SMS / email). Re-displayable via
             `GET /auth/otp/{id}` until TTL expires.
+
+            **OMITTED when `delivery_mode=email`** (ADR-095 D7): RealmID
+            delivered the code to the subject, so the caller does not get it.
+            Check `delivered` to tell that apart from a fault.
+        delivered:
+          type: string
+          enum: [view_bff, email]
+          description: |
+            The transport actually used (ADR-095 D7). Lets a caller
+            distinguish "no `value` because it was emailed" from "no `value`
+            because something broke".
         expires_at:
           type: string
           format: date-time
@@ -1432,8 +1463,8 @@ components:
           description: |
             Inline owner of this tenant (role=owner). Populated on list
             responses (`GET /tenants`, `GET /platforms/{pid}/tenants`) so
-            admin UIs avoid an N+1 fan-out; omitted on single-tenant
-            fetches. `null` when no owner is seated yet (e.g., a freshly
+            admin UIs avoid an N+1 fan-out, and on `GET /tenants/{id}` (one
+            lookup, so no fan-out concern). `null` when no owner is seated yet (e.g., a freshly
             minted admin tenant before the invite is accepted).
         users_count:
           type: integer
@@ -1456,9 +1487,40 @@ components:
             only (an org whose users merely sign in without triggering an
             audited action will not move it).
 
-            Populated ONLY on `GET /platforms/{pid}/tenants`, and **absent**
-            when the tenant has never had an audited event — render absent as
-            unknown, never as the epoch.
+            Populated on `GET /platforms/{pid}/tenants` and on
+            `GET /tenants/{id}`, and **absent** when the tenant has never had
+            an audited event — render absent as unknown, never as the epoch.
+        member_count:
+          type: integer
+          description: |
+            People currently on this tenant's roster: `users` rows with
+            `kind='human'` AND `status <> 'invited'`.
+
+            A DEACTIVATED member IS counted — they are still on the roster and
+            still administrable. An INVITED row is NOT: an invitation is an
+            offer, not a membership. A `kind='service'` row is not counted at
+            all — a bot is not a member of a team.
+
+            This is deliberately not derivable from `users_count`, which is
+            every row regardless of status or kind and therefore already
+            contains every pending invitation and every service account.
+
+            Populated ONLY on `GET /tenants/{id}`, computed best-effort:
+            **absent** (not `0`) when the aggregate could not be computed, so
+            render an absent value as unknown. It exists on this endpoint
+            because a platform owner may READ one of their orgs
+            (`authorizeTenantRead` has a parent branch) but may NOT read its
+            user roster (`GET /tenants/{id}/users` does not) — ADR-067. The
+            aggregate is what that persona can be shown.
+        pending_invitation_count:
+          type: integer
+          description: |
+            `users` rows in this tenant with `status='invited'` — the exact
+            precondition the accept/reject endpoints enforce.
+
+            Same surface and same absent-vs-zero contract as `member_count`
+            above. `member_count` and `pending_invitation_count` are disjoint
+            by construction and both are subsets of `users_count`.
 
     TenantConfig:
       type: object
@@ -1590,6 +1652,35 @@ components:
       description: Allowlist — unknown keys return 400 `unknown_config_key`.
       properties:
         concurrent_session_limit: { type: integer, minimum: 0 }
+        invitation_acceptance:
+          type: string
+          enum: [auto, explicit]
+          default: auto
+          description: |
+            ADR-095 D2. How an invitation into a tenant in this realm becomes a
+            live membership.
+
+            `auto` (the default, and what every realm did before ADR-095) flips
+            the invited membership to active on the invitee's next sign-in
+            ANYWHERE in this realm, with no prompt. That makes an invitation a
+            unilateral cross-tenant membership grant — fine for a platform whose
+            invitees are expected, wrong for one where a person can be pulled
+            into several customer orgs.
+
+            `explicit` requires the invitee to accept via
+            `POST /me/invitations/{tenantId}/accept` (or decline via the
+            `/reject` sibling). Until they do, the membership stays
+            `status='invited'` and is surfaced on `GET /me` with
+            `pending_first_signin: true`.
+
+            **Exception (D3):** even in `explicit` mode, an invitation
+            auto-accepts when it is the invitee's ONLY membership in the realm.
+            That case is invite-only onboarding rather than a cross-org grant,
+            and refusing it would strand a first-time invitee with no console on
+            which to accept the invitation that would give them one.
+
+            An ABSENT value means `auto`. Changing the mode affects invitations
+            not yet accepted; it never retroactively un-joins anyone.
         single_tenant_membership:
           type: boolean
           description: |
@@ -2089,6 +2180,7 @@ components:
       properties:
         concurrent_session_limit: { type: integer }
         single_tenant_membership: { type: boolean }
+        invitation_acceptance: { type: string, enum: [auto, explicit] }
         session_eviction_policy: { type: string }
         access_ttl_seconds: { type: integer }
         refresh_ttl_seconds: { type: integer }
@@ -4194,6 +4286,38 @@ paths:
         name: id
         required: true
         schema: { type: string, format: uuid }
+    get:
+      tags: [Platforms]
+      summary: Read one platform the caller owns
+      description: |
+        The singular counterpart to `GET /platforms/mine`, returning the same
+        row shape for one platform. Backs the CLI's `platforms describe`.
+
+        Authorization is inherited from `/platforms/mine`, not restated: the
+        visible set is exactly what that endpoint returns, filtered to one id.
+        A platform the caller cannot see returns the SAME `404
+        platform_not_found` as an id that was never issued — never `403`. A
+        distinct refusal would confirm the id is live, which would turn any
+        partner account into a directory of every platform on the fleet.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformSummary' }
+        '401':
+          description: unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            platform_not_found — returned identically for an unknown id and for
+            a platform the caller may not see.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
     patch:
       tags: [Platforms]
       summary: Rename a platform
@@ -5803,6 +5927,16 @@ paths:
     get:
       tags: [Tenants]
       summary: Get a tenant
+      description: |
+        Readable by any member of the tenant AND by the owner of the parent
+        realm's admin tenant (a platform owner over one of their orgs; RI over
+        a platform's admin tenant) — ADR-067's G-014 parent branch.
+
+        The response carries `member_count`, `pending_invitation_count` and
+        `last_activity_at`. Those aggregates exist for the parent persona, who
+        can read this record but CANNOT read `GET /tenants/{id}/users` — that
+        gate has no parent branch, deliberately. All three are best-effort:
+        absent means "not computed", never `0`.
       security: [{ BearerAccess: [] }]
       responses:
         '200':
@@ -6938,6 +7072,19 @@ paths:
                             Render it as pending, not as somewhere to go —
                             hiding it would make an invitation invisible to
                             its recipient. Absent means false.
+                        invitation_pending:
+                          type: boolean
+                          description: >-
+                            ADR-095 D5 — this membership is still an OFFER
+                            awaiting the caller's answer (`users.status =
+                            'invited'`), so `POST /me/invitations/{tenantId}/accept`
+                            and its `/reject` sibling will act on it. Orthogonal
+                            to `pending_first_signin`, which answers whether the
+                            membership can be ENTERED: a bulk import and a
+                            just-accepted invitation are both unclaimed with no
+                            decision outstanding, and offering accept/decline on
+                            either answers `not_invited` / `not_pending`. Absent
+                            means false.
         '401':
           description: unauthorized
         '404':
@@ -6945,6 +7092,61 @@ paths:
 
   # ---- ADR-049 §A.7: domain CRUD ----
 
+  /me/invitations/{tenantId}/accept:
+    post:
+      tags: [Auth]
+      summary: Accept an invitation to a tenant (ADR-095 D5)
+      description: |
+        Authenticated by the caller's own **realm** session (BearerAccess),
+        not a session in the target tenant — someone accepting an invitation
+        has no session there yet. The target membership is proven to be the
+        caller's by the same correlation the `/reject` sibling uses.
+
+        The invitation moves to `status='accepted'` with a `responded_at` and
+        the membership row becomes `active`.
+
+        Needed because a realm on `invitation_acceptance: explicit`
+        (ADR-095 D2) no longer activates an invitation implicitly at login, so
+        a decline path with no matching accept path would leave the invitee
+        able to say no and unable to say yes. On a realm using the default
+        `auto` mode this endpoint still works — it simply settles a row that
+        the invitee's next sign-in would have settled anyway.
+
+        The lifecycle row is written BEFORE the membership is activated. That
+        is the concurrency control: `Respond` is the only operation that can
+        lose a race against a simultaneous reject or an inviter's revoke, so
+        activating the membership first would let a rejected invitation still
+        grant access.
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Invitation accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string, format: uuid }
+                  status: { type: string, enum: [accepted] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            No such membership for this caller. Deliberately does not
+            distinguish "no such tenant" from "not your tenant" — the
+            difference would make this an existence oracle for tenant ids.
+        '409':
+          description: |
+            `not_invited` — the membership is not a pending invitation (an
+            already-active member has nothing to accept), or `not_pending` —
+            the invitation was already answered, revoked or expired.
+        '501':
+          description: '`invitations_unavailable` — invitation lifecycle store not configured.'
+      security:
+        - BearerAccess: []
   /me/invitations/{tenantId}/reject:
     post:
       tags: [Auth]
@@ -8024,6 +8226,43 @@ paths:
               schema:
                 $ref: '#/components/schemas/AdminSearchResponse'
         '403': { description: not base-realm staff }
+
+  /admin/platforms/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Internal ops]
+      summary: Read one platform's fleet row (ADR-048 §1)
+      description: |
+        The singular counterpart to `GET /admin/platforms`, returning the
+        identical `AdminPlatformSummary` row for one platform. It resolves
+        through the same store query and the same serializer as the list, so
+        the detail screen and the fleet table cannot disagree about a platform.
+
+        The base realm is omitted, exactly as it is from the list.
+      security:
+        - BearerAccess: []
+        - BearerService: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminPlatformSummary' }
+        '401':
+          description: unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { description: not base-realm staff }
+        '404':
+          description: platform_not_found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /admin/platforms/{id}/notes:
     get:

@@ -46,6 +46,23 @@ warning against concurrent `auth login`); these are the code fixes.
 
 ## Broken today
 
+> **FIXED 2026-08-06 — `platforms set-config` bound to GET or PATCH at random.**
+> `actionVerb` keyed on the trailing path segment alone, so the GET and the
+> PATCH on `/platforms/{id}/config` derived the same `(group, verb)`. Their path
+> params are equal in number, so `buildCommands`' "fewest params wins" tie-break
+> could not separate them either and kept whichever came first out of a
+> RANDOMIZED Go map iteration. Same binary, same spec, different answer per run;
+> a run that bound GET would accept the operator's values and issue a read.
+> Now method-aware (`get-config` / `set-config`), which renames nothing else —
+> `config` is the only action segment in the spec with more than one non-DELETE
+> method. Guarded by `TestBuildCommandsIsDeterministic`, which rebuilds the tree
+> 51× and derives its subject list from the SPEC rather than from a hand-written
+> list of known collisions. RCA in `DECISIONS.md` 2026-08-06.
+>
+> **The near-miss worth keeping:** this was found while diffing the command tree
+> before re-vendoring the spec — not by a test, and not by anyone using the
+> command. A 50/50 binding presents to a user as "it worked yesterday".
+
 > **FIXED 2026-08-05 — "Service mode does not work against the issuer."**
 > `resolveCredential` now performs the ADR-051 exchange
 > (`POST /auth/login {grant_type: platform_api_key}`) and bears the returned
