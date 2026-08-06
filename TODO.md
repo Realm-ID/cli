@@ -23,14 +23,17 @@ warning against concurrent `auth login`); these are the code fixes.
   config) hits a `401` mid-run with no obvious cause. Decode the stored bearer's
   `exp` and print remaining lifetime / "expires at". CLI-only
   (`cmd/realm-id`), small.
-- [ ] **Surface the approve-side error to the CLI poll** (cross-repo: `api/` +
-  `cli/`). Today the CLI only ever sees `authorization_pending` until
-  `expired_token`, so a failed approval (409 `approval_needs_app`,
-  `login_failed`) is indistinguishable from a timeout. Needs the BFF to record a
-  terminal failure reason on the device record and return it from
-  `/auth/device/token`; then the CLI prints "approval failed: `<reason>`" instead
-  of "expired before approval". **Contract change — the BFF half is owned in
-  `api/TODO.md`; do that first.**
+- [x] ~~**Surface the approve-side error to the CLI poll**~~ — **DONE, and it
+  had been for five weeks.** The BFF records the terminal reason
+  (`normalizeApprovalErr` → `DeviceCodes.Fail`, shipped `v0.16.0` 2026-07-01)
+  and returns it from `/auth/device/token`; `main.go:428-437` prints
+  `approval failed: <reason>` instead of polling to expiry. Both TODOs said
+  otherwise because **nothing tested the seam** — `TestAuthLogin_ApprovalFailed`
+  hand-writes the BFF's JSON envelope in the test itself, so it passes whether
+  or not the real BFF emits that shape. Closed 2026-08-06 by pinning the wire
+  contract end-to-end in `tests/ui-e2e/specs/device-approval.spec.ts` (which
+  polls `/auth/device/token` against the real BFF, playing this CLI's role) plus
+  `api/internal/handlers/device_token_test.go`. No CLI change was needed.
 - [ ] **Bind the `/device` approval page to a specific `device_code`**
   (cross-repo: issuer + `ui/web`, not CLI-only). The approval page doesn't show
   *which* run/code it's authorizing, so running `auth login` in two terminals and
