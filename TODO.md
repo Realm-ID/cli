@@ -47,22 +47,6 @@ warning against concurrent `auth login`); these are the code fixes.
   `auth login`, so the CLI itself can no longer produce two live codes on one
   machine. The multi-machine / stale-tab case remains.)*
 
-- [ ] `.github/workflows/provision-api.yml` + `api/README.md` — both still
-      document `REALM_API_KEY` as a required value in the `api-env` blob. It was
-      removed deliberately on 2026-07-28 (`api` commit `2833f5d`, ADR-057
-      workload-identity bootstrap) and `api-env` v7 holds only `REDIS_URL`. The
-      workflow comment at line 44 says "Secrets (REALM_API_KEY, REDIS_URL) stay
-      in the single GSM secret"; `README.md:64` lists it as required. The static
-      branch in `cmd/bff/main.go:86,134` is a deliberate rollback path and stays
-      — only the docs are wrong. Found 2026-08-09 auditing both env blobs.
-
-- [ ] `api` Cloud Run service carries an **orphan secret volume** —
-      `api-env-jic-mam` is declared in `spec.template.spec.volumes` (same
-      `api-env` secret) but bound to no `volumeMount`; only `api-env-wix-gom` is
-      mounted. Harmless leftover from a re-provision, but it makes
-      `services describe` misleading. Clears itself on the next
-      `provision-api.yml` run with `--set-secrets`; verify rather than assume.
-
 ## Broken today
 
 > **FIXED 2026-08-06 — `platforms set-config` bound to GET or PATCH at random.**
