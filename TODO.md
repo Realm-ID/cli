@@ -20,9 +20,29 @@ warning against concurrent `auth login`); these are the code fixes.
 - [ ] **Surface token expiry in `realm-id auth whoami`** — the device-login
   session bearer is short-lived (Traide saw ~38 min) and nothing shows when it
   expires, so a long provisioning sequence (claim → verify → roles → bindings →
-  config) hits a `401` mid-run with no obvious cause. Decode the stored bearer's
-  `exp` and print remaining lifetime / "expires at". CLI-only
-  (`cmd/realm-id`), small.
+  config) hits a `401` mid-run with no obvious cause.
+  ⚠️ **RE-VERIFIED 2026-08-21 — the stated fix is IMPOSSIBLE and the sizing is
+  wrong. Do not build it as written.** It says "decode the stored bearer's `exp`
+  … CLI-only, small". Both halves fail:
+  - **There is nothing to decode.** `cfg.SessionToken` is the BFF session
+    bearer, and ADR-060 makes it an OPAQUE lookup id plus a per-session AEAD key
+    (`api/internal/session/store.go:10`) — not a JWT. It carries no claims.
+  - **Nothing hands the CLI an expiry.** `POST /auth/device/token` returns
+    exactly `{session_token, realm_id, tenant_id, tenants}`
+    (`api/internal/handlers/device.go:315-321`), and `/me` is a passthrough of
+    the ISSUER's `/me`, so it carries no BFF session state either. The BFF's
+    `loginResp` does have `ExpiresAt` — but that is the SPA login path, not this
+    one, and the CLI's `deviceTokenResp` does not declare it.
+  So this is **cross-repo (api/ + cli/), not CLI-only**, and it carries a design
+  question the entry never posed: BFF sessions expire two ways — `RefreshExp`
+  (absolute) and `IdleTTLSeconds` (ADR-070 sliding window, reset on every
+  authenticated request) — so "expires at" has no single truthful answer. A
+  session with 6 days absolute left dies in 30 minutes if the operator stops
+  typing, which is precisely the Traide scenario.
+  **Options** (needs a decision before code): (a) BFF returns both windows on
+  the device-token response, CLI stores and displays them; (b) CLI-only
+  mitigation — name expiry as a likely cause in the `401` message, no proactive
+  display; (c) BFF exposes a session-introspection endpoint the CLI can poll.
 > **Carried lesson from the approve-side-error item** (record purged 2026-08-09
 > per this file's "open work only" rule; full account in `Realm-ID/project`'s
 > `DECISIONS.md` 2026-08-06). It had been DONE for five weeks and three TODO
