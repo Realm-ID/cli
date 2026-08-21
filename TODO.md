@@ -49,6 +49,12 @@ warning against concurrent `auth login`); these are the code fixes.
 
 ## Broken today
 
+> ⚠️ **THIS SECTION IS EMPTY — everything below is a FIXED-note kept for its
+> findings.** Recorded 2026-08-21 because the heading alone reads as a live
+> pool of bugs, and it was mistaken for one during that day's cross-file sweep,
+> before the sweep actually reached the file. The open CLI work is the two
+> Device-flow DX items above.
+
 > **FIXED 2026-08-06 — `platforms set-config` bound to GET or PATCH at random.**
 > `actionVerb` keyed on the trailing path segment alone, so the GET and the
 > PATCH on `/platforms/{id}/config` derived the same `(group, verb)`. Their path
