@@ -4,6 +4,78 @@ Rationale log for the `realm-id` CLI. WHAT-shipped lives in git/CHANGELOG; this
 file records WHY. See the root `Realm-ID/project` DECISIONS.md for cross-cutting
 context.
 
+
+## 2026-08-21 — `whoami` names the remedy; the countdown it asked for was both impossible and aimed at a fixed bug
+
+`sessionHint` writes one line to STDERR when a BFF call fails with
+`session_expired` / `session_missing` / `session_revoked`, naming the cause and
+`realm-id auth login`. Stdout is untouched — ADR-062 makes it the
+machine-readable channel.
+
+### What the item asked for, and why none of it was built
+
+`TODO.md` asked to *"decode the stored bearer's `exp` and print remaining
+lifetime — CLI-only, small"*, after Traide hit a `401` ~38 minutes into
+provisioning their prod realm (2026-06-29). Three separate things were wrong
+with that.
+
+**There is nothing to decode.** `cfg.SessionToken` is ADR-060's OPAQUE session
+id plus a per-session AEAD key, not a JWT. It carries no claims.
+
+**Nothing hands the CLI an expiry.** `POST /auth/device/token` returns exactly
+`{session_token, realm_id, tenant_id, tenants}`. So the item was cross-repo, not
+CLI-only.
+
+**And the symptom no longer reproduces** — measured, not argued. Against a live
+stack with `access_ttl_seconds` compressed to 1s, a BFF passthrough call made 5
+seconds after login returned `200`: the passthrough self-heals an expired access
+JWT and retries (`api/internal/middleware/passthrough.go:210`). A CLI session now
+survives until its refresh (30d) or idle window ends, not until the access token
+lapses.
+
+**The measurement carried a positive control, and it was load-bearing**: a
+silently-ignored config knob would have made the whole test vacuous — a 15-minute
+token cannot expire during a 5-second sleep, so the `200` would have proved
+nothing. Reading the config back was not enough either (the `v0.74.0`
+`single_tenant_membership` defect stored a value that was never applied), so the
+control asked the BFF's own `/token` for the resulting `expires_at`: **1 second**.
+
+The most likely explanation for Traide's 38 minutes is that the self-heal was
+**dead on arrival** — it matched an error code the issuer never sends on that
+path — and was fixed on **2026-07-01**, two days after their report
+(`api/DECISIONS.md:857`). Stated as the likely explanation, not a finding: the
+numbers do not line up exactly (15m ≠ 38m) and nobody re-tested at the time.
+
+### What was actually built, and why it is smaller than the ask
+
+The BFF already emits a coded `session_expired`, and the CLI already prints the
+body — so the CAUSE was on screen all along and the item's "no obvious cause" was
+overstated. What was missing is the REMEDY. One stderr line, using the
+`errorCode` helper that already existed.
+
+Only the three session-lifecycle codes qualify. Hinting "log in again" after a
+PERMISSION failure would send the operator round a loop that cannot help,
+relabelling an authorization problem as an authentication one.
+
+### Mutation testing found a gap in the tests, not in the code
+
+Four mutations. Moving the hint to stdout failed immediately. **Dropping the
+status guard and dropping the code switch both left the suite GREEN.**
+
+The cause is worth keeping: every case varied status and code *together*
+(401+session code, 403+permission code), so the suite pinned the CONJUNCTION by
+accident and neither half on its own. **A test set that only ever moves two
+variables in lockstep cannot tell which one the code reads.**
+
+Two cases close it — a `401` with a non-session code, and a session envelope
+under a non-401 status. The second needed a realistic fixture, and this codebase
+supplies one: the documented **GoFr typed-nil→206 trap**, where a handler
+returning a helper's `(typedNilData, err)` pair collapses a 4xx into a `206`
+carrying a real error envelope. So a genuine `session_expired` body really can
+arrive under a success-class status — and hinting there would tell the operator
+their session is dead at the moment it demonstrably is not. All four mutations
+now fail.
+
 ## 2026-08-06 — re-vendor the spec to 0.24.0; `platforms describe` costs a `cp`
 
 The vendored `openapi.yaml` was pinned at spec `0.20.0` while the issuer had

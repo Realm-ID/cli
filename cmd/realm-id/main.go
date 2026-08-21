@@ -498,6 +498,39 @@ func pinTenant(cfg *Config, tenantID string) error {
 	return saveConfig(cfg)
 }
 
+// sessionHint writes a remedy line to STDERR when a BFF call failed because the
+// CLI's session is gone. It never touches stdout: ADR-062 makes stdout the
+// machine-readable channel, so a human sentence there would corrupt the JSON an
+// agent is parsing.
+//
+// Why this and not a countdown. The original ask (cli/TODO.md) was to print the
+// session's remaining lifetime, after Traide hit a 401 partway through a long
+// provisioning run and read it as "the CLI broke". That is not buildable —
+// cfg.SessionToken is ADR-060's OPAQUE session id plus an AEAD key, not a JWT,
+// so there is no `exp`, and POST /auth/device/token hands the CLI no expiry
+// either. It also aims at the wrong thing: verified 2026-08-21 against a live
+// stack (access_ttl_seconds compressed to 1s, positive control confirming the
+// knob applied), the BFF passthrough SELF-HEALS an expired access JWT and
+// retries, so a session now survives until its refresh or idle window ends. The
+// symptom Traide reported was most likely the self-heal being dead on arrival,
+// fixed 2026-07-01 (api/DECISIONS.md).
+//
+// What remains true is the part this fixes: when a session really has ended,
+// the body already names the CAUSE (`session_expired`) and nothing names the
+// REMEDY. Only the three session-lifecycle codes qualify — telling someone to
+// log in again after a permission failure sends them round a loop that cannot
+// help, relabelling an authorization problem as an authentication one.
+func sessionHint(status int, raw []byte) {
+	if status != http.StatusUnauthorized {
+		return
+	}
+	code := errorCode(raw)
+	switch code {
+	case "session_expired", "session_missing", "session_revoked":
+		fmt.Fprintf(os.Stderr, "\n%s: this CLI session is no longer valid.\nRun: realm-id auth login\n", code)
+	}
+}
+
 func authWhoami(cfg *Config) int {
 	if cfg.SessionToken == "" {
 		return failCode(errors.New("not logged in (run: realm-id auth login)"), exitForbidden)
@@ -508,6 +541,7 @@ func authWhoami(cfg *Config) int {
 	}
 	_, _ = os.Stdout.Write(raw)
 	fmt.Fprintln(os.Stdout)
+	sessionHint(status, raw)
 	return exitForStatus(status)
 }
 
@@ -637,6 +671,7 @@ func cmdAPI(args []string) int {
 	}
 	_, _ = os.Stdout.Write(raw)
 	fmt.Fprintln(os.Stdout)
+	sessionHint(status, raw)
 	return exitForStatus(status)
 }
 

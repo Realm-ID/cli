@@ -541,3 +541,195 @@ func TestAuthLogin_Accepts201Created(t *testing.T) {
 		t.Fatalf("session token not captured from 201 response: %q", cfg.SessionToken)
 	}
 }
+
+// captureStd runs fn with os.Stdout and os.Stderr redirected to temp files and
+// returns what each received. The CLI writes to the package-level os.Stdout /
+// os.Stderr directly, so swapping them is the only way to observe the split —
+// and the split IS the contract here (ADR-062: stdout is machine-readable, so a
+// human hint must never land there).
+func captureStd(t *testing.T, fn func() int) (string, string, int) {
+	t.Helper()
+	dir := t.TempDir()
+	outF, err := os.Create(filepath.Join(dir, "out"))
+	if err != nil {
+		t.Fatalf("create out: %v", err)
+	}
+	errF, err := os.Create(filepath.Join(dir, "err"))
+	if err != nil {
+		t.Fatalf("create err: %v", err)
+	}
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = outF, errF
+	code := fn()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	outF.Close()
+	errF.Close()
+	ob, _ := os.ReadFile(filepath.Join(dir, "out"))
+	eb, _ := os.ReadFile(filepath.Join(dir, "err"))
+	return string(ob), string(eb), code
+}
+
+// TestWhoami_DeadSessionNamesTheRemedy — a CLI whose session has gone must say
+// what to DO about it.
+//
+// Traide hit this provisioning their prod realm (2026-06-29): a long sequence
+// 401'd partway through and read as "the CLI broke". The body already carries
+// `session_expired`, so the CAUSE was on screen; the remedy was not, and a
+// human reading a JSON error envelope mid-script does not infer `auth login`.
+//
+// Deliberately narrow. The original TODO asked to print a session's remaining
+// LIFETIME, which is not buildable (the bearer is ADR-060's opaque id, not a
+// JWT, and nothing hands the CLI an expiry) and — verified 2026-08-21 against a
+// live stack — would answer a question that no longer bites: the BFF's
+// passthrough self-heals an expired access JWT, so a session survives until the
+// refresh or idle window ends. This handles the case that DOES end a session.
+func TestWhoami_DeadSessionNamesTheRemedy(t *testing.T) {
+	for _, code := range []string{"session_expired", "session_missing", "session_revoked"} {
+		t.Run(code, func(t *testing.T) {
+			body := `{"error":{"code":"` + code + `","message":"session not found or expired"}}`
+			mux := http.NewServeMux()
+			mux.HandleFunc("/me", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, body)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+			t.Setenv("REALM_ID_BFF", srv.URL)
+
+			stdout, stderr, exit := captureStd(t, func() int {
+				return authWhoami(&Config{SessionToken: "sess_dead"})
+			})
+
+			if !strings.Contains(stderr, "realm-id auth login") {
+				t.Errorf("stderr does not name the remedy.\ngot: %q", stderr)
+			}
+			if !strings.Contains(stderr, code) {
+				t.Errorf("stderr does not name the cause %q.\ngot: %q", code, stderr)
+			}
+			// ADR-062: stdout is the machine-readable channel. An agent parses
+			// it, so the hint must not contaminate it — and the server's body
+			// must still arrive intact.
+			if !strings.Contains(stdout, body) {
+				t.Errorf("stdout lost the server body.\ngot: %q", stdout)
+			}
+			if strings.Contains(stdout, "auth login") {
+				t.Errorf("the human hint leaked into stdout, breaking the JSON contract.\ngot: %q", stdout)
+			}
+			if exit != exitForbidden {
+				t.Errorf("exit = %d, want exitForbidden (%d)", exit, exitForbidden)
+			}
+		})
+	}
+}
+
+// TestWhoami_HealthySessionSaysNothing is the POSITIVE CONTROL for the test
+// above: an unconditionally-printed hint would satisfy every assertion there.
+// A working session must leave stderr untouched, or the CLI cries wolf on every
+// call and the hint stops meaning anything.
+func TestWhoami_HealthySessionSaysNothing(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/me", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"user_id":"u-1"}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	stdout, stderr, exit := captureStd(t, func() int {
+		return authWhoami(&Config{SessionToken: "sess_live"})
+	})
+	if stderr != "" {
+		t.Errorf("a healthy session wrote to stderr: %q", stderr)
+	}
+	if !strings.Contains(stdout, "u-1") {
+		t.Errorf("stdout = %q, want the profile body", stdout)
+	}
+	if exit != exitOK {
+		t.Errorf("exit = %d, want exitOK", exit)
+	}
+}
+
+// TestWhoami_OtherFailuresAreNotSessionHints — a 403 on a permission problem
+// must NOT tell the operator to log in again. That advice would send them round
+// a loop that cannot fix anything, which is worse than silence: it relabels an
+// authorization failure as an authentication one.
+func TestWhoami_OtherFailuresAreNotSessionHints(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/me", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":"insufficient_permission","message":"nope"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("REALM_ID_BFF", srv.URL)
+
+	_, stderr, _ := captureStd(t, func() int {
+		return authWhoami(&Config{SessionToken: "sess_live"})
+	})
+	if strings.Contains(stderr, "auth login") {
+		t.Errorf("a permission failure was mislabelled as a dead session: %q", stderr)
+	}
+}
+
+// TestSessionHint_KeysOnBothStatusAndCode closes a gap this test file HAD.
+//
+// Found by mutation, not by review: dropping the `status != 401` guard and
+// dropping the code switch BOTH left the suite green, because every existing
+// case varied status and code together. A test set that only ever moves two
+// variables in lockstep cannot tell which one the code is reading — so it was
+// pinning the conjunction by accident and neither half individually.
+//
+// The 200 case is not hypothetical for the passthrough: `/api/*` forwards the
+// ISSUER's body verbatim, so a successful response can carry nested text that
+// looks like an error envelope. Hinting "log in again" on a 200 would be the
+// worst outcome of the three — it tells the operator their session is dead at
+// the exact moment it demonstrably is not.
+func TestSessionHint_KeysOnBothStatusAndCode(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			// Catches "hint on ANY 401".
+			name:   "401 with a non-session code",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"code":"insufficient_permission","message":"nope"}}`,
+		},
+		{
+			// Catches "hint on ANY status". 206 is not a hypothetical: it is
+			// this codebase's documented GoFr trap — a handler returning a
+			// helper's (typedNilData, err) pair collapses the 4xx into a
+			// 206 carrying a real error envelope (issuer/TODO.md, "GoFr
+			// typed-nil→206"). So a genuine session_expired body CAN arrive
+			// under a success-class status, and hinting there would tell the
+			// operator their session is dead at the moment it is not.
+			name:   "206 carrying a real session_expired envelope (the GoFr typed-nil trap)",
+			status: http.StatusPartialContent,
+			body:   `{"error":{"code":"session_expired","message":"session not found or expired"}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/me", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			t.Setenv("REALM_ID_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+			t.Setenv("REALM_ID_BFF", srv.URL)
+
+			_, stderr, _ := captureStd(t, func() int {
+				return authWhoami(&Config{SessionToken: "sess"})
+			})
+			if strings.Contains(stderr, "auth login") {
+				t.Errorf("hinted a dead session on %s.\nstderr: %q", tc.name, stderr)
+			}
+		})
+	}
+}
