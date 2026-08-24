@@ -59,10 +59,15 @@ realm-id api-keys revoke --platform plt_abc --keyId ak_123                # rota
 # ttl_seconds=…` to choose, `--field non_expiring=true` for the one permanent
 # slot).
 
-# ADR-084 end-user API keys. Self-service, no override: {uid} must be you.
-# (ADR-091 removed the user_api_keys.admin_mint_allowed escape hatch.)
-realm-id user-api-keys create --tenant ten_123 --uid usr_9 \
-  --field label=reports-bot --field permissions_cap:='["audit:read"]'
+# ADR-084 end-user API keys — LIST and REVOKE only.
+#
+# `user-api-keys create` is NOT a CLI command. ADR-097 §E made minting BFF-only:
+# it needs a PLATFORM bearer escorting a user token (Authorization: platform +
+# X-User-Token), and this binary holds a user token from the ADR-062 device
+# flow. The verb is filtered out of the generated tree rather than left to 401
+# at runtime — a broken command is worse than an absent one, because you cannot
+# tell it from a missing capability. Mint through your own backend, or the
+# console. (The endpoint still exists; it is BFFs that may call it.)
 realm-id user-api-keys list --tenant ten_123 --uid usr_9
 realm-id user-api-keys revoke --tenant ten_123 --uid usr_9 --id uak_456
 # Revocation is the primary control for an end-user key (ADR-084 §9), so it is

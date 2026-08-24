@@ -204,3 +204,65 @@ func TestBuildCommandsIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// TestUserAPIKeyCreateIsFilteredButListAndRevokeSurvive pins ADR-097 §E's
+// consequence for this binary.
+//
+// Minting a user API key requires a PLATFORM bearer escorting a user token
+// (ADR-050's Authorization + X-User-Token shape). This CLI holds a USER token
+// from the ADR-062 device flow and cannot produce one, so the verb would
+// generate cleanly, appear in `--help`, and 401 at runtime — worse than absent,
+// because the operator cannot tell a missing capability from a broken one.
+//
+// The subjects are DERIVED from the built tree, not listed: this asks the same
+// buildCommands the binary runs. Every earlier test in this file that called
+// deriveCommand in isolation could not have seen a filter at all — the same gap
+// that hid the v0.2.11 random-verb-binding defect, where the collision was only
+// visible to buildCommands.
+//
+// Both halves are asserted. "create is absent" alone is satisfied by a tree with
+// no user-api-keys commands whatsoever — including one produced by a spec that
+// failed to load — so list and revoke must be present for the absence to mean
+// anything.
+func TestUserAPIKeyCreateIsFilteredButListAndRevokeSurvive(t *testing.T) {
+	cmds, _, err := buildCommands()
+	if err != nil {
+		t.Fatalf("buildCommands: %v", err)
+	}
+	if len(cmds) == 0 {
+		t.Fatal("buildCommands produced NO commands; this test would have inspected nothing")
+	}
+
+	verbs := map[string]string{} // verb -> method, for the user-api-keys group
+	for _, c := range cmds {
+		if len(c.Group) == 1 && c.Group[0] == "user-api-keys" {
+			verbs[c.Verb] = c.Method
+		}
+	}
+	if _, present := verbs["create"]; present {
+		t.Errorf("ADR-097 §E: `user-api-keys create` must be filtered — this binary cannot "+
+			"satisfy the platform escort, so the verb would 401 at runtime. Got %v", verbs)
+	}
+	for _, want := range []string{"list", "revoke"} {
+		if _, present := verbs[want]; !present {
+			t.Errorf("`user-api-keys %s` must SURVIVE the filter (§E gates creation only, and "+
+				"ADR-084 §9 names revocation as the primary control for an end-user key). Got %v",
+				want, verbs)
+		}
+	}
+
+	// The rule is method-and-path shaped, not name shaped: the platform-key
+	// collection is a different resource and must be untouched.
+	if !skipBFFOnly("POST", "/tenants/{tid}/users/{uid}/user-api-keys") {
+		t.Error("skipBFFOnly must filter the user-api-keys mint")
+	}
+	for _, tc := range []struct{ method, path string }{
+		{"GET", "/tenants/{tid}/users/{uid}/user-api-keys"},
+		{"DELETE", "/tenants/{tid}/users/{uid}/user-api-keys/{id}"},
+		{"POST", "/platforms/{id}/api-keys"},
+	} {
+		if skipBFFOnly(tc.method, tc.path) {
+			t.Errorf("skipBFFOnly must NOT filter %s %s", tc.method, tc.path)
+		}
+	}
+}

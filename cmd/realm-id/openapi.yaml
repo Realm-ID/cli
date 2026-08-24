@@ -48,7 +48,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.24.0
+  version: 0.29.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -120,7 +120,17 @@ components:
       description: |
         Short-lived platform JWT minted by POST /auth/login with
         `grant_type=platform_api_key` (ADR-051; v0.7.0). Carries
-        `subject_type=platform` and claim `scope=platform`. Used by
+        `subject_type=platform` and claim `token_class=platform`.
+
+        **ADR-097 #8 — claim rename, COMPLETE.** The class marker used to be
+        the `scope` claim. RFC 9068 §2.2.3 gives that name to GRANTED
+        AUTHORITY, which ADR-097 hands to partner-supplied strings, so the
+        class moved to its own `token_class` claim. Spec `0.27.0` emitted
+        **both**; from `0.28.0` a platform token carries `token_class` only.
+        **BREAKING for anything still reading `scope` to decide "is this a
+        platform token"** — a `scope` on a token is now the partner's own
+        granted-authority vocabulary and says nothing about class. A partner
+        may legitimately name a scope `platform`. Used by
         partner backends per ADR-047 to mediate every scoped
         read/write against RealmID — including identity-provider
         discovery, /auth/login user grants, /me forwards, and the
@@ -834,6 +844,54 @@ components:
             Optional partner-supplied claims, gated by
             `realms.config.access_token_custom_claim_keys`
             (SDK SPEC §4.2).
+
+            A key that collides with a reserved JWT claim name is now
+            **refused** with 400 `reserved_claim_key`, not dropped
+            (ADR-097 D3). A dropped claim is indistinguishable, from your
+            side, from an honoured one — and once `scope` carries granted
+            authority, that difference is a gate that never fires.
+        scope:
+          type: string
+          description: |
+            **ADR-097 §A — granted authority, space-delimited.**
+
+            RFC 9068 §2.2.3, which defines the claim by reference to RFC
+            8693 §4.2 ("a JSON string containing a space-separated list of
+            scopes") in RFC 6749 §3.3 format. A STRING, not an array.
+
+            These are **your** scope strings. RealmID stores no partner
+            catalog: the values are never parsed, validated against a
+            vocabulary, persisted, or interpreted. Your repo owns the
+            route -> scope and role -> scope maps; the RealmID SDK is the
+            gate that evaluates them.
+
+            **Charset (RFC 6749 §3.3):** `%x21 / %x23-5B / %x5D-7E` —
+            printable ASCII minus SPACE, `"` and `\`. Case-SENSITIVE, no
+            normalization. A space inside a value would split one scope into
+            two, so a malformed entry is refused at mint (`invalid_scope`)
+            rather than silently reshaped.
+
+            **Bounded** by the realm's `user_api_keys.max_permission_strings`
+            and `max_permission_string_len` (defaults 32 / 128) —
+            `too_many_scopes` / `scope_too_long`. The same knobs, not a
+            second vocabulary for the same kind of string.
+
+            **Intersected server-side.** When the session came from a user
+            API key, the minted claim is `scope` INTERSECTED with the key's
+            live `permissions_cap` — exact string match, no wildcards, no
+            hierarchy. RealmID does this so that a caller who bypasses the
+            SDK still receives a narrowed token.
+
+            **Re-resolved on every call.** The claim is never stored on the
+            session: send it each time. Omitting it mints no `scope` at all.
+
+            **Revocation lag.** A token-carried scope is only as fresh as
+            the token: revoking a grant takes effect within
+            `access_ttl_seconds`. Where a stale grant is unacceptable —
+            money movement, permission administration, data export — use the
+            SDK's `CapAllows`, which reads live and has zero lag.
+
+            Not accepted on a service-class refresh (`scope_not_supported`).
 
     TokenResponse:
       type: object
@@ -1651,7 +1709,29 @@ components:
       type: object
       description: Allowlist — unknown keys return 400 `unknown_config_key`.
       properties:
-        concurrent_session_limit: { type: integer, minimum: 0 }
+        concurrent_session_limit:
+          type: integer
+          minimum: 0
+          description: |
+            ADR-092 D1/D2. Live tenant-scoped sessions allowed per membership;
+            `0` means unlimited. A DEFAULT, not a cap — `realm_roles.
+            concurrent_session_limit` overrides it in BOTH directions.
+
+            **The login mechanism does not decide concurrency.** The gate sits
+            in `mintAccessTokenWithBroker`, the single choke point every
+            tenant-scoped access token passes through, so it applies to
+            `grant_type=otp` and service-account logins exactly as it does to
+            provider-token logins. There is no per-grant exemption.
+
+            Machine principals are handled at CONFIG time, not exempted at mint
+            time: setting a limit on a role whose `assignable_to` includes
+            `service` is refused with `session_limit_not_allowed_for_service_role`,
+            because N pods logging in as one bot are one user row and a limit
+            there turns a rolling deploy into an outage.
+
+            A renewal is never refused — the check asks whether admitting this
+            session would push the membership over, so a refresh of an existing
+            (jti, tenant) mint is always allowed.
         invitation_acceptance:
           type: string
           enum: [auto, explicit]
@@ -1781,9 +1861,13 @@ components:
             Allowlist of partner-supplied claim keys honoured by
             POST /auth/token's `custom_claims` (SDK SPEC §4.2). Reserved
             JWT claim names (iss, sub, aud, iat, nbf, exp, jti, azp,
-            tenant_id, role) always win and are dropped silently. Any
-            request key not in this allowlist returns 400 `bad_request`.
-            Empty / unset = no custom claims accepted.
+            tenant_id, role, mfa_at, amr, scope, token_class) always win,
+            and a request naming one is now REFUSED with 400
+            `reserved_claim_key` rather than dropped (ADR-097 D3 — the list
+            this sentence used to carry was hand-maintained and had already
+            drifted, omitting `mfa_at` and `amr`). Any request key not in
+            this allowlist returns 400 `bad_request`. Empty / unset = no
+            custom claims accepted.
         service_refresh_rotates:
           type: boolean
           description: |
@@ -2178,7 +2262,11 @@ components:
         Every key is always present; RealmConfig fields with no patch
         counterpart (`suspended_at`, `suspend_reason`) are NOT exposed.
       properties:
-        concurrent_session_limit: { type: integer }
+        concurrent_session_limit:
+          type: integer
+          description: |
+            See `RealmConfigPatch.concurrent_session_limit`. Applies to every
+            tenant-scoped mint regardless of grant type; `0` is unlimited.
         single_tenant_membership: { type: boolean }
         invitation_acceptance: { type: string, enum: [auto, explicit] }
         session_eviction_policy: { type: string }
@@ -3421,7 +3509,8 @@ paths:
           description: |
             unauthorized (missing or invalid platform token; user
             grants only)
-            | wrong_scope (bearer is not scope=platform)
+            | wrong_scope (bearer is not `token_class=platform`; the
+            error CODE is unchanged, only the claim it reads)
             | invalid_audience (id-token `aud` not registered;
             `provider_token` / `google`)
             | invalid_credentials (bad password / OTP / api-key)
@@ -3528,7 +3617,16 @@ paths:
             missing_tenant_id (refresh subject is a multi-tenant user and
             the body carries no `tenant_id`) | bad_request (a
             `custom_claims` key is not in the realm's
-            `access_token_custom_claim_keys` allowlist) | bad_json.
+            `access_token_custom_claim_keys` allowlist)
+            | reserved_claim_key (a `custom_claims` key is a reserved JWT
+            claim name — ADR-097 D3; previously dropped silently)
+            | invalid_scope (a `scope` entry is not an RFC 6749 §3.3
+            scope-token)
+            | too_many_scopes / scope_too_long (`scope` exceeds the realm's
+            `user_api_keys.max_permission_strings` /
+            `max_permission_string_len`)
+            | scope_not_supported (this session class mints no `scope`)
+            | bad_json.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -3661,7 +3759,8 @@ paths:
         ADR-061 counterpart to `POST /auth/mfa/enroll` — disables MFA for
         the calling user. Auth (`requireAuthAsUser`): the user's own
         access JWT, **or** a partner **platform bearer**
-        (`scope=platform`) carrying the user's verified access JWT in
+        (`token_class=platform`; was `scope=platform` before ADR-097 #8)
+        carrying the user's verified access JWT in
         `X-User-Token` — the production BFF path (ADR-050). The partner
         cannot impersonate: it must possess the user's access JWT, and the
         operation resolves to and acts as that user. The bare
@@ -4611,7 +4710,28 @@ paths:
 
         Key-derived tokens carry `amr: ["api_key"]` with **no** `mfa` entry, so a
         key can never satisfy a step-up gate downstream.
-      security: [{ BearerAccess: [] }]
+
+        **BREAKING — new in ADR-097 §E: minting is BFF-only.** This route now
+        requires a **platform bearer** in `Authorization`, carrying the acting
+        user's access JWT in `X-User-Token` — the same ADR-050 shape the rest of
+        the partner-mediated surface uses. A bare user access token answers
+        `401 wrong_scope`.
+
+        The escort must belong to the **target user's own realm**: a platform
+        bearer from a different realm answers `403 realm_mismatch`. RealmID's own
+        console satisfies this the same way a partner does — it IS the BFF for
+        RealmID, which is a platform on RealmID — and consequently can no longer
+        mint a key in a partner realm.
+
+        A user API key is a long-lived credential. Creating one is the operation
+        that must be mediated by a confidential backend; **`GET` and `DELETE` on
+        this collection are deliberately unchanged**, because reading and
+        revoking a key you already hold is not credential issuance.
+
+        *Consequence for the `realm-id` CLI:* it holds a user token and cannot
+        satisfy this escort, so `user-api-keys create` is filtered out of its
+        command tree. `list` and `revoke` are unaffected.
+      security: [{ BearerPlatformToken: [] }]
       requestBody:
         required: true
         content:
@@ -4631,8 +4751,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            `wrong_scope` — ADR-097 §E: this route requires a platform bearer
+            (`token_class=platform`). A bare user access token is refused.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: '`forbidden` — minting for a user other than the caller.'
+          description: |
+            `forbidden` — minting for a user other than the caller ·
+            `realm_mismatch` — ADR-097 §E: the platform bearer belongs to a
+            different realm than the target user.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -4800,8 +4930,8 @@ paths:
             Mint with an identity that is **not** a platform api-key: an
             ADR-057 **WIF-bootstrapped** session (the recommended automated
             rotation channel) or a **human owner/admin** login. Note this is
-            keyed on how the token was obtained (`azp`), not on scope — WIF also
-            mints `scope=platform`. `DELETE` and `GET` on this collection are
+            keyed on how the token was obtained (`azp`), not on class — WIF also
+            mints `token_class=platform`. `DELETE` and `GET` on this collection are
             unrestricted.
 
             `platform_api_key_login_disabled` — **new in ADR-091 (D6.4)**: a
@@ -6010,7 +6140,19 @@ paths:
         '200':
           description: OK
         '400':
-          description: recipient_not_member | recipient_not_active | already_owner | conflicting_outgoing_disposition | invalid_identifier
+          description: |
+            recipient_not_member | recipient_not_active | already_owner |
+            conflicting_outgoing_disposition | invalid_identifier |
+            recipient_contact_unproven — `new_owner_email` matched a contact in
+            the tenant that its holder has NOT verified (spec `0.26.0`). An
+            address written by an admin is an assertion, and the ownership
+            pointer is the one write that must not follow one: a member with
+            `users:manage` can write a contact at an unclaimed address and have
+            it resolve to their own row. Name the recipient with `owner_user_id`
+            (which names a row, not an address, and is unaffected), or have the
+            holder verify the address first. Provisioning a NEW row on the
+            parent path is unchanged — at an address nobody holds there is no
+            identity to confuse.
         '403':
           description: caller is neither the tenant's owner nor its G-014 parent
         '404':
@@ -6206,6 +6348,15 @@ paths:
         notification** (email old + new address; a phone change routes the
         alarm to the account email on record). A cross-user collision is
         rejected up front (409) so a failed rebind leaves the binding intact.
+
+        **A PENDING INVITATION'S ADDRESS IS IMMUTABLE** (ADR-095 amendment,
+        spec `0.25.0`). A user whose `status` is `invited` is refused with
+        `400 invitation_address_immutable`. Re-pointing a live invitation at
+        a different inbox changes who may accept it, while the ADR-092 D5
+        lifecycle row keeps its original expiry, the new address is never
+        notified, and the old address is never told the offer moved. To
+        correct a typo'd invite address: `DELETE /tenants/{id}/invitations/{uid}`
+        (which releases every contact) and invite the corrected address.
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -6233,7 +6384,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/User' }
         '400':
-          description: bad_json | missing_fields (neither email nor phone supplied)
+          description: |
+            bad_json | missing_fields (neither email nor phone supplied) |
+            invitation_address_immutable (the user's status is `invited`;
+            revoke the invitation and invite the corrected address)
         '404':
           description: user_not_found
         '409':

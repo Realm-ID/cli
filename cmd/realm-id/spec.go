@@ -170,6 +170,27 @@ func isRevocable(path string) bool {
 		strings.Contains(path, "/user-api-keys/")
 }
 
+// skipBFFOnly drops surfaces that require a PLATFORM bearer escorting a user
+// token (ADR-050's Authorization: platform + X-User-Token shape). This binary
+// holds a USER token from the ADR-062 device flow and cannot produce one, so
+// such a verb would generate cleanly, appear in `--help`, and 401 at runtime —
+// which is worse than not existing, because the operator has no way to tell a
+// missing capability from a broken one.
+//
+// Today that is exactly one operation: minting a user API key, put behind the
+// escort by ADR-097 §E. `GET` and `DELETE` on the same collection are NOT
+// escorted and stay available — ADR-084 §9 and the partner guide both name
+// revocation as the primary control for an end-user key, so a binary that
+// cannot revoke one would contradict the advice shipped with it.
+//
+// The endpoint is filtered here rather than removed from the spec: it still
+// exists, for BFFs. If RealmID staff later want CLI minting, the fix is for the
+// CLI to obtain a base-realm platform token — separate work, not smuggled in
+// through this list.
+func skipBFFOnly(method, path string) bool {
+	return method == "POST" && strings.HasSuffix(path, "/user-api-keys")
+}
+
 // skipDestructive enforces ADR-062 §5: no delete, no signing-key rotate, no
 // suspend/unsuspend, no ownership/domain transfer (PUT …/owner). These are
 // absent from the binary until machine-2FA exists. Key revocation is the one
@@ -317,7 +338,7 @@ func buildCommands() (cmds []command, dropped []command, err error) {
 		pi := doc.Paths[path]
 		segs := splitSegs(path)
 		for method, op := range pi.byMethod() {
-			if skipDestructive(method, path) {
+			if skipDestructive(method, path) || skipBFFOnly(method, path) {
 				continue
 			}
 			group, verb, ok := deriveCommand(method, path)
