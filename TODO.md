@@ -118,3 +118,15 @@ warning against concurrent `auth login`); these are the code fixes.
 
 *(No open chores. The `gofmt -l` violation on `cmd/realm-id/main.go` was verified
 clean 2026-07-28 and the item was removed; this line goes at the next sweep.)*
+
+- [ ] **The vendored `cmd/realm-id/openapi.yaml` is two spec versions stale** —
+      it declares `0.24.0` while `issuer/docs/swagger.yaml` is at `0.26.0`
+      (measured 2026-08-24). The CLI derives its whole command tree from this
+      embedded copy (no SDK dependency), so every operation added in `0.25.0`
+      (`invitation_address_immutable` era) and `0.26.0` is simply absent from
+      the binary. **Nothing detects the drift** — there is no test comparing the
+      vendored `info.version` against the issuer's, which is the same shape as
+      the `platforms describe` gap that sat unnoticed until someone diffed the
+      tree by hand (`DECISIONS.md` 2026-08-06). Re-vendor, and diff the command
+      tree before and after — that diff is what caught the `set-config` binding
+      bug. Worth adding the version-comparison check at the same time.
