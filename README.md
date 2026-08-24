@@ -44,6 +44,14 @@ realm-id config list                 # show the active configuration
 realm-id platforms list-mine
 realm-id roles list --platform plt_abc
 realm-id roles create --platform plt_abc --field name=editor --field description="Can edit"
+
+# ADR-097 scope rename — realm-wide, one transaction, over every user API key
+# cap in the realm. NOT reversible in general: where a key held both strings,
+# the merge destroys what a reversal would need. ALWAYS dry-run first.
+realm-id scopes rename --platform plt_abc --dry_run true \
+  --field from=reports.read --field to=reports:read
+realm-id scopes rename --platform plt_abc \
+  --field from=reports.read --field to=reports:read
 realm-id api-keys create --platform plt_abc --field label=provisioning   # mint
 realm-id api-keys revoke --platform plt_abc --keyId ak_123                # rotate
 # The verb is `revoke`, not `delete`: it sets revoked_at on a row that stays

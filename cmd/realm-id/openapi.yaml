@@ -48,7 +48,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.29.0
+  version: 0.30.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -3157,6 +3157,49 @@ components:
             `migrated_holders` + `migrated_holders_to`, and each migration is
             audited. Existing holders are never stranded without a role.
 
+    RenameScopeRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          description: The scope string to rename. RFC 6749 §3.3 scope-token.
+        to:
+          type: string
+          description: |
+            Its replacement. RFC 6749 §3.3 scope-token, bounded by the realm's
+            `user_api_keys.max_permission_string_len`. A SPACE here would
+            corrupt every token minted afterwards by splitting one scope into
+            two, which is why the charset is enforced rather than assumed.
+      example:
+        from: reports.read
+        to: reports:read
+
+    RenameScopeResponse:
+      type: object
+      required: [from, to, dry_run, keys, roles]
+      properties:
+        from: { type: string }
+        to: { type: string }
+        dry_run:
+          type: boolean
+          description: |
+            Echoed so a response cannot be mistaken for the other kind when read
+            out of a log.
+        keys:
+          type: integer
+          description: |
+            `user_api_keys` ROWS whose `permissions_cap` changed. Rows, not
+            occurrences — a row holding `from` twice counts once, because a row
+            is what you can go and look at.
+        roles:
+          type: integer
+          description: |
+            ALWAYS `0`. `realm_roles.permissions` holds RealmID's own ADR-074
+            catalog, not your vocabulary, and is deliberately not renamed — see
+            the endpoint description. The field is kept so a client written
+            against the originally-documented two-store shape still parses.
+
     RenameRoleRequest:
       type: object
       required: [to]
@@ -5436,10 +5479,17 @@ paths:
       tags: [Platform Admin]
       summary: Atomically rename a custom role (ADR-040)
       description: |
-        Renames the catalog row AND every reference in
-        `users.role` + `invitations.role` inside the platform's realm in one
-        transaction. System roles return 400 `system_role_immutable`.
-        Target name collision returns 409 `target_exists`.
+        Renames the catalog row AND every reference to it inside the platform's
+        realm, in one transaction: `users.role`, `invitations.role` and every
+        other role's `can_invite_roles`.
+
+        `can_invite_roles` and `invitations.role` were **added in ADR-097** (D1
+        and D2). Before that, renaming a role silently stripped "may invite at
+        this tier" from every role that had it — a CLOSED failure, so nothing
+        errored and nothing logged.
+
+        System roles return 400 `system_role_immutable`. Target name collision
+        returns 409 `target_exists`.
       security: [{ BearerAccess: [] }]
       requestBody:
         required: true
@@ -5458,6 +5508,107 @@ paths:
           description: role_not_found
         '409':
           description: target_exists
+
+  /platforms/{id}/scopes/rename:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: query
+        name: dry_run
+        required: false
+        schema: { type: boolean }
+        description: |
+          When `true`, returns the counts a real run would produce and writes
+          NOTHING. The preview is computed by performing the real updates inside
+          a transaction that is then rolled back, so the number you confirm is
+          the number the write produces — a preview counted by a separate query
+          would be a second implementation of the same predicate, and the two
+          would drift.
+    post:
+      tags: [Platform Admin]
+      summary: Rename an ADR-097 scope string across the realm
+      description: |
+        **ADR-097 §F.** Renames one of YOUR scope strings everywhere RealmID
+        stores one, for this realm, in a single transaction. Today that is
+        exactly one place:
+
+        - `user_api_keys.permissions_cap` — the cap a key's minted `scope` is
+          intersected against
+
+        RealmID stores no partner catalog and understands none of these strings
+        (ADR-097 #1/#6). This endpoint exists because a scope is stored **by
+        value** and is not a foreign key, so renaming one is an operation you
+        cannot do safely by hand.
+
+        `realm_roles.permissions` is **deliberately not renamed**: it is
+        validated against RealmID's own ADR-074 catalog on every role write, in
+        every realm, so it cannot hold your vocabulary — and renaming an
+        enforced RealmID permission would fail closed and silently. The `roles`
+        count in the response is therefore always `0`; it is kept so a client
+        written against the originally-documented shape still parses.
+
+        **One transaction.** A partial rename splits the vocabulary, and the
+        forgotten half fails CLOSED and silently — exactly the defect ADR-097 D1
+        found in the role rename. The next column that starts holding a scope
+        string is added inside this transaction.
+
+        **Idempotent.** A second run finds nothing named `from`, reports zeroes,
+        and writes nothing.
+
+        **Deduped on collision.** A row holding BOTH `from` and `to` ends with
+        one `to`. That merge is also why a rename is **not reversible in
+        general** — it destroys the information a reversal would need — and why
+        the dry run and the audit record (`scope.rename`, carrying actor, both
+        strings and both counts) are mandatory rather than convenient.
+
+        **Case-sensitive**, matching the mint. `Read` and `read` are two
+        distinct scopes, so renaming one to the other is a legitimate merge.
+
+        **Owner-gated** (`requireRealmOwner`), the same gate as the role rename:
+        renaming the vocabulary your permission model is expressed in is not a
+        permission you delegate — ADR-091 D3 retired `roles:manage` from the
+        catalog on that argument.
+
+        **Removal is NOT offered** (ADR-097 #5). It is destructive in a way a
+        rename is not and needs its own confirmation design.
+
+        **Refused on a `realmid`-audience realm** (`realmid_audience_immutable`).
+        There, `permissions_cap` entries are validated against RealmID's OWN
+        catalog at mint, so a rename could write a string past that gate and the
+        cap would quietly stop matching anything. This is the one place RealmID
+        knows a vocabulary — its own, as a platform on RealmID.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenameScopeRequest' }
+      responses:
+        '200':
+          description: OK — counts are ROWS changed, not occurrences.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RenameScopeResponse' }
+        '400':
+          description: |
+            `bad_request` (from/to missing) ·
+            `invalid_scope` (not an RFC 6749 §3.3 scope-token — note `from` is
+            validated too: a `from` containing a space could never match a
+            stored scope, so accepting it would guarantee a silent zero-row
+            "success") ·
+            `scope_too_long` · `invalid_rename` (from == to) ·
+            `realmid_audience_immutable`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`forbidden` — realm owner only.'
+        '404':
+          description: realm_not_found
+        '501':
+          description: '`not_implemented` — no scope store wired on this deployment.'
 
   /platforms/{id}/roles/{roleId}/disable:
     parameters:
