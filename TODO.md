@@ -56,18 +56,18 @@ warning against concurrent `auth login`); these are the code fixes.
   terminal." What remains is only the one distinction above — a consumed code
   and an unknown one produce the same sentence, and the two call for different
   operator actions. Original entry, kept for its context:
-- [ ] ~~**Bind the `/device` approval page to a specific `device_code`**~~
-  (cross-repo: issuer + `ui/web`, not CLI-only). The approval page doesn't show
-  *which* run/code it's authorizing, so running `auth login` in two terminals and
-  approving one while watching the other's poller looks like an indefinite hang
-  (`authorization_pending` forever) — Traide filed false "STILL-BROKEN" reports
-  over exactly this self-inflicted race. Fix: have the page display/confirm the
-  `device_code` (or `user_code`) being approved, and/or surface "this code was
-  already consumed by another session" instead of silent pending. Touches the
-  issuer `/auth/device/approve` surface + `ui/web/src/main.tsx` `/device` branch.
-  *(Partially mitigated: `cli/v0.2.7` added a hard OS-lockfile singleton for
-  `auth login`, so the CLI itself can no longer produce two live codes on one
-  machine. The multi-machine / stale-tab case remains.)*
+> ~~**Bind the `/device` approval page to a specific `device_code`**~~
+> (cross-repo: issuer + `ui/web`, not CLI-only). The approval page doesn't show
+> *which* run/code it's authorizing, so running `auth login` in two terminals and
+> approving one while watching the other's poller looks like an indefinite hang
+> (`authorization_pending` forever) — Traide filed false "STILL-BROKEN" reports
+> over exactly this self-inflicted race. Fix: have the page display/confirm the
+> `device_code` (or `user_code`) being approved, and/or surface "this code was
+> already consumed by another session" instead of silent pending. Touches the
+> issuer `/auth/device/approve` surface + `ui/web/src/main.tsx` `/device` branch.
+> *(Partially mitigated: `cli/v0.2.7` added a hard OS-lockfile singleton for
+> `auth login`, so the CLI itself can no longer produce two live codes on one
+> machine. The multi-machine / stale-tab case remains.)*
 
 ## Broken today
 
