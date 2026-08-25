@@ -5,6 +5,35 @@ file records WHY. See the root `Realm-ID/project` DECISIONS.md for cross-cutting
 context.
 
 
+## 2026-08-25 (later+1) — the 9.7 MB binary is untracked, and the ignore pattern the TODO proposed is a trap
+
+**Problem.** `cmd/realm-id/realm-id`, a compiled 9.7 MB binary, has been tracked
+since `4e281ea` (2026-07-24). `.gitignore` covered `/realm-id` — anchored to the
+repo root — so the `cmd/` copy was never ignored, and a `go build` run from that
+directory dirties the tree with a multi-megabyte diff. Untracked with
+`git rm --cached`; it is the only revision of the file, so nothing is rewritten.
+
+**The TODO's proposed fix was wrong and that was MEASURED, not argued.** It said
+to "widen the ignore to `realm-id` (unanchored)". An unanchored pattern matches
+directories too, and `cmd/realm-id/` **is** a directory — so the pattern that
+hides the binary also hides the package that produces it. Probed directly: with
+`realm-id` unanchored, an untracked `cmd/realm-id/probe_new.go` is reported
+ignored, naming that pattern. Already-tracked files keep tracking, which is
+precisely why it would have looked fine on the day and broken on the next file
+someone added — a silent `git add` no-op, the worst available failure for a
+source file.
+
+**Decision: spell both paths out** — `/realm-id` and `/cmd/realm-id/realm-id`.
+Two lines instead of one, and neither can reach the source directory. The
+alternative (`realm-id` plus a `!cmd/realm-id/` negation) re-earns the same
+directory ambiguity for no gain. The reasoning is in the file as a comment,
+because the next person to see two near-identical lines will want to collapse
+them.
+
+**Carry forward:** a `.gitignore` entry for a build artifact whose name matches
+its package directory must be anchored. The build product and the source tree
+share a name by convention in Go, so this is the normal case, not an edge one.
+
 ## 2026-08-25 (later) — the refusal was overturned the same day, and the reasoning against it is kept
 
 **Decision (owner, 2026-08-25).** `POST /platforms/{id}/scopes/remove` ships as

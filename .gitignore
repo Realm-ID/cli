@@ -1,3 +1,9 @@
+# Compiled binaries. Both paths are spelled out DELIBERATELY: an unanchored
+# `realm-id` also matches the DIRECTORY cmd/realm-id/, which silently ignores
+# every NEW file added under it (verified: an untracked cmd/realm-id/x.go is
+# reported ignored by that pattern; already-tracked files are unaffected, so
+# the breakage would show up only on the next file someone adds).
 /realm-id
+/cmd/realm-id/realm-id
 /dist/
 *.out

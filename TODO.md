@@ -204,9 +204,3 @@ clean 2026-07-28 and the item was removed; this line goes at the next sweep.)*
       releases from commit subjects yields a document that looks authoritative
       and is not.
 
-- [ ] **A 9.8 MB compiled binary is tracked in git** at
-      `cmd/realm-id/realm-id`, committed 2026-07-24 by `4e281ea`. `.gitignore`
-      covers `/realm-id` (repo root only), so the `cmd/` copy is not ignored and
-      any `go build ./...` run from that directory dirties the tree with a
-      multi-megabyte diff. Delete it from the index and widen the ignore to
-      `realm-id` (unanchored). Found 2026-08-25.
