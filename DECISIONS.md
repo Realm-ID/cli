@@ -5,6 +5,121 @@ file records WHY. See the root `Realm-ID/project` DECISIONS.md for cross-cutting
 context.
 
 
+## 2026-08-25 — re-vendor the spec to 0.32.0; the one new operation is REFUSED entry, and the command tree does not move
+
+Vendored `cmd/realm-id/openapi.yaml` from `0.30.0` to `issuer/docs/swagger.yaml`
+at `0.32.0` (`go generate ./...`), and filtered the single operation it adds.
+
+**The net effect on the binary is zero commands.** The before/after command-tree
+dump is byte-identical once the filter is in. That is the finding, not a
+disappointment: a `chore(spec)` commit that looks like "new capability" delivered
+none, and the only thing the bump actually required was a policy decision.
+
+### What the diff showed
+
+One path added across the whole bump: `POST /platforms/{id}/scopes/remove`
+(ADR-097 §G). Everything else in the 220-line spec diff is schemas and prose —
+`RemoveScopeRequest` / `RemoveScopeResponse`, and the ADR-084 §7 amendment
+rewriting what an empty `permissions_cap` means. **No existing operation changed
+method, path, params or body**, which is the half of the diff that would have
+been dangerous and is the half nobody thinks to check.
+
+`scopes rename` was ALREADY present — it arrived with `0.30.0` (commit
+`06b5f20`), not with this bump. Worth stating because the task that prompted this
+work recorded both §F and §G as landing together.
+
+### Why the removal is filtered rather than exposed
+
+ADR-062 §5 states its rule as a property, not as its three named examples:
+the verbs are absent so that *"a credential handed to an agent CANNOT perform an
+irreversible action even if the agent tries"*, and it is explicitly *"stronger
+than a `--yes` soft-gate"*.
+
+The endpoint is that rule's subject on every count. Its own description says
+**"Not reversible — neither the removal nor an accompanying revocation can be
+undone"**: it deletes a scope string from every `permissions_cap` in the realm in
+one transaction, and under `on_empty=revoke` it also revokes every key the
+removal would uncap.
+
+Three arguments for exposing it were considered and all fail:
+
+- **"It ships a `?dry_run=true` preview."** The preview is OPT-IN, which is
+  exactly the soft-gate shape §5 says it is stronger than. An agent omits it.
+- **"It defaults to `on_empty=refuse`."** A default guards the *uncapping*
+  hazard, not the irreversibility. `refuse` still permanently deletes the scope
+  from every key that holds more than one.
+- **"ADR-085 §8 already exempts key revocation."** That exemption's own
+  justification is *"a replacement is one `create` away"* — and since ADR-097 §E
+  this binary cannot mint a user API key at all (`skipBFFOnly`). A bulk revoke it
+  cannot undo by re-minting is not the soft, re-mintable act §8 licensed, and it
+  picks its victims by discovery rather than by the operator naming them.
+
+`scopes rename` deliberately stays: a rename is undone by renaming back, so §5
+does not reach it. The removal is not unreachable either — `realm-id api POST
+/platforms/<id>/scopes/remove --json …` still works, the same escape hatch every
+other §5 operation keeps. Revisit when machine-2FA/OTP step-up lands and §5
+unlocks these behind `--otp`.
+
+### The mis-derivation found on the way — reported, NOT fixed
+
+Left unfiltered, the new operation generated as **`realm-id remove create`**: a
+new top-level resource named `remove`, whose verb is `create`.
+
+The first instinct was to add `"remove"` to `actionVerb`, which would have named
+it `scopes remove`. **That was reverted after checking whether the case was
+unique — it is not.** `deriveCommand` treats any trailing static segment as a
+collection noun unless `actionVerb` names it, so every action segment absent from
+that set already becomes a top-level resource with the verb `create`. Thirteen
+commands are in that state today: you revoke a service account by running
+`realm-id revoke create`, and import users with `realm-id import create`. The new
+one would have been the fourteenth.
+
+Fixing one of fourteen would have made the tree *less* consistent while reading
+as a fix. Each needs its own naming decision, and renaming any of them is a
+breaking change to a shipped binary — so the whole class is filed in `TODO.md`
+instead. Recorded here because the correction is the useful part: the defect this
+change first appeared to introduce was pre-existing and much wider.
+
+### The guards
+
+`TestScopeRemoveIsFilteredButRenameSurvives` asserts both halves — "remove is
+absent" alone is satisfied by a tree that failed to load, so the sibling
+`scopes rename` must be PRESENT for the absence to mean anything.
+
+`TestTopLevelResourceGroupsAreReviewed` is the general one, and it is the answer
+to the TODO item's actual complaint (*"nothing detects the drift"*). It pins the
+set of resource groups the binary exposes and fails on any addition OR removal.
+
+It is a **hand-maintained list, deliberately**, against this workspace's standing
+rule that subject lists must be derived. The rule's target is silent decay: a
+derived list answers *"is each thing we thought of still right?"*. This one
+answers the question that actually went unasked — *"did the spec grow a command
+nobody looked at?"* — and its only failure mode is going RED, which forces
+exactly the review it exists to force. It catches removals too, which are worse
+than additions: a partner's script breaks with no signal from a `chore` commit.
+The thirteen mis-derived groups are pinned in it with a comment saying they are
+recorded, not endorsed.
+
+Both mutation-verified in both directions: dropping the `/scopes/remove` filter
+turns both guards red (naming `remove create` in the failure message); also
+filtering `/scopes/rename` turns the survives-half and the DISAPPEARED-half red.
+
+### No version tag, and no CHANGELOG entry
+
+**No tag was cut.** No command enters or leaves the binary, so there is nothing
+for a consumer to consume; and the version is injected from the tag by
+GoReleaser, which cannot run — GitHub Actions has been failing at startup
+org-wide since 2026-08-16 (billing). Two commits already sit untagged past
+`v0.2.11`, one of them breaking (`ea3b58d`, ADR-097 §E filtering
+`user-api-keys create`); that backlog wants **`v0.3.0`** when releases resume,
+and the decision belongs with whoever batches the release, not with this change.
+
+**There is no `cli/CHANGELOG.md`.** This file's own header and `TODO.md` both
+point at one and it has never existed — twelve tags with no release notes. Filed
+in `TODO.md`; not backfilled here, because inventing twelve releases' worth of
+notes from commit subjects would produce a document that looks authoritative and
+is not.
+
 ## 2026-08-21 — `whoami` names the remedy; the countdown it asked for was both impossible and aimed at a fixed bug
 
 `sessionHint` writes one line to STDERR when a BFF call fails with

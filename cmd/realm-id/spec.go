@@ -192,9 +192,34 @@ func skipBFFOnly(method, path string) bool {
 }
 
 // skipDestructive enforces ADR-062 §5: no delete, no signing-key rotate, no
-// suspend/unsuspend, no ownership/domain transfer (PUT …/owner). These are
-// absent from the binary until machine-2FA exists. Key revocation is the one
-// documented exemption — see isRevocable.
+// suspend/unsuspend, no ownership/domain transfer (PUT …/owner), no ADR-097 §G
+// scope removal. These are absent from the binary until machine-2FA exists. Key
+// revocation is the one documented exemption — see isRevocable.
+//
+// §5 states the rule as a property, not as its three examples: "the verbs are
+// absent, so a credential handed to an agent CANNOT perform an irreversible
+// action even if the agent tries", and it is explicitly "stronger than a `--yes`
+// soft-gate".
+//
+// POST /platforms/{id}/scopes/remove (spec 0.32.0) is that rule's subject on
+// every count. Its own description says "Not reversible — neither the removal
+// nor an accompanying revocation can be undone": the scope string is deleted
+// from every `permissions_cap` in the realm in one transaction, and under
+// `on_empty=revoke` it also revokes every key the removal would uncap.
+//
+// The `?dry_run=true` preview does not change the answer — it is opt-in, which
+// is precisely the soft-gate shape §5 rejects. An agent simply omits it.
+//
+// And the ADR-085 §8 revocation exemption does NOT extend here, because its own
+// justification fails: that exemption holds because "a replacement is one
+// `create` away", and since ADR-097 §E this binary cannot mint a user API key at
+// all (see skipBFFOnly). A bulk revoke it cannot undo by re-minting is not the
+// soft, re-mintable act §8 licensed. It also selects its victims by discovery
+// rather than by the operator naming them.
+//
+// Not unreachable, just untyped: `realm-id api POST /platforms/<id>/scopes/remove
+// --json …` still works, the same escape hatch every other §5 operation keeps.
+// Revisit when machine-2FA/OTP step-up lands and §5 unlocks behind `--otp`.
 func skipDestructive(method, path string) bool {
 	if method == "DELETE" {
 		return !isRevocable(path)
@@ -205,7 +230,8 @@ func skipDestructive(method, path string) bool {
 	switch {
 	case strings.HasSuffix(path, "/signing-keys/rotate"),
 		strings.HasSuffix(path, "/suspend"),
-		strings.HasSuffix(path, "/unsuspend"):
+		strings.HasSuffix(path, "/unsuspend"),
+		strings.HasSuffix(path, "/scopes/remove"):
 		return true
 	}
 	return false

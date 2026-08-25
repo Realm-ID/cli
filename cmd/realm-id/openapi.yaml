@@ -48,7 +48,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.30.0
+  version: 0.32.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -3200,6 +3200,88 @@ components:
             the endpoint description. The field is kept so a client written
             against the originally-documented two-store shape still parses.
 
+    RemoveScopeRequest:
+      type: object
+      required: [scope]
+      properties:
+        scope:
+          type: string
+          description: |
+            The scope string to delete from every `permissions_cap` in this
+            realm. RFC 6749 §3.3 scope-token, bounded by the realm's
+            `user_api_keys.max_permission_string_len`. Validated even though it
+            is only a search key: a value containing a space could never match a
+            stored scope, so accepting it would guarantee a silent zero-row
+            "success" reading as "there was nothing to remove".
+        on_empty:
+          type: string
+          enum: [refuse, revoke]
+          default: refuse
+          description: |
+            What to do about keys whose `permissions_cap` this removal would
+            leave EMPTY — which means **NO RESTRICTION**, not "permits nothing".
+
+            - `refuse` (default) — write NOTHING and answer `409
+              scope_removal_would_uncap`. The only mode under which this
+              operation cannot widen authority.
+            - `revoke` — remove the scope AND revoke those keys, in the same
+              transaction. Destructive and irreversible, so it must be named.
+
+            An unrecognised value is REJECTED (`400 invalid_on_empty`) rather
+            than defaulted: a typo silently selecting a behaviour is the shape
+            where you believe you asked for one thing and got the other.
+      example:
+        scope: reports.read
+        on_empty: refuse
+
+    RemoveScopeResponse:
+      type: object
+      required: [scope, dry_run, on_empty, outcome, keys, revoked, emptied]
+      properties:
+        scope: { type: string }
+        dry_run: { type: boolean }
+        on_empty:
+          type: string
+          enum: [refuse, revoke]
+          description: The mode IN FORCE, including when it was defaulted.
+        outcome:
+          type: string
+          enum: [applied, would_apply, refused]
+          description: |
+            Three states rather than a pair of booleans, because
+            `dry_run: true, applied: false` conflates "nothing was written
+            because you asked for a preview" with "nothing was written because
+            it was refused" — the two you most need to tell apart in a log.
+
+            On a dry run this reports what the WRITE would have done. A dry run
+            answering `refused` means the real call would return `409`.
+        keys:
+          type: integer
+          description: |
+            `user_api_keys` ROWS whose `permissions_cap` held the scope. Counts
+            every row rewritten, INCLUDING revoked and expired ones — the realm's
+            vocabulary is made consistent everywhere it is stored.
+        revoked:
+          type: integer
+          description: Keys revoked under `on_empty=revoke`; `0` otherwise.
+        emptied:
+          type: array
+          description: |
+            The LIVE keys this removal would leave uncapped — **rows, not a
+            count**, because this is the outcome you cannot undo afterwards.
+
+            Revoked and expired keys are excluded: they cannot mint, so they
+            cannot be uncapped in any way that matters, and treating one as a
+            blocker would refuse over an already-dead row. Their caps are still
+            rewritten.
+          items:
+            type: object
+            required: [id, user_id, label]
+            properties:
+              id: { type: string, format: uuid }
+              user_id: { type: string, format: uuid }
+              label: { type: string }
+
     RenameRoleRequest:
       type: object
       required: [to]
@@ -3346,9 +3428,15 @@ components:
           type: array
           items: { type: string }
           description: |
-            **A CAP, NEVER A GRANT.** Effective authority is
-            `permissions_cap ∩ the principal's live permissions`, re-resolved
-            per request — so it can only ever UNDER-grant. Demote the holder
+            **OMITTED OR EMPTY MEANS NO RESTRICTION.** A key created without
+            `permissions_cap` is UNCAPPED: the claim is omitted from its tokens
+            entirely, and its authority is the holder's own live permissions.
+            There is no way to express "capped to nothing" — such a key would be
+            inert, which is what omitting the field used to produce.
+
+            **A CAP, NEVER A GRANT.** When present and non-empty, effective
+            authority is `permissions_cap ∩ the principal's live permissions`,
+            re-resolved per request — so it can only ever UNDER-grant. Demote the holder
             and the key shrinks with them; transfer the org (ADR-076) and the
             cap still binds, because the intersection runs *before* owner
             implicit-all.
@@ -5571,8 +5659,11 @@ paths:
         permission you delegate — ADR-091 D3 retired `roles:manage` from the
         catalog on that argument.
 
-        **Removal is NOT offered** (ADR-097 #5). It is destructive in a way a
-        rename is not and needs its own confirmation design.
+        **Removal lives on its own endpoint**, `POST
+        /platforms/{id}/scopes/remove` (ADR-097 §G, added spec `0.32.0`). It is
+        not a flag here, because emptying a cap does not narrow a key to
+        nothing — it UNCAPS it — so removal needs a preview that names rows and
+        a decision about those rows that a rename never needs.
 
         **Refused on a `realmid`-audience realm** (`realmid_audience_immutable`).
         There, `permissions_cap` entries are validated against RealmID's OWN
@@ -5607,6 +5698,113 @@ paths:
           description: '`forbidden` — realm owner only.'
         '404':
           description: realm_not_found
+        '501':
+          description: '`not_implemented` — no scope store wired on this deployment.'
+
+  /platforms/{id}/scopes/remove:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: query
+        name: dry_run
+        required: false
+        schema: { type: boolean }
+        description: |
+          When `true`, returns what a real run WOULD do and writes NOTHING —
+          computed by performing the real statements inside a transaction that
+          is then rolled back, so what you confirm is what the write produces.
+
+          **A dry run always answers `200`, even when the write would answer
+          `409`.** That asymmetry is deliberate: the error envelope carries no
+          structured payload, so a `409` cannot deliver the `emptied` list, and a
+          preview mirroring it would refuse while having nowhere to put the one
+          thing it exists to produce. The preview does not lie — `outcome`
+          reports what the write would have done.
+
+          A refusing dry run still reports the full `keys` count, not zero: you
+          are previewing in order to decide, and the scale of what is being
+          refused is what tells you whether `on_empty=revoke` is proportionate.
+    post:
+      tags: [Platform Admin]
+      summary: Remove an ADR-097 scope string across the realm
+      description: |
+        **ADR-097 §G.** Deletes one of YOUR scope strings from every
+        `user_api_keys.permissions_cap` in this realm, in a single transaction.
+
+        **This is NOT "rename, but destructive" — it is an inversion.** Emptying
+        a cap does not narrow a key to nothing. Since the ADR-084 §7 amendment
+        (2026-08-24) an **empty `permissions_cap` means NO RESTRICTION**,
+        delivered by omitting the claim from the minted token — so a key whose
+        last scope you remove becomes **uncapped**: unrestricted at RealmID's own
+        permission gates, and passing every scope it requests through
+        unfiltered. Removing a scope can therefore WIDEN a key, maximally and
+        silently, inside an operation whose whole purpose is to narrow.
+
+        So a key that would be emptied is treated as a **precondition failure**,
+        not a step to perform. See `on_empty`.
+
+        **Set-containment, not "one entry".** A cap of `["a","a"]` is storable
+        (creation does not deduplicate) and is emptied by removing `a`, so the
+        check is "every entry equals this scope", never a length test.
+
+        **Idempotent.** A second run matches nothing, reports zeroes, writes
+        nothing.
+
+        **Not reversible** — neither the removal nor an accompanying revocation
+        can be undone. That is why the dry run and the audit record
+        (`scope.remove`, carrying actor, scope, `on_empty`, both counts and the
+        emptied key ids) are mandatory rather than convenient.
+
+        **Owner-gated** (`requireRealmOwner`), the same gate as the rename.
+
+        **Refused on a `realmid`-audience realm** (`realmid_audience_immutable`),
+        the same refusal as the rename and for the same reason: there,
+        `permissions_cap` entries are validated against RealmID's OWN ADR-074
+        catalog at mint, so this endpoint would be editing RealmID's permission
+        model rather than your vocabulary.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RemoveScopeRequest' }
+      responses:
+        '200':
+          description: |
+            OK. Either the removal was applied, or this was a dry run reporting
+            what a write would do — read `outcome`, not the status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemoveScopeResponse' }
+        '400':
+          description: |
+            `bad_request` (scope missing) ·
+            `invalid_scope` (not an RFC 6749 §3.3 scope-token) ·
+            `scope_too_long` ·
+            `invalid_on_empty` (not `refuse` or `revoke` — unrecognised values
+            are rejected, never defaulted) ·
+            `realmid_audience_immutable`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`forbidden` — realm owner only.'
+        '404':
+          description: realm_not_found
+        '409':
+          description: |
+            `scope_removal_would_uncap` — at least one LIVE key holds this scope
+            and nothing else, so removing it would leave that key with an empty
+            `permissions_cap`, i.e. NO RESTRICTION. **Nothing was written**,
+            including the keys that were not at risk.
+
+            The envelope carries no list; re-run with `?dry_run=true` to see
+            which keys, then either re-cap them or pass `on_empty="revoke"`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '501':
           description: '`not_implemented` — no scope store wired on this deployment.'
 

@@ -119,14 +119,81 @@ warning against concurrent `auth login`); these are the code fixes.
 *(No open chores. The `gofmt -l` violation on `cmd/realm-id/main.go` was verified
 clean 2026-07-28 and the item was removed; this line goes at the next sweep.)*
 
-- [ ] **The vendored `cmd/realm-id/openapi.yaml` is two spec versions stale** —
-      it declares `0.24.0` while `issuer/docs/swagger.yaml` is at `0.26.0`
-      (measured 2026-08-24). The CLI derives its whole command tree from this
-      embedded copy (no SDK dependency), so every operation added in `0.25.0`
-      (`invitation_address_immutable` era) and `0.26.0` is simply absent from
-      the binary. **Nothing detects the drift** — there is no test comparing the
-      vendored `info.version` against the issuer's, which is the same shape as
-      the `platforms describe` gap that sat unnoticed until someone diffed the
-      tree by hand (`DECISIONS.md` 2026-08-06). Re-vendor, and diff the command
-      tree before and after — that diff is what caught the `set-config` binding
-      bug. Worth adding the version-comparison check at the same time.
+> ~~**The vendored `cmd/realm-id/openapi.yaml` is two spec versions stale**~~ —
+> **CLOSED 2026-08-25.** Re-vendored `0.30.0` → `0.32.0` via `go generate ./...`.
+> **The command tree did not move: the before/after dump is byte-identical.**
+>
+> **Two of the item's own premises were STALE when it was closed.** It says
+> "declares `0.24.0` while the issuer is at `0.26.0`" — measured 2026-08-24, but
+> commits `fc2ce2d`/`ea3b58d`/`06b5f20` had already carried the vendored copy to
+> `0.30.0`. The drift claim survived (two versions), the numbers did not.
+> Second: `scopes rename` was already generating, from `0.30.0` (`06b5f20`) —
+> §F and §G did not land together.
+>
+> **The whole `0.30.0` → `0.32.0` bump adds ONE path**,
+> `POST /platforms/{id}/scopes/remove` (ADR-097 §G). The other ~200 diff lines
+> are schemas and prose (`RemoveScopeRequest`/`Response`, the ADR-084 §7
+> amendment on an empty `permissions_cap`). **No existing operation changed
+> method, path, params or body** — the half of the diff that would have been
+> dangerous, and the half nobody thinks to check.
+>
+> **The new operation is FILTERED, not exposed** (ADR-062 §5): it is
+> irreversible by its own description and under `on_empty=revoke` bulk-revokes
+> keys this binary cannot re-mint, since ADR-097 §E filters the mint. Its
+> `?dry_run=true` preview is opt-in — the soft-gate shape §5 is explicitly
+> "stronger than". `scopes rename` stays (a rename is undone by renaming back),
+> and `realm-id api POST …/scopes/remove` remains as the escape hatch.
+> Full reasoning in `DECISIONS.md` 2026-08-25.
+>
+> **"Nothing detects the drift" is now false.**
+> `TestTopLevelResourceGroupsAreReviewed` pins the set of resource groups the
+> binary exposes and fails on any addition OR removal, so a future re-vendor
+> that grows a command cannot land unreviewed. It is deliberately a
+> hand-maintained list: its only failure mode is going RED, which forces the
+> review. Mutation-verified in both directions, as is
+> `TestScopeRemoveIsFilteredButRenameSurvives`.
+>
+> **The version-comparison check the item asked for was NOT built**, and the
+> reason is worth keeping — see the open item below.
+
+- [ ] **No test compares the vendored `info.version` against the issuer's** —
+      `cmd/realm-id/openapi.yaml` vs `issuer/docs/swagger.yaml`. Asked for by the
+      re-vendor item closed above and deliberately not built there: the check is
+      **cross-repo**, and `Realm-ID/cli`'s CI checks out only this repo, so a test
+      reading `../../../issuer/docs/swagger.yaml` would `t.Skip` in the one place
+      it needs to run — a guard that reports nothing. It belongs in the umbrella
+      repo's cross-repo CI (or needs the ADR-062 §6-era deploy-key setup), not in
+      `cmd/realm-id/spec_test.go`. Until then the drift is caught by a human
+      diffing the tree, plus `TestTopLevelResourceGroupsAreReviewed` catching the
+      subset of drift that changes the command surface.
+
+- [ ] **Fourteen commands are mis-derived as top-level "resources" whose verb is
+      `create`** — `cmd/realm-id/spec.go`, `deriveCommand`. A trailing static
+      segment is treated as a collection noun unless `actionVerb` names it, so
+      every action segment absent from that set becomes its own top-level
+      resource: `realm-id revoke create` revokes a service account,
+      `realm-id import create` imports users, and likewise `deactivate`,
+      `delink`, `disable`, `enable`, `hand-back`, `leave`, `pending`, `request`,
+      `reset-handle`, `revoke-all`, `tenant-choice`. Pre-dates ADR-097; found
+      2026-08-25 while diffing the tree for the `0.32.0` re-vendor, when the new
+      `/scopes/remove` path would have become the fourteenth. **Fixing one of
+      fourteen was tried and reverted** — it makes the tree less consistent while
+      reading as a fix. Each needs its own naming decision, and every rename is
+      breaking for a shipped binary, so this wants one deliberate pass.
+      Currently pinned as-is (and marked "not endorsed") by
+      `TestTopLevelResourceGroupsAreReviewed`.
+
+- [ ] **`cli/CHANGELOG.md` does not exist** — `DECISIONS.md`'s header and this
+      file's own preamble both point at one ("shipped items live in
+      `CHANGELOG.md` / git tags"), and there are twelve tags with no release
+      notes. Either write it going forward or correct both pointers to say git
+      tags are the only record. Not backfilled 2026-08-25: reconstructing twelve
+      releases from commit subjects yields a document that looks authoritative
+      and is not.
+
+- [ ] **A 9.8 MB compiled binary is tracked in git** at
+      `cmd/realm-id/realm-id`, committed 2026-07-24 by `4e281ea`. `.gitignore`
+      covers `/realm-id` (repo root only), so the `cmd/` copy is not ignored and
+      any `go build ./...` run from that directory dirties the tree with a
+      multi-megabyte diff. Delete it from the index and widen the ignore to
+      `realm-id` (unanchored). Found 2026-08-25.

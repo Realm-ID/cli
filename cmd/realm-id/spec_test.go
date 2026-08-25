@@ -266,3 +266,121 @@ func TestUserAPIKeyCreateIsFilteredButListAndRevokeSurvive(t *testing.T) {
 		}
 	}
 }
+
+// TestScopeRemoveIsFilteredButRenameSurvives pins ADR-062 §5 against the
+// ADR-097 §G scope removal added in spec `0.32.0`.
+//
+// §5 states its rule as a property, not as its three examples: the verbs are
+// absent so that "a credential handed to an agent CANNOT perform an irreversible
+// action even if the agent tries", explicitly "stronger than a `--yes`
+// soft-gate". `POST /platforms/{id}/scopes/remove` is irreversible by its own
+// description, deletes a scope from every `permissions_cap` in the realm in one
+// transaction, and under `on_empty=revoke` bulk-revokes every key the removal
+// would uncap — keys this binary cannot re-mint, since ADR-097 §E filters the
+// mint (see skipBFFOnly). Its `?dry_run=true` preview is opt-in, which is the
+// soft-gate shape §5 rejects.
+//
+// Both halves are asserted. "remove is absent" alone is satisfied by a tree that
+// failed to load, so `scopes rename` — the sibling operation on the same
+// collection, which §5 does NOT reach because a rename is reversible by renaming
+// back — must be PRESENT for the absence to carry any meaning.
+func TestScopeRemoveIsFilteredButRenameSurvives(t *testing.T) {
+	cmds, _, err := buildCommands()
+	if err != nil {
+		t.Fatalf("buildCommands: %v", err)
+	}
+	if len(cmds) == 0 {
+		t.Fatal("buildCommands produced NO commands; this test would have inspected nothing")
+	}
+
+	sawRename := false
+	for _, c := range cmds {
+		if strings.HasSuffix(c.Path, "/scopes/remove") {
+			t.Errorf("ADR-062 §5: %s %s must be filtered — it is irreversible and can "+
+				"bulk-revoke keys this binary cannot re-mint. It generated as `%s %s`.",
+				c.Method, c.Path, strings.Join(c.Group, " "), c.Verb)
+		}
+		if strings.HasSuffix(c.Path, "/scopes/rename") {
+			sawRename = true
+		}
+	}
+	if !sawRename {
+		t.Error("`scopes rename` must SURVIVE the filter — §5 reaches irreversible acts, and a " +
+			"rename is undone by renaming back. Its absence means the spec failed to load and " +
+			"the assertion above proved nothing.")
+	}
+
+	// The rule is path-shaped, so state it directly too: the filter must not
+	// have been satisfied by some unrelated skip (a tag change, a spec typo).
+	if !skipDestructive("POST", "/platforms/{id}/scopes/remove") {
+		t.Error("skipDestructive must filter POST /platforms/{id}/scopes/remove")
+	}
+	if skipDestructive("POST", "/platforms/{id}/scopes/rename") {
+		t.Error("skipDestructive must NOT filter the rename")
+	}
+}
+
+// TestTopLevelResourceGroupsAreReviewed fails when a spec re-vendor changes the
+// set of resource groups the binary exposes.
+//
+// This is a deliberately HAND-MAINTAINED list, against this workspace's standing
+// rule, because here the decay direction is the safe one. A derived subject list
+// answers "is each thing we thought of still right?"; this answers the question
+// that actually went unasked — "did the spec grow a command nobody looked at?"
+// The only way it rots is by going RED, which forces exactly the review it
+// exists to force. It also catches removals, which are more dangerous than
+// additions: a partner's script breaks with no signal from a chore commit.
+//
+// Recorded so the list is not mistaken for an endorsement: the entries marked
+// below are MIS-DERIVED. `deriveCommand` treats a trailing static segment as a
+// collection noun unless `actionVerb` names it, so every action segment absent
+// from that set becomes a top-level resource whose verb is `create` — you run
+// `realm-id revoke create` to revoke a service account. Fourteen commands are in
+// this state; it predates the ADR-097 work and is tracked in TODO.md. Each needs
+// its own naming decision, so they are pinned here as-is rather than quietly
+// renamed.
+func TestTopLevelResourceGroupsAreReviewed(t *testing.T) {
+	want := map[string]bool{
+		"admin events": true, "admin notes": true, "admin platforms": true,
+		"admin search": true, "admin stats": true,
+		"api-keys": true, "audit-events": true, "contact-drift-reviews": true,
+		"contact-verifications": true, "domains": true, "federation-bindings": true,
+		"identity-providers": true, "integration-installations": true,
+		"integrations": true, "invitations": true, "login-attempts": true,
+		"mfa": true, "origins": true, "permissions": true, "platforms": true,
+		"roles": true, "scopes": true, "service-accounts": true,
+		"signing-keys": true, "sources": true, "sso-domains": true,
+		"starter-roles": true, "stats": true, "tenants": true,
+		"user-api-keys": true, "users": true,
+
+		// MIS-DERIVED action segments (see the doc comment). Not endorsed.
+		"deactivate": true, "delink": true, "disable": true, "enable": true,
+		"hand-back": true, "import": true, "leave": true, "pending": true,
+		"request": true, "reset-handle": true, "revoke": true,
+		"revoke-all": true, "tenant-choice": true,
+	}
+
+	tr, err := loadTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.groups) == 0 {
+		t.Fatal("no groups built — the guard would pass vacuously")
+	}
+
+	got := map[string]bool{}
+	for _, g := range tr.groups {
+		got[g] = true
+		if !want[g] {
+			t.Errorf("NEW resource group %q reached the binary. Diff the command tree, decide "+
+				"whether it should be exposed at all (ADR-062 §5) and whether it is named "+
+				"correctly, then add it here.", g)
+		}
+	}
+	for g := range want {
+		if !got[g] {
+			t.Errorf("resource group %q DISAPPEARED from the binary. A removal breaks callers "+
+				"silently; confirm it was intended, then drop it from this list.", g)
+		}
+	}
+}
