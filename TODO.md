@@ -17,24 +17,24 @@ Surfaced provisioning the Traide prod realm via CLI device login
 The docs side is handled (`README.md`: re-auth, `REALM_ID_API_KEY` for long runs,
 warning against concurrent `auth login`); these are the code fixes.
 
-- [x] ~~**Surface token expiry in `realm-id auth whoami`**~~ — **RESOLVED
-  2026-08-21, but NOT as asked.** `sessionHint` names the cause and
-  `realm-id auth login` on stderr for the three session-lifecycle codes; stdout
-  stays pure JSON.
-  **The countdown was not built, for three reasons, and the third was
-  MEASURED.** (1) The bearer is ADR-060's opaque id, not a JWT — nothing to
-  decode. (2) `POST /auth/device/token` hands the CLI no expiry, so it was
-  cross-repo, not CLI-only. (3) **The symptom no longer reproduces**: against a
-  live stack with `access_ttl_seconds` compressed to 1s (positive control: the
-  BFF's `/token` reported a 1-second `expires_at`, because a stored-but-unapplied
-  knob would have made the test vacuous), a passthrough call 5s after login
-  returned `200` — the BFF self-heals an expired access JWT. Traide's ~38 minutes
-  was most likely the self-heal being dead on arrival, fixed 2026-07-01, two days
-  after their report. Likely explanation, not a finding: 15m ≠ 38m.
-  Four mutations; **two initially survived and the gap was in the TESTS** — every
-  case moved status and code together, so the suite could not tell which the code
-  read. Rationale: `DECISIONS.md` 2026-08-21. Original entry:
-
+> ~~**Surface token expiry in `realm-id auth whoami`**~~ — **RESOLVED
+> 2026-08-21, but NOT as asked.** `sessionHint` names the cause and
+> `realm-id auth login` on stderr for the three session-lifecycle codes; stdout
+> stays pure JSON.
+> **The countdown was not built, for three reasons, and the third was
+> MEASURED.** (1) The bearer is ADR-060's opaque id, not a JWT — nothing to
+> decode. (2) `POST /auth/device/token` hands the CLI no expiry, so it was
+> cross-repo, not CLI-only. (3) **The symptom no longer reproduces**: against a
+> live stack with `access_ttl_seconds` compressed to 1s (positive control: the
+> BFF's `/token` reported a 1-second `expires_at`, because a stored-but-unapplied
+> knob would have made the test vacuous), a passthrough call 5s after login
+> returned `200` — the BFF self-heals an expired access JWT. Traide's ~38 minutes
+> was most likely the self-heal being dead on arrival, fixed 2026-07-01, two days
+> after their report. Likely explanation, not a finding: 15m ≠ 38m.
+> Four mutations; **two initially survived and the gap was in the TESTS** — every
+> case moved status and code together, so the suite could not tell which the code
+> read. Rationale: `DECISIONS.md` 2026-08-21. Original entry:
+>
 > **Carried lesson from the approve-side-error item** (record purged 2026-08-09
 > per this file's "open work only" rule; full account in `Realm-ID/project`'s
 > `DECISIONS.md` 2026-08-06). It had been DONE for five weeks and three TODO
@@ -45,7 +45,6 @@ warning against concurrent `auth login`); these are the code fixes.
 > was the pessimistic one. The 201-vs-200 bug lived in that same seam and was
 > found in production. When this CLI's behaviour depends on another repo's wire
 > shape, the test that proves it must put a real server on the other end.
-
 - [ ] **Distinguish "this code was already consumed by another session" from
   "unknown or expired"** on the `/device` approval page.
   ⚠️ **RE-SCOPED 2026-08-24 — the original premise is STALE.** It read "the
