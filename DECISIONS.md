@@ -5,6 +5,20 @@ file records WHY. See the root `Realm-ID/project` DECISIONS.md for cross-cutting
 context.
 
 
+## Index
+
+9 entries. Newest first.
+
+- [2026-08-25 (later+1) — the 9.7 MB binary is untracked, and the ignore pattern the TODO proposed is a trap](#2026-08-25-later1--the-97-mb-binary-is-untracked-and-the-ignore-pattern-the-todo-proposed-is-a-trap)
+- [2026-08-25 (later) — the refusal was overturned the same day, and the reasoning against it is kept](#2026-08-25-later--the-refusal-was-overturned-the-same-day-and-the-reasoning-against-it-is-kept)
+- [2026-08-25 — re-vendor the spec to 0.32.0; the one new operation is REFUSED entry, and the command tree does not move](#2026-08-25--re-vendor-the-spec-to-0320-the-one-new-operation-is-refused-entry-and-the-command-tree-does-not-move)
+- [2026-08-21 — `whoami` names the remedy; the countdown it asked for was both impossible and aimed at a fixed bug](#2026-08-21--whoami-names-the-remedy-the-countdown-it-asked-for-was-both-impossible-and-aimed-at-a-fixed-bug)
+- [2026-08-06 — re-vendor the spec to 0.24.0; `platforms describe` costs a `cp`](#2026-08-06--re-vendor-the-spec-to-0240-platforms-describe-costs-a-cp)
+- [2026-08-06 — `platforms set-config` bound to GET or PATCH at random, per run](#2026-08-06--platforms-set-config-bound-to-get-or-patch-at-random-per-run)
+- [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
+- [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
+- [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
 ## 2026-08-25 (later+1) — the 9.7 MB binary is untracked, and the ignore pattern the TODO proposed is a trap
 
 **Problem.** `cmd/realm-id/realm-id`, a compiled 9.7 MB binary, has been tracked
