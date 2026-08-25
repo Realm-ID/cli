@@ -284,7 +284,12 @@ func TestUserAPIKeyCreateIsFilteredButListAndRevokeSurvive(t *testing.T) {
 // failed to load, so `scopes rename` — the sibling operation on the same
 // collection, which §5 does NOT reach because a rename is reversible by renaming
 // back — must be PRESENT for the absence to carry any meaning.
-func TestScopeRemoveIsFilteredButRenameSurvives(t *testing.T) {
+func TestScopeRemoveIsExposedAsScopesRemove(t *testing.T) {
+	// ADR-062 §5 Amendment (2026-08-25, owner decision): scope removal is
+	// exposed despite being irreversible. This guard is the inverse of the one
+	// it replaced, deliberately — the amendment is a DECISION, so what needs
+	// pinning is that the decision still holds and that the op did not drift
+	// back to the bogus `remove create` shape it derives as by default.
 	cmds, _, err := buildCommands()
 	if err != nil {
 		t.Fatalf("buildCommands: %v", err)
@@ -293,30 +298,72 @@ func TestScopeRemoveIsFilteredButRenameSurvives(t *testing.T) {
 		t.Fatal("buildCommands produced NO commands; this test would have inspected nothing")
 	}
 
-	sawRename := false
-	for _, c := range cmds {
-		if strings.HasSuffix(c.Path, "/scopes/remove") {
-			t.Errorf("ADR-062 §5: %s %s must be filtered — it is irreversible and can "+
-				"bulk-revoke keys this binary cannot re-mint. It generated as `%s %s`.",
-				c.Method, c.Path, strings.Join(c.Group, " "), c.Verb)
+	var removeCmd, renameCmd *command
+	for i, c := range cmds {
+		switch {
+		case strings.HasSuffix(c.Path, "/scopes/remove"):
+			removeCmd = &cmds[i]
+		case strings.HasSuffix(c.Path, "/scopes/rename"):
+			renameCmd = &cmds[i]
 		}
-		if strings.HasSuffix(c.Path, "/scopes/rename") {
-			sawRename = true
-		}
-	}
-	if !sawRename {
-		t.Error("`scopes rename` must SURVIVE the filter — §5 reaches irreversible acts, and a " +
-			"rename is undone by renaming back. Its absence means the spec failed to load and " +
-			"the assertion above proved nothing.")
 	}
 
-	// The rule is path-shaped, so state it directly too: the filter must not
-	// have been satisfied by some unrelated skip (a tag change, a spec typo).
-	if !skipDestructive("POST", "/platforms/{id}/scopes/remove") {
-		t.Error("skipDestructive must filter POST /platforms/{id}/scopes/remove")
+	// The sibling is the positive control: rename has generated since spec
+	// 0.30.0, so its absence would mean the spec failed to load and every
+	// assertion here proved nothing.
+	if renameCmd == nil {
+		t.Fatal("`scopes rename` is missing — the spec failed to load, so this test inspected nothing")
 	}
-	if skipDestructive("POST", "/platforms/{id}/scopes/rename") {
-		t.Error("skipDestructive must NOT filter the rename")
+	if removeCmd == nil {
+		t.Fatal("POST /platforms/{id}/scopes/remove must be EXPOSED (ADR-062 §5 amendment, " +
+			"2026-08-25). If you are re-filtering it, amend the ADR rather than this test.")
+	}
+
+	// `remove` must be an ACTION on `scopes`, not a resource of its own. Absent
+	// from actionVerb it derives as the top-level `remove create`, which is the
+	// same mis-derivation 13 existing commands already carry (see TODO).
+	if got := strings.Join(removeCmd.Group, " "); got != "scopes" {
+		t.Errorf("scope removal must group under `scopes`, got %q (verb %q) — "+
+			"a bare `remove` group means actionVerb no longer names the segment", got, removeCmd.Verb)
+	}
+	if removeCmd.Verb != "remove" {
+		t.Errorf("verb = %q, want \"remove\"", removeCmd.Verb)
+	}
+	if removeCmd.Method != "POST" {
+		t.Errorf("method = %q, want POST", removeCmd.Method)
+	}
+
+	// The preview is the only surface that can report which keys a removal
+	// would uncap (the 409 envelope carries no payload), so a build that drops
+	// the flag leaves the operator unable to look before writing.
+	var sawDryRun bool
+	for _, q := range removeCmd.Query {
+		if q.Name == "dry_run" {
+			sawDryRun = true
+		}
+	}
+	if !sawDryRun {
+		t.Error("`scopes remove` must carry --dry-run: it is the ONLY way to learn the " +
+			"`emptied` rows before writing")
+	}
+
+	if skipDestructive("POST", "/platforms/{id}/scopes/remove") {
+		t.Error("skipDestructive must NOT filter the scope removal (ADR-062 §5 amendment)")
+	}
+	// The amendment is scoped to ONE operation. If it ever widens, it must widen
+	// in the ADR, not by accident here.
+	for _, p := range []string{
+		"/platforms/{id}/signing-keys/rotate",
+		"/platforms/{id}/suspend",
+		"/tenants/{id}/owner",
+	} {
+		m := "POST"
+		if strings.HasSuffix(p, "/owner") {
+			m = "PUT"
+		}
+		if !skipDestructive(m, p) {
+			t.Errorf("%s %s must still be filtered — the §5 amendment covers scope removal alone", m, p)
+		}
 	}
 }
 

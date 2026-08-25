@@ -5,6 +5,56 @@ file records WHY. See the root `Realm-ID/project` DECISIONS.md for cross-cutting
 context.
 
 
+## 2026-08-25 (later) — the refusal was overturned the same day, and the reasoning against it is kept
+
+**Decision (owner, 2026-08-25).** `POST /platforms/{id}/scopes/remove` ships as
+`realm-id scopes remove`. The entry below refused it entry under ADR-062 §5; that
+refusal stood for about an hour.
+
+**The §5 case against exposing it was not wrong, and is preserved verbatim** —
+in the entry below, in `skipDestructive`'s comment, and in the ADR amendment.
+The operation is irreversible by its own spec text; under `on_empty=revoke` it
+bulk-revokes keys this binary cannot re-mint, because ADR-097 §E filters the
+mint; `?dry_run=true` is opt-in, which is the soft-gate shape §5 is explicitly
+"stronger than"; and it selects its victims by discovery rather than by the
+operator naming them. Every one of those still holds. **A filter that stops
+naming what it gave up stops being reviewable**, which is why none of it was
+deleted on the way to reversing the outcome.
+
+**What the refusal overlooked.** Filtering the typed verb never removed the
+capability — `realm-id api POST /platforms/<id>/scopes/remove --json …` has
+always been reachable, and is the documented escape hatch for every §5
+operation. So the filter did not stop the destructive act; it stopped the
+*guard rails* around it, and left an operator hand-rolling the exact request
+that decides whether live credentials get revoked. §5's premise is that absence
+prevents the act. Here absence prevented only the safe path.
+
+That is sharpest on the preview. `emptied` is a list of ROWS and the error
+envelope is `{error, code}` with no payload, so the dry run is the ONLY surface
+that can answer "which keys would this uncap?" — the question an operator must
+answer before writing. A binary that could not reach it was, in practice,
+pushing people toward the unguarded call.
+
+**Recorded as an AMENDMENT to ADR-062 §5, not a bypass** (issuer `2855c0d`).
+A §5 exception that lives only in a filter function is indistinguishable from a
+§5 violation by anyone reading the ADR. The amendment is scoped to this one
+operation and says so; `delete`, signing-key `rotate`, `suspend`/`unsuspend` and
+ownership transfer stay absent.
+
+**Implementation note that is easy to get wrong.** Dropping the path from
+`skipDestructive` is not enough: `deriveCommand` treats a trailing static segment
+as a collection noun unless `actionVerb` names it, so the op generates as the
+bogus top-level `remove create`. `remove` joins `actionVerb`, and the guard pins
+the GROUPING (`scopes` / `remove`), not merely the presence — mutation-verified:
+removing it from `actionVerb` fails with the exact `remove create` shape.
+
+**Guard.** `TestScopeRemoveIsExposedAsScopesRemove` replaces
+`TestScopeRemoveIsFilteredButRenameSurvives` and is its inverse by design. It
+keeps the sibling `scopes rename` as a positive control (its absence means the
+spec failed to load and the test inspected nothing), asserts `--dry-run`
+survives, and re-asserts that the other four destructive surfaces stay filtered.
+Both mutations caught; suite 41 pass / 0 fail.
+
 ## 2026-08-25 — re-vendor the spec to 0.32.0; the one new operation is REFUSED entry, and the command tree does not move
 
 Vendored `cmd/realm-id/openapi.yaml` from `0.30.0` to `issuer/docs/swagger.yaml`

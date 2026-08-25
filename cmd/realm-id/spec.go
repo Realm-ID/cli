@@ -96,7 +96,7 @@ type command struct {
 // collection noun); the method disambiguates a couple of them.
 func actionVerb(method, seg string) (string, bool) {
 	switch seg {
-	case "claim", "verify", "rename", "accept", "reject", "approve",
+	case "claim", "verify", "rename", "remove", "accept", "reject", "approve",
 		"resolve", "enroll", "confirm", "rotate", "suspend", "unsuspend":
 		return seg, true
 	case "mine":
@@ -192,34 +192,36 @@ func skipBFFOnly(method, path string) bool {
 }
 
 // skipDestructive enforces ADR-062 §5: no delete, no signing-key rotate, no
-// suspend/unsuspend, no ownership/domain transfer (PUT …/owner), no ADR-097 §G
-// scope removal. These are absent from the binary until machine-2FA exists. Key
-// revocation is the one documented exemption — see isRevocable.
+// suspend/unsuspend, no ownership/domain transfer (PUT …/owner). These are
+// absent from the binary until machine-2FA exists. Key revocation is one
+// documented exemption (see isRevocable); ADR-097 §G scope removal is the
+// other, and it is an AMENDMENT rather than a reading — see below.
 //
 // §5 states the rule as a property, not as its three examples: "the verbs are
 // absent, so a credential handed to an agent CANNOT perform an irreversible
 // action even if the agent tries", and it is explicitly "stronger than a `--yes`
 // soft-gate".
 //
-// POST /platforms/{id}/scopes/remove (spec 0.32.0) is that rule's subject on
-// every count. Its own description says "Not reversible — neither the removal
-// nor an accompanying revocation can be undone": the scope string is deleted
-// from every `permissions_cap` in the realm in one transaction, and under
-// `on_empty=revoke` it also revokes every key the removal would uncap.
+// POST /platforms/{id}/scopes/remove (spec 0.32.0) FITS that description. Read
+// on §5's own terms it should be filtered: it is irreversible by its own spec
+// text, `?dry_run=true` is opt-in (the soft-gate shape §5 rejects, and an agent
+// simply omits it), and the ADR-085 §8 revocation exemption does not reach it —
+// §8 holds because "a replacement is one `create` away", and since ADR-097 §E
+// this binary cannot mint a user API key at all (see skipBFFOnly). A bulk revoke
+// it cannot undo by re-minting is not the soft, re-mintable act §8 licensed.
 //
-// The `?dry_run=true` preview does not change the answer — it is opt-in, which
-// is precisely the soft-gate shape §5 rejects. An agent simply omits it.
+// It is exposed anyway, by an EXPLICIT OWNER DECISION (2026-08-25) recorded as
+// an amendment to ADR-062 §5 — not smuggled through this list. The reasoning
+// above is kept verbatim because it is the cost of the decision, and a filter
+// that stops naming what it gave up stops being reviewable. See
+// `issuer/docs/adr/062-cli-agent-first.md` § "Amendment (2026-08-25)" and
+// `DECISIONS.md` 2026-08-25.
 //
-// And the ADR-085 §8 revocation exemption does NOT extend here, because its own
-// justification fails: that exemption holds because "a replacement is one
-// `create` away", and since ADR-097 §E this binary cannot mint a user API key at
-// all (see skipBFFOnly). A bulk revoke it cannot undo by re-minting is not the
-// soft, re-mintable act §8 licensed. It also selects its victims by discovery
-// rather than by the operator naming them.
-//
-// Not unreachable, just untyped: `realm-id api POST /platforms/<id>/scopes/remove
-// --json …` still works, the same escape hatch every other §5 operation keeps.
-// Revisit when machine-2FA/OTP step-up lands and §5 unlocks behind `--otp`.
+// What the operator gets: `realm-id scopes remove --scope … [--dry-run]`. The
+// preview is the ONLY way to learn which keys a removal would uncap — `emptied`
+// is a row list, and the 409 error envelope cannot carry a payload — so a CLI
+// that could not reach it forced operators onto `realm-id api POST …`, hand-
+// rolling the request that decides whether live credentials get revoked.
 func skipDestructive(method, path string) bool {
 	if method == "DELETE" {
 		return !isRevocable(path)
@@ -230,8 +232,7 @@ func skipDestructive(method, path string) bool {
 	switch {
 	case strings.HasSuffix(path, "/signing-keys/rotate"),
 		strings.HasSuffix(path, "/suspend"),
-		strings.HasSuffix(path, "/unsuspend"),
-		strings.HasSuffix(path, "/scopes/remove"):
+		strings.HasSuffix(path, "/unsuspend"):
 		return true
 	}
 	return false

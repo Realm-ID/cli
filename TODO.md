@@ -137,13 +137,27 @@ clean 2026-07-28 and the item was removed; this line goes at the next sweep.)*
 > method, path, params or body** — the half of the diff that would have been
 > dangerous, and the half nobody thinks to check.
 >
-> **The new operation is FILTERED, not exposed** (ADR-062 §5): it is
-> irreversible by its own description and under `on_empty=revoke` bulk-revokes
-> keys this binary cannot re-mint, since ADR-097 §E filters the mint. Its
-> `?dry_run=true` preview is opt-in — the soft-gate shape §5 is explicitly
-> "stronger than". `scopes rename` stays (a rename is undone by renaming back),
-> and `realm-id api POST …/scopes/remove` remains as the escape hatch.
-> Full reasoning in `DECISIONS.md` 2026-08-25.
+> ~~**The new operation is FILTERED, not exposed** (ADR-062 §5)~~ —
+> **OVERTURNED THE SAME DAY by owner decision (2026-08-25). It ships as
+> `realm-id scopes remove`.** The §5 reading above is correct and is kept
+> verbatim, because it is the COST of the decision, not a mistake: the op is
+> irreversible by its own description, under `on_empty=revoke` bulk-revokes keys
+> this binary cannot re-mint (ADR-097 §E filters the mint), and `?dry_run=true`
+> is opt-in — the soft-gate shape §5 is explicitly "stronger than".
+> **What the filter overlooked:** it never removed the capability, only the safe
+> path to it. `realm-id api POST …/scopes/remove --json …` was always reachable,
+> so filtering the typed verb left an operator hand-rolling the request that
+> decides whether live credentials get revoked — and the dry-run preview is the
+> ONLY surface that can report which keys a removal would uncap (`emptied` is a
+> row list; the 409 envelope carries no payload).
+> Recorded as an **amendment to ADR-062 §5**, not a bypass:
+> `issuer/docs/adr/062-agent-cli-and-device-flow-auth.md` § *Amendment
+> (2026-08-25)* (issuer `2855c0d`). `remove` joins `actionVerb` so the op derives
+> as `scopes remove` rather than the bogus top-level `remove create` it defaults
+> to. `TestScopeRemoveIsExposedAsScopesRemove` pins the exposure, the GROUPING,
+> the `--dry-run` flag, and re-asserts that delete / signing-key rotate /
+> suspend / owner-transfer stay filtered, so a widening must be deliberate.
+> Both mutations verified. Full reasoning in `DECISIONS.md` 2026-08-25.
 >
 > **"Nothing detects the drift" is now false.**
 > `TestTopLevelResourceGroupsAreReviewed` pins the set of resource groups the
