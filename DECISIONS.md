@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-9 entries. Newest first.
+10 entries. Newest first.
 
+- [2026-08-27 — re-vendor to 0.33.0: the command tree moves in BOTH directions, and the §5 amendment loses its subject](#2026-08-27--re-vendor-to-0330-the-command-tree-moves-in-both-directions-and-the-5-amendment-loses-its-subject)
 - [2026-08-25 (later+1) — the 9.7 MB binary is untracked, and the ignore pattern the TODO proposed is a trap](#2026-08-25-later1--the-97-mb-binary-is-untracked-and-the-ignore-pattern-the-todo-proposed-is-a-trap)
 - [2026-08-25 (later) — the refusal was overturned the same day, and the reasoning against it is kept](#2026-08-25-later--the-refusal-was-overturned-the-same-day-and-the-reasoning-against-it-is-kept)
 - [2026-08-25 — re-vendor the spec to 0.32.0; the one new operation is REFUSED entry, and the command tree does not move](#2026-08-25--re-vendor-the-spec-to-0320-the-one-new-operation-is-refused-entry-and-the-command-tree-does-not-move)
@@ -18,6 +19,46 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-08-27 — re-vendor to 0.33.0: the command tree moves in BOTH directions, and the §5 amendment loses its subject
+
+**What.** `cmd/realm-id/openapi.yaml` re-vendored from issuer spec `0.32.0` to
+`0.33.0` (ADR-100). This is the first re-vendor where the generated tree moves in
+both directions at once, and both moves needed a decision rather than a diff.
+
+**`scopes remove` disappears, and the 2026-08-25 amendment goes with it.** Two
+days ago §5 was amended by explicit owner decision to expose a bulk, irreversible
+operation the rule read on its own terms would have filtered — the reasoning
+against it was kept verbatim in `spec.go` precisely because it was the cost of
+the decision. ADR-100 D10 has now deleted the endpoint outright, everywhere, so
+there is no operation left for the amendment to cover. **Superseded, not
+reversed**: the decision was correct for the design as it stood. §5 is back to
+having no exceptions beyond revocation, and the long justification is retired
+from `spec.go` to `git log` — a filter that documents an endpoint nobody can call
+stops being readable.
+
+`TestScopeRemoveIsExposedAsScopesRemove` inverted into
+`TestScopeRemoveIsGoneAndRenameSurvives`. It keeps `scopes rename` as the
+positive control for the same reason the old test did: an absence assertion is
+satisfied by a tree that failed to load.
+
+**`user-api-keys update` appears, and must not.** ADR-100 D12's
+`PUT …/user-api-keys/{id}` carries the SAME ADR-097 §E escort as the mint, and
+this binary holds a user token from the device flow — so the verb would generate
+cleanly, appear in `--help`, and 401 at runtime, which is worse than not
+existing because the operator cannot tell a missing capability from a broken one.
+
+**The filter is METHOD-aware, and that is the whole decision.** `skipBFFOnly`
+was `POST && HasSuffix("/user-api-keys")`; the obvious widening — match the path
+`/user-api-keys/` — would ALSO catch `DELETE …/user-api-keys/{id}`, the revoke,
+which is the same path shape. ADR-084 §9 and the partner guide both name
+revocation as the primary control for an end-user key, so a binary that could not
+revoke one would contradict the documentation shipped with it. The new test
+asserts both directions, and mutation-checking it (reverting the filter to the
+old one-line form) fails it by name.
+
+**Nothing else in the tree moved.** `user-api-keys list` / `revoke` and
+`scopes rename` are unchanged, and the top-level resource list is byte-identical.
 
 ## 2026-08-25 (later+1) — the 9.7 MB binary is untracked, and the ignore pattern the TODO proposed is a trap
 

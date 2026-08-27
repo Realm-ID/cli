@@ -177,51 +177,55 @@ func isRevocable(path string) bool {
 // which is worse than not existing, because the operator has no way to tell a
 // missing capability from a broken one.
 //
-// Today that is exactly one operation: minting a user API key, put behind the
-// escort by ADR-097 §E. `GET` and `DELETE` on the same collection are NOT
-// escorted and stay available — ADR-084 §9 and the partner guide both name
-// revocation as the primary control for an end-user key, so a binary that
-// cannot revoke one would contradict the advice shipped with it.
+// Two operations today, both on the user-API-key collection:
 //
-// The endpoint is filtered here rather than removed from the spec: it still
-// exists, for BFFs. If RealmID staff later want CLI minting, the fix is for the
-// CLI to obtain a base-realm platform token — separate work, not smuggled in
+//   - POST …/user-api-keys — the mint, put behind the escort by ADR-097 §E.
+//   - PUT  …/user-api-keys/{id} — the ADR-100 D12 replace, put behind the SAME
+//     escort for the same reason. It shares the mint's write schema and can
+//     WIDEN a key (`uncapped` false→true, `org_scope` selected→all, a longer
+//     TTL), so an unescorted update would be the mint's hole reached by two
+//     calls instead of one.
+//
+// `GET` and `DELETE` on the same collection are NOT escorted and stay available
+// — ADR-084 §9 and the partner guide both name revocation as the primary
+// control for an end-user key, so a binary that cannot revoke one would
+// contradict the advice shipped with it.
+//
+// ⚠️ THE METHOD IS PART OF THE TEST, and must stay so. It is tempting to
+// simplify this to "any path containing /user-api-keys", and that would filter
+// `DELETE …/user-api-keys/{id}` — the revoke — which is the same path shape as
+// the PUT and must pass through. `spec_test.go` pins both directions.
+//
+// These are filtered here rather than removed from the spec: they still exist,
+// for BFFs. If RealmID staff later want CLI minting or updating, the fix is for
+// the CLI to obtain a base-realm platform token — separate work, not smuggled in
 // through this list.
 func skipBFFOnly(method, path string) bool {
-	return method == "POST" && strings.HasSuffix(path, "/user-api-keys")
+	if method == "POST" && strings.HasSuffix(path, "/user-api-keys") {
+		return true
+	}
+	return method == "PUT" && strings.Contains(path, "/user-api-keys/")
 }
 
 // skipDestructive enforces ADR-062 §5: no delete, no signing-key rotate, no
 // suspend/unsuspend, no ownership/domain transfer (PUT …/owner). These are
-// absent from the binary until machine-2FA exists. Key revocation is one
-// documented exemption (see isRevocable); ADR-097 §G scope removal is the
-// other, and it is an AMENDMENT rather than a reading — see below.
+// absent from the binary until machine-2FA exists. Key revocation is the one
+// documented exemption (see isRevocable).
 //
-// §5 states the rule as a property, not as its three examples: "the verbs are
-// absent, so a credential handed to an agent CANNOT perform an irreversible
-// action even if the agent tries", and it is explicitly "stronger than a `--yes`
-// soft-gate".
+// # The ADR-097 §G scope-removal amendment is RETIRED, because its subject is
 //
-// POST /platforms/{id}/scopes/remove (spec 0.32.0) FITS that description. Read
-// on §5's own terms it should be filtered: it is irreversible by its own spec
-// text, `?dry_run=true` is opt-in (the soft-gate shape §5 rejects, and an agent
-// simply omits it), and the ADR-085 §8 revocation exemption does not reach it —
-// §8 holds because "a replacement is one `create` away", and since ADR-097 §E
-// this binary cannot mint a user API key at all (see skipBFFOnly). A bulk revoke
-// it cannot undo by re-minting is not the soft, re-mintable act §8 licensed.
+// A long note used to sit here justifying `realm-id scopes remove`: §5 read on
+// its own terms would have filtered it (irreversible by its own spec text, with
+// an opt-in `?dry_run` — the soft-gate shape §5 rejects), and it was exposed
+// anyway by an explicit owner decision on 2026-08-25, recorded as an amendment
+// to §5.
 //
-// It is exposed anyway, by an EXPLICIT OWNER DECISION (2026-08-25) recorded as
-// an amendment to ADR-062 §5 — not smuggled through this list. The reasoning
-// above is kept verbatim because it is the cost of the decision, and a filter
-// that stops naming what it gave up stops being reviewable. See
-// `issuer/docs/adr/062-cli-agent-first.md` § "Amendment (2026-08-25)" and
-// `DECISIONS.md` 2026-08-25.
-//
-// What the operator gets: `realm-id scopes remove --scope … [--dry-run]`. The
-// preview is the ONLY way to learn which keys a removal would uncap — `emptied`
-// is a row list, and the 409 error envelope cannot carry a payload — so a CLI
-// that could not reach it forced operators onto `realm-id api POST …`, hand-
-// rolling the request that decides whether live credentials get revoked.
+// ADR-100 D10 then deleted `POST /platforms/{id}/scopes/remove` outright:
+// retiring a scope is self-healing once the partner supplies `role_permissions`
+// at every token mint. There is no operation left for the amendment to cover, so
+// §5 is back to having no exceptions beyond revocation. The reasoning is kept in
+// `git log` and in `DECISIONS.md` rather than here, because a filter that
+// documents an endpoint nobody can call stops being readable.
 func skipDestructive(method, path string) bool {
 	if method == "DELETE" {
 		return !isRevocable(path)

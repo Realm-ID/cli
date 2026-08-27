@@ -267,29 +267,23 @@ func TestUserAPIKeyCreateIsFilteredButListAndRevokeSurvive(t *testing.T) {
 	}
 }
 
-// TestScopeRemoveIsFilteredButRenameSurvives pins ADR-062 §5 against the
-// ADR-097 §G scope removal added in spec `0.32.0`.
+// TestScopeRemoveIsGoneAndRenameSurvives — ADR-100 D10 deleted
+// `POST /platforms/{id}/scopes/remove` outright, so the CLI must not generate a
+// verb for it.
 //
-// §5 states its rule as a property, not as its three examples: the verbs are
-// absent so that "a credential handed to an agent CANNOT perform an irreversible
-// action even if the agent tries", explicitly "stronger than a `--yes`
-// soft-gate". `POST /platforms/{id}/scopes/remove` is irreversible by its own
-// description, deletes a scope from every `permissions_cap` in the realm in one
-// transaction, and under `on_empty=revoke` bulk-revokes every key the removal
-// would uncap — keys this binary cannot re-mint, since ADR-097 §E filters the
-// mint (see skipBFFOnly). Its `?dry_run=true` preview is opt-in, which is the
-// soft-gate shape §5 rejects.
+// This replaces TestScopeRemoveIsExposedAsScopesRemove, which pinned the
+// opposite: the ADR-062 §5 amendment of 2026-08-25 that exposed a bulk,
+// irreversible operation on an explicit owner decision. That decision is
+// SUPERSEDED, not reversed — the endpoint it covered no longer exists anywhere,
+// because retiring a scope is self-healing once the partner supplies
+// `role_permissions` at every token mint. §5 is back to having no exceptions
+// beyond revocation.
 //
-// Both halves are asserted. "remove is absent" alone is satisfied by a tree that
-// failed to load, so `scopes rename` — the sibling operation on the same
-// collection, which §5 does NOT reach because a rename is reversible by renaming
-// back — must be PRESENT for the absence to carry any meaning.
-func TestScopeRemoveIsExposedAsScopesRemove(t *testing.T) {
-	// ADR-062 §5 Amendment (2026-08-25, owner decision): scope removal is
-	// exposed despite being irreversible. This guard is the inverse of the one
-	// it replaced, deliberately — the amendment is a DECISION, so what needs
-	// pinning is that the decision still holds and that the op did not drift
-	// back to the bogus `remove create` shape it derives as by default.
+// ⚠️ THE ABSENCE ALONE PROVES NOTHING. A tree that failed to load has no
+// `remove` verb either. `scopes rename` is the positive control: the sibling
+// operation on the same collection, which survives, and whose presence is what
+// makes the absence mean something.
+func TestScopeRemoveIsGoneAndRenameSurvives(t *testing.T) {
 	cmds, _, err := buildCommands()
 	if err != nil {
 		t.Fatalf("buildCommands: %v", err)
@@ -308,50 +302,17 @@ func TestScopeRemoveIsExposedAsScopesRemove(t *testing.T) {
 		}
 	}
 
-	// The sibling is the positive control: rename has generated since spec
-	// 0.30.0, so its absence would mean the spec failed to load and every
-	// assertion here proved nothing.
 	if renameCmd == nil {
 		t.Fatal("`scopes rename` is missing — the spec failed to load, so this test inspected nothing")
 	}
-	if removeCmd == nil {
-		t.Fatal("POST /platforms/{id}/scopes/remove must be EXPOSED (ADR-062 §5 amendment, " +
-			"2026-08-25). If you are re-filtering it, amend the ADR rather than this test.")
+	if removeCmd != nil {
+		t.Errorf("`scopes remove` generated from %s %s — the endpoint was DELETED by ADR-100 D10, "+
+			"so a vendored spec still carrying it is a stale re-vendor, not a filter question",
+			removeCmd.Method, removeCmd.Path)
 	}
 
-	// `remove` must be an ACTION on `scopes`, not a resource of its own. Absent
-	// from actionVerb it derives as the top-level `remove create`, which is the
-	// same mis-derivation 13 existing commands already carry (see TODO).
-	if got := strings.Join(removeCmd.Group, " "); got != "scopes" {
-		t.Errorf("scope removal must group under `scopes`, got %q (verb %q) — "+
-			"a bare `remove` group means actionVerb no longer names the segment", got, removeCmd.Verb)
-	}
-	if removeCmd.Verb != "remove" {
-		t.Errorf("verb = %q, want \"remove\"", removeCmd.Verb)
-	}
-	if removeCmd.Method != "POST" {
-		t.Errorf("method = %q, want POST", removeCmd.Method)
-	}
-
-	// The preview is the only surface that can report which keys a removal
-	// would uncap (the 409 envelope carries no payload), so a build that drops
-	// the flag leaves the operator unable to look before writing.
-	var sawDryRun bool
-	for _, q := range removeCmd.Query {
-		if q.Name == "dry_run" {
-			sawDryRun = true
-		}
-	}
-	if !sawDryRun {
-		t.Error("`scopes remove` must carry --dry-run: it is the ONLY way to learn the " +
-			"`emptied` rows before writing")
-	}
-
-	if skipDestructive("POST", "/platforms/{id}/scopes/remove") {
-		t.Error("skipDestructive must NOT filter the scope removal (ADR-062 §5 amendment)")
-	}
-	// The amendment is scoped to ONE operation. If it ever widens, it must widen
-	// in the ADR, not by accident here.
+	// §5's own rules must still bind. The retired amendment covered exactly one
+	// operation; if it ever comes back it comes back in the ADR, not here.
 	for _, p := range []string{
 		"/platforms/{id}/signing-keys/rotate",
 		"/platforms/{id}/suspend",
@@ -362,8 +323,52 @@ func TestScopeRemoveIsExposedAsScopesRemove(t *testing.T) {
 			m = "PUT"
 		}
 		if !skipDestructive(m, p) {
-			t.Errorf("%s %s must still be filtered — the §5 amendment covers scope removal alone", m, p)
+			t.Errorf("%s %s must still be filtered by §5", m, p)
 		}
+	}
+}
+
+// TestUserAPIKeyUpdateIsFilteredButRevokeSurvives — ADR-100 D12's `PUT` carries
+// the same ADR-097 §E escort as the mint, so this binary cannot call it.
+//
+// The two halves are the whole test, because the PUT and the DELETE are the SAME
+// PATH SHAPE — `…/user-api-keys/{id}`. A filter written as a path prefix would
+// catch both and silently remove `realm-id user-api-keys revoke`, which ADR-084
+// §9 and the partner guide both name as the primary control for an end-user key.
+func TestUserAPIKeyUpdateIsFilteredButRevokeSurvives(t *testing.T) {
+	const coll = "/tenants/{tid}/users/{uid}/user-api-keys"
+	if !skipBFFOnly("PUT", coll+"/{id}") {
+		t.Error("the ADR-100 update must be filtered: it shares the mint's escort and can WIDEN a key")
+	}
+	if skipBFFOnly("DELETE", coll+"/{id}") {
+		t.Error("the revoke must NOT be filtered — same path shape, different method, and it is " +
+			"the control the docs tell operators to use")
+	}
+
+	cmds, _, err := buildCommands()
+	if err != nil {
+		t.Fatalf("buildCommands: %v", err)
+	}
+	var sawUpdate, sawRevoke bool
+	for _, c := range cmds {
+		if !strings.Contains(c.Path, "/user-api-keys") {
+			continue
+		}
+		switch c.Method {
+		case "PUT":
+			sawUpdate = true
+		case "DELETE":
+			sawRevoke = true
+		}
+	}
+	if sawUpdate {
+		t.Error("`user-api-keys update` generated — it would appear in --help and 401 at runtime, " +
+			"which is worse than not existing")
+	}
+	// The positive control: without it, a tree that failed to load passes above.
+	if !sawRevoke {
+		t.Fatal("`user-api-keys revoke` is missing — either the spec failed to load or the " +
+			"filter widened to a path match, taking the revoke with it")
 	}
 }
 
