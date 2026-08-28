@@ -125,6 +125,11 @@ rebuild. Mapping: REST resource → noun, method → verb (`list`/`describe`/`cr
 - **Collisions** — where a hierarchical API flattens to the same `resource verb`
   (e.g. platform- vs tenant-scoped `identity-providers list`), the broadest-scope
   variant wins; the narrower ones stay reachable via `realm-id api`.
+- **Unrecognised segments** — a trailing path segment the generator can classify
+  as neither a collection nor an action produces **no command at all** (use
+  `realm-id api`), and fails the build's own test until someone names it. It is
+  not guessed at: until 2026-08-28 it was, which is how thirteen action segments
+  each became a top-level "resource" you invoked as `realm-id revoke create`.
 
 `auth login` opens the approval link in your default browser (best-effort, only on
 an interactive terminal) and prints it as a fallback; the link already carries the

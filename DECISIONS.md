@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-10 entries. Newest first.
+11 entries. Newest first.
 
+- [2026-08-28 — thirteen action segments were top-level "resources" with a `create` verb; the derivation now refuses to guess](#2026-08-28--thirteen-action-segments-were-top-level-resources-with-a-create-verb-the-derivation-now-refuses-to-guess)
 - [2026-08-27 — re-vendor to 0.33.0: the command tree moves in BOTH directions, and the §5 amendment loses its subject](#2026-08-27--re-vendor-to-0330-the-command-tree-moves-in-both-directions-and-the-5-amendment-loses-its-subject)
 - [2026-08-25 (later+1) — the 9.7 MB binary is untracked, and the ignore pattern the TODO proposed is a trap](#2026-08-25-later1--the-97-mb-binary-is-untracked-and-the-ignore-pattern-the-todo-proposed-is-a-trap)
 - [2026-08-25 (later) — the refusal was overturned the same day, and the reasoning against it is kept](#2026-08-25-later--the-refusal-was-overturned-the-same-day-and-the-reasoning-against-it-is-kept)
@@ -19,6 +20,107 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-08-28 — thirteen action segments were top-level "resources" with a `create` verb; the derivation now refuses to guess
+
+**One pass, all of them, no release.** `TODO.md` recorded that fixing one of
+these was tried and reverted, because a single rename makes the tree *less*
+consistent while reading as a fix. That judgement stands, and it is why this is
+one change covering every case rather than fourteen small ones. It also ships
+`CHANGELOG.md`, whose first entry is this break.
+
+### RCA
+
+**Symptom.** `realm-id revoke create` revoked a service account.
+`realm-id import create` imported users. `realm-id tenant-choice create` settled
+a login picker. Thirteen top-level "resources" in `realm-id --help` that name no
+resource, each with the verb `create`, none of which creates anything. Three
+further operations — `roles disable`, `roles enable`, `sessions revoke` — were
+not merely misnamed but **absent**, and nothing said so.
+
+**Root cause.** `deriveCommand`'s three rules were not total. A trailing static
+path segment was an action if `actionVerb` named it and a **collection noun
+otherwise** — the default was to assume the segment was a resource. So the
+correctness of the whole tree rested on a hand-maintained allowlist being
+complete, and it never was: `actionVerb` grew one segment at a time, each added
+because someone happened to be looking at that path (`config` in the 2026-08-06
+random-binding fix, `remove` in the 2026-08-25 amendment). Every segment nobody
+had happened to look at silently took the other branch.
+
+The *second-order* cause is worse than the naming. Two mis-derived segments
+(`disable`, `enable`) appear on two different parents each, and `revoke` on two;
+because the bogus group name came from the segment rather than the parent, those
+pairs **collided**, and `buildCommands`' "fewest path params wins" tie-break
+resolved each collision by discarding one operation. A missing allowlist entry
+did not just produce a bad name, it deleted a capability.
+
+**Why it wasn't caught.** `TestTopLevelResourceGroupsAreReviewed` *did* see all
+thirteen — and pinned them, with a comment marking them "not endorsed". The
+guard was working; what was missing was a rule it could fail against. It asked
+"did the group set change?", which the mis-derivation answers "no" forever. No
+test asked "is every segment in the spec something we have classified?", so the
+unclassified state was not nameable and therefore not assertable. The three
+dropped operations had no guard at all: `buildCommands` returns `dropped` and
+nothing inspects it.
+
+**Fix.** The classification is now total and the default inverted:
+
+- `actionVerb` gains the thirteen segments. Twelve keep their own name as the
+  verb (`service-accounts deactivate`); `pending` becomes `list-pending`,
+  matching `mine` → `list-mine`, because `GET /domains/pending` is a filtered
+  list and `domains pending` would read as an imperative.
+- Collection nouns are now **derived from the spec**, not listed: a segment that
+  some path follows with a further segment is being used as a collection there.
+  That covers most of them and leaves a small hand-written
+  `listOnlyCollections` for the eight collections with no item route
+  (`audit-events`, `permissions`, `stats`, …), which the structural rule cannot
+  see.
+- A trailing segment in neither set is **unclassified**, and `deriveCommand`
+  returns no command for it. Absent is recoverable (`realm-id api`); a
+  confidently wrong command is not, and that is exactly the failure being fixed.
+
+`me tenant-choice` is the one name that needed a judgement call: `/me/tenant-choice`
+has no intermediate collection, so the parent segment is `me`. Taking the
+derived answer keeps the rule uniform. The alternative — treating `/me/` as a
+group prefix the way `/admin/` is treated — would have renamed
+`invitations accept`/`reject`, which work today.
+
+**Prevention.** `TestEverySpecSegmentIsClassified` walks the embedded spec,
+derives the subject list from it, and fails while any trailing segment is
+unclassified — so the next re-vendor that introduces one goes red and forces the
+naming decision that did not happen this time. Its subject list is derived, not
+hand-written, which is the property the old guard lacked; a positive control
+(≥30 segments found) stops it passing on a spec that failed to load, since
+"empty" is its pass condition. `TestUnclassifiedTrailingSegmentIsSkippedNotInvented`
+covers the skip branch on a synthetic path — it is unreachable from the real
+spec by construction, and without it the guard clause could be deleted with the
+suite still green (verified: that mutation is caught only by this test).
+`TestActionSegmentsDeriveOnTheirParentResource` pins all sixteen commands
+positively **and** the thirteen dead group names negatively, so a regression
+reports a diagnosis rather than only "a group disappeared".
+
+### Why the two lists are still partly hand-maintained
+
+This workspace's standing rule is to derive a check's subject list rather than
+write it. `listOnlyCollections` is written by hand, and the reason is that the
+alternative is worse: the structural signal for "collection" is an item route,
+and eight real collections in this spec have none. A derived-only rule would
+classify `audit-events` as an action and break `audit-events list`, which works.
+What makes the hand-written half acceptable is that it can now only decay by
+going **RED** — an unclassified segment is a test failure, not a silently
+invented command. That is the same argument that justified
+`TestTopLevelResourceGroupsAreReviewed` being hand-maintained, and it is the
+part that was missing before: that guard could rot silently, because the
+mis-derivation it was pinning looked exactly like a decision.
+
+### Not released, deliberately
+
+Fourteen tags exist (`v0.2.0`–`v0.3.1`; the TODO item that asked for the
+changelog said twelve, written before `v0.3.0`). Every rename here breaks a
+script written against any of them. Tagging is a separate act with its own
+decision — there is nothing else queued behind this, and a break should not ride
+out as a side effect of the commit that caused it. The break is written up in
+`CHANGELOG.md` under *Unreleased* with an old → new table.
 
 ## 2026-08-27 — re-vendor to 0.33.0: the command tree moves in BOTH directions, and the §5 amendment loses its subject
 

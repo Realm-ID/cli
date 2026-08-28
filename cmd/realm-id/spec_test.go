@@ -383,14 +383,15 @@ func TestUserAPIKeyUpdateIsFilteredButRevokeSurvives(t *testing.T) {
 // exists to force. It also catches removals, which are more dangerous than
 // additions: a partner's script breaks with no signal from a chore commit.
 //
-// Recorded so the list is not mistaken for an endorsement: the entries marked
-// below are MIS-DERIVED. `deriveCommand` treats a trailing static segment as a
-// collection noun unless `actionVerb` names it, so every action segment absent
-// from that set becomes a top-level resource whose verb is `create` — you run
-// `realm-id revoke create` to revoke a service account. Fourteen commands are in
-// this state; it predates the ADR-097 work and is tracked in TODO.md. Each needs
-// its own naming decision, so they are pinned here as-is rather than quietly
-// renamed.
+// The thirteen MIS-DERIVED groups this list used to carry — `deactivate`,
+// `delink`, `disable`, `enable`, `hand-back`, `import`, `leave`, `pending`,
+// `request`, `reset-handle`, `revoke`, `revoke-all`, `tenant-choice` — are gone
+// as of 2026-08-28. They existed because `deriveCommand` treated any trailing
+// static segment `actionVerb` did not name as a collection noun, so the segment
+// became a top-level resource whose verb was `create`: `realm-id revoke create`
+// revoked a service account. They are pinned negatively by
+// `TestActionSegmentsDeriveOnTheirParentResource`, so a regression fails there
+// with a diagnosis rather than only here with "a group disappeared".
 func TestTopLevelResourceGroupsAreReviewed(t *testing.T) {
 	want := map[string]bool{
 		"admin events": true, "admin notes": true, "admin platforms": true,
@@ -405,11 +406,10 @@ func TestTopLevelResourceGroupsAreReviewed(t *testing.T) {
 		"starter-roles": true, "stats": true, "tenants": true,
 		"user-api-keys": true, "users": true,
 
-		// MIS-DERIVED action segments (see the doc comment). Not endorsed.
-		"deactivate": true, "delink": true, "disable": true, "enable": true,
-		"hand-back": true, "import": true, "leave": true, "pending": true,
-		"request": true, "reset-handle": true, "revoke": true,
-		"revoke-all": true, "tenant-choice": true,
+		// Parents of a trailing action segment, reached only that way. They are
+		// resource groups like any other; what made them absent before
+		// 2026-08-28 was the mis-derivation, not a decision.
+		"contacts": true, "me": true, "memberships": true, "sessions": true,
 	}
 
 	tr, err := loadTree()
@@ -434,5 +434,143 @@ func TestTopLevelResourceGroupsAreReviewed(t *testing.T) {
 			t.Errorf("resource group %q DISAPPEARED from the binary. A removal breaks callers "+
 				"silently; confirm it was intended, then drop it from this list.", g)
 		}
+	}
+}
+
+// TestActionSegmentsDeriveOnTheirParentResource pins the shape ADR-062 §1 asks
+// for — `<parent resource> <action>` — for every trailing action segment in the
+// spec, not just the handful `actionVerb` happened to name.
+//
+// Until 2026-08-28, `deriveCommand` treated any trailing static segment absent
+// from `actionVerb` as a COLLECTION NOUN, so the segment became its own
+// top-level resource and the method chose the verb: `realm-id revoke create`
+// revoked a service account and `realm-id import create` imported users.
+// Fourteen commands were in that state.
+//
+// The table is exhaustive over the action segments the binary exposes, and it
+// asserts the GROUP as well as the verb, because the group is the half that was
+// wrong. The two `disable`/`enable` pairs are here for a second reason: under
+// the old derivation both members of each pair derived the SAME (group, verb)
+// — `disable create` — so the collision tie-break silently dropped one of each.
+// Getting the group right is what makes all four reachable.
+func TestActionSegmentsDeriveOnTheirParentResource(t *testing.T) {
+	cases := []struct{ method, path, wantGroup, wantVerb string }{
+		{"POST", "/tenants/{id}/users/{uid}/sessions/revoke", "sessions", "revoke"},
+		{"POST", "/platforms/{id}/sessions/revoke-all", "sessions", "revoke-all"},
+		{"GET", "/domains/pending", "domains", "list-pending"},
+		{"POST", "/platforms/{id}/roles/{roleId}/disable", "roles", "disable"},
+		{"POST", "/platforms/{id}/roles/{roleId}/enable", "roles", "enable"},
+		{"POST", "/platforms/{id}/integrations/{iid}/disable", "integrations", "disable"},
+		{"POST", "/platforms/{id}/integrations/{iid}/enable", "integrations", "enable"},
+		{"POST", "/tenants/{id}/users/import", "users", "import"},
+		{"POST", "/tenants/{id}/users/{uid}/hand-back", "users", "hand-back"},
+		{"POST", "/tenants/{id}/service-accounts/{said}/reset-handle", "service-accounts", "reset-handle"},
+		{"POST", "/tenants/{id}/service-accounts/{said}/revoke", "service-accounts", "revoke"},
+		{"POST", "/tenants/{id}/service-accounts/{said}/deactivate", "service-accounts", "deactivate"},
+		{"POST", "/tenants/{id}/users/{uid}/contacts/{contactId}/delink", "contacts", "delink"},
+		{"POST", "/me/memberships/{tenantId}/leave", "memberships", "leave"},
+		{"POST", "/me/tenant-choice", "me", "tenant-choice"},
+		{"POST", "/platforms/{pid}/tenants/{tid}/sso-domains/{domain}/request", "sso-domains", "request"},
+	}
+	for _, tc := range cases {
+		g, v, ok := deriveCommand(tc.method, tc.path)
+		if !ok {
+			t.Errorf("%s %s was skipped; want %q %q", tc.method, tc.path, tc.wantGroup, tc.wantVerb)
+			continue
+		}
+		if got := strings.Join(g, " "); got != tc.wantGroup || v != tc.wantVerb {
+			t.Errorf("%s %s → %q %q, want %q %q", tc.method, tc.path, got, v, tc.wantGroup, tc.wantVerb)
+		}
+	}
+
+	// The commands must actually REACH the tree — deriveCommand agreeing in
+	// isolation is what the v0.2.11 random-binding defect already proved is not
+	// enough (only buildCommands could see that collision).
+	tr, err := loadTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		c := find(t, tr, tc.wantGroup, tc.wantVerb)
+		if c.Path != tc.path || c.Method != tc.method {
+			t.Errorf("%s %s bound to %s %s", tc.wantGroup, tc.wantVerb, c.Method, c.Path)
+		}
+	}
+	// And the mis-derived groups must be GONE, or the rename only added aliases.
+	for _, gone := range []string{
+		"deactivate", "delink", "disable", "enable", "hand-back", "import",
+		"leave", "pending", "request", "reset-handle", "revoke", "revoke-all",
+		"tenant-choice",
+	} {
+		if _, still := tr.byGroup[gone]; still {
+			t.Errorf("mis-derived top-level group %q is still in the tree", gone)
+		}
+	}
+}
+
+// TestEverySpecSegmentIsClassified is the guard that makes the fix hold on the
+// NEXT re-vendor.
+//
+// The old derivation had no notion of "I do not know what this segment is": an
+// unrecognised trailing static segment silently became a top-level resource
+// with a `create` verb, which is exactly how fourteen bogus commands reached a
+// shipped binary without anyone deciding to ship them. `unclassifiedSegments`
+// makes that state nameable, `deriveCommand` now SKIPS such a path instead of
+// inventing a command for it, and this test fails when the set is non-empty.
+//
+// It is derived from the embedded spec, not hand-listed, so a re-vendor that
+// introduces a new trailing segment goes red here and forces the naming
+// decision — the thing that did not happen in the first place.
+func TestEverySpecSegmentIsClassified(t *testing.T) {
+	unknown, err := unclassifiedSegments()
+	if err != nil {
+		t.Fatalf("unclassifiedSegments: %v", err)
+	}
+	if len(unknown) > 0 {
+		t.Errorf("trailing path segments the derivation cannot classify: %v\n"+
+			"Each is neither a known action (add it to `actionVerb`) nor a collection "+
+			"noun (add it to `listOnlyCollections` if it has no item route). Until then "+
+			"the operation is ABSENT from the typed tree and reachable only via "+
+			"`realm-id api`.", unknown)
+	}
+
+	// Positive control: the classifier must actually be looking at something.
+	// An empty answer is the PASS condition above, so a broken parse, an empty
+	// embed or an accidental early return would pass silently without this.
+	all, err := trailingStaticSegments()
+	if err != nil {
+		t.Fatalf("trailingStaticSegments: %v", err)
+	}
+	if len(all) < 30 {
+		t.Fatalf("only %d distinct trailing static segments found (%v) — the spec did not "+
+			"load, so the assertion above inspected nothing", len(all), all)
+	}
+}
+
+// TestUnclassifiedTrailingSegmentIsSkippedNotInvented covers the branch that
+// cannot be reached from the CURRENT spec — by construction, since
+// TestEverySpecSegmentIsClassified fails while any real path lands there.
+//
+// It is the whole behavioural change of the 2026-08-28 fix: the old default was
+// "treat anything I do not recognise as a collection", which is how a segment
+// nobody had classified became `realm-id <segment> create`. The new default is
+// to produce NO command. A synthetic path is the only way to exercise it, and
+// exercising it matters — without this test, deleting the guard clause passes
+// the whole suite.
+func TestUnclassifiedTrailingSegmentIsSkippedNotInvented(t *testing.T) {
+	for _, method := range []string{"GET", "POST", "PATCH", "PUT"} {
+		if _, _, ok := deriveCommand(method, "/tenants/{id}/frobnicate"); ok {
+			g, v, _ := deriveCommand(method, "/tenants/{id}/frobnicate")
+			t.Errorf("%s /tenants/{id}/frobnicate derived %q %q; an unclassified segment must "+
+				"produce no command at all", method, strings.Join(g, " "), v)
+		}
+	}
+	// Control: the same shape with a segment the classifier DOES know must
+	// still derive, or the guard is just refusing everything.
+	if _, _, ok := deriveCommand("GET", "/tenants/{id}/config"); !ok {
+		t.Fatal("a known action segment stopped deriving — the guard is over-broad")
+	}
+	if _, _, ok := deriveCommand("GET", "/platforms/{id}/roles"); !ok {
+		t.Fatal("a known collection segment stopped deriving — the guard is over-broad")
 	}
 }

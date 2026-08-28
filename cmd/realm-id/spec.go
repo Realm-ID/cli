@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"sort"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -97,10 +98,24 @@ type command struct {
 func actionVerb(method, seg string) (string, bool) {
 	switch seg {
 	case "claim", "verify", "rename", "remove", "accept", "reject", "approve",
-		"resolve", "enroll", "confirm", "rotate", "suspend", "unsuspend":
+		"resolve", "enroll", "confirm", "rotate", "suspend", "unsuspend",
+		// Added 2026-08-28. Each of these was previously ABSENT from this set,
+		// which is precisely how it became a top-level resource: see the
+		// package-level note on `listOnlyCollections`. The segment reads as the
+		// verb on its parent collection, so no renaming of the segment itself
+		// is needed — `…/service-accounts/{said}/deactivate` is
+		// `service-accounts deactivate`.
+		"deactivate", "delink", "disable", "enable", "hand-back", "import",
+		"leave", "request", "reset-handle", "revoke", "revoke-all",
+		"tenant-choice":
 		return seg, true
 	case "mine":
 		return "list-mine", true
+	case "pending":
+		// GET /domains/pending is a FILTERED LIST, not an act — the same shape
+		// as `/platforms/mine`, and named the same way, so `domains pending`
+		// cannot be misread as "make these domains pending".
+		return "list-pending", true
 	case "config":
 		// Method-aware, unlike the segments above: /platforms/{id}/config
 		// serves BOTH a GET and a PATCH. Keying on the segment alone put them
@@ -130,6 +145,110 @@ func actionVerb(method, seg string) (string, bool) {
 func isAction(seg string) bool {
 	_, ok := actionVerb("", seg)
 	return ok
+}
+
+// listOnlyCollections are resource collections with no item route — nothing in
+// the spec ever writes `…/<seg>/{id}` for them — so the structural rule in
+// `collectionSegments` cannot see them and they must be named here.
+//
+// This list and `actionVerb` are the two halves of a TOTAL classification of
+// trailing static segments. A segment in neither is `unclassified`, which
+// `deriveCommand` SKIPS (absent from the typed tree, still reachable via
+// `realm-id api`) and `TestEverySpecSegmentIsClassified` fails on. That is the
+// whole point: before 2026-08-28 an unrecognised segment silently became a
+// top-level resource whose verb was `create`, so thirteen bogus groups reached
+// a shipped binary without anyone deciding to ship them. The lists decay only
+// by going RED, which forces the naming decision the spec re-vendor skipped.
+var listOnlyCollections = map[string]bool{
+	"audit-events":   true,
+	"events":         true,
+	"login-attempts": true,
+	"notes":          true,
+	"permissions":    true,
+	"search":         true,
+	"starter-roles":  true,
+	"stats":          true,
+}
+
+// collectionSegments is DERIVED from the embedded spec, not hand-listed: a
+// static segment that some path follows with a further segment (`/roles/{id}`,
+// `/sessions/{id}`) is being used as a collection there, so it is a noun
+// everywhere. That covers the great majority of collections and shrinks the
+// hand-maintained half to `listOnlyCollections`.
+//
+// Computed once — the spec is embedded and immutable, and `buildCommands` must
+// stay a pure function of it (TestBuildCommandsIsDeterministic).
+var collectionSegments = sync.OnceValue(func() map[string]bool {
+	segs := map[string]bool{}
+	var doc oaDoc
+	if err := yaml.Unmarshal(openapiYAML, &doc); err != nil {
+		return segs // every segment becomes unclassified; the guard test goes red
+	}
+	for path := range doc.Paths {
+		parts := splitSegs(path)
+		// Every segment BUT the last: a segment is a collection where something
+		// follows it, which is the whole signal.
+		for i := 0; i+1 < len(parts); i++ {
+			if !isParamSeg(parts[i]) {
+				segs[parts[i]] = true
+			}
+		}
+	}
+	return segs
+})
+
+// isCollectionSeg reports whether a trailing static segment names a resource
+// collection (so GET=list / POST=create applies to the segment itself).
+func isCollectionSeg(seg string) bool {
+	return collectionSegments()[seg] || listOnlyCollections[seg]
+}
+
+// trailingStaticSegments returns every distinct trailing static segment across
+// the spec paths the CLI considers (i.e. those surviving skipPath), sorted.
+// It is the subject list the classification guard walks; deriving it from the
+// document is what makes that guard notice a re-vendor nobody reviewed.
+func trailingStaticSegments() ([]string, error) {
+	var doc oaDoc
+	if err := yaml.Unmarshal(openapiYAML, &doc); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for path := range doc.Paths {
+		if skipPath(path) {
+			continue
+		}
+		parts := splitSegs(path)
+		if len(parts) == 0 {
+			continue
+		}
+		if last := parts[len(parts)-1]; !isParamSeg(last) {
+			seen[last] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// unclassifiedSegments returns the trailing static segments that are neither a
+// known action verb nor a collection noun. Non-empty means the typed tree is
+// missing operations, and is a hard test failure rather than a silent
+// invention — see listOnlyCollections.
+func unclassifiedSegments() ([]string, error) {
+	all, err := trailingStaticSegments()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, s := range all {
+		if !isAction(s) && !isCollectionSeg(s) {
+			out = append(out, s)
+		}
+	}
+	return out, nil
 }
 
 func isParamSeg(s string) bool { return strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") }
@@ -257,7 +376,16 @@ func nearestStaticBefore(segs []string, i int) string {
 // Rules (ADR-062 §1, resource→noun / method→verb):
 //   - trailing {param}      → item op: GET=describe, PATCH/PUT=update
 //   - trailing action verb  → action on the nearest preceding resource noun
-//   - trailing static noun  → collection: GET=list, POST=create
+//   - trailing collection   → collection: GET=list, POST=create
+//   - anything else         → NO COMMAND (see the note on listOnlyCollections)
+//
+// The last rule is the 2026-08-28 fix. "Anything else" used to fall into the
+// collection case, so an unrecognised trailing segment became a TOP-LEVEL
+// resource whose verb was `create` — `realm-id revoke create` to revoke a
+// service account, `realm-id import create` to import users. Thirteen such
+// groups shipped. Skipping is the conservative default: the operation stays
+// reachable through `realm-id api`, and `TestEverySpecSegmentIsClassified`
+// turns the skip into a red build rather than a silent hole.
 //
 // /admin/* paths are grouped under the `admin` command.
 func deriveCommand(method, path string) (group []string, verb string, ok bool) {
@@ -311,6 +439,15 @@ func deriveCommand(method, path string) (group []string, verb string, ok bool) {
 		}
 		v, _ := actionVerb(method, last)
 		return append(prefix, resource), v, true
+
+	case !isCollectionSeg(last):
+		// Neither a known action nor a collection noun. SKIP rather than
+		// invent: this branch used to fall through to the collection case
+		// below, which made the segment its own top-level resource with a
+		// `create` verb (`realm-id revoke create`). An absent command is
+		// recoverable via `realm-id api`; a confidently wrong one is not.
+		// `TestEverySpecSegmentIsClassified` fails while any path is here.
+		return nil, "", false
 
 	default: // trailing static noun → collection
 		switch method {
