@@ -70,9 +70,10 @@ warning against concurrent `auth login`); these are the code fixes.
 
 ## Broken today
 
-> ⚠️ **THIS SECTION HOLDS THREE OPEN ITEMS — read to the bottom.** They are
-> below the FIXED-notes, not above them: the vendored-spec version check, the
-> fourteen mis-derived `create` commands, and the missing `CHANGELOG.md`.
+> ⚠️ **THIS SECTION HOLDS ONE OPEN ITEM — read to the bottom.** It is below the
+> FIXED-notes, not above them: the vendored-spec version check. The mis-derived
+> `create` commands and the missing `CHANGELOG.md` were CLOSED 2026-08-28 and
+> are recorded at the bottom as struck records.
 >
 > **This banner said "THIS SECTION IS EMPTY" until 2026-08-28**, which stopped
 > being true on 2026-08-25 when those three were filed under it. It was written
@@ -189,27 +190,57 @@ clean 2026-07-28 and the item was removed; this line goes at the next sweep.)*
       diffing the tree, plus `TestTopLevelResourceGroupsAreReviewed` catching the
       subset of drift that changes the command surface.
 
-- [ ] **Fourteen commands are mis-derived as top-level "resources" whose verb is
-      `create`** — `cmd/realm-id/spec.go`, `deriveCommand`. A trailing static
-      segment is treated as a collection noun unless `actionVerb` names it, so
-      every action segment absent from that set becomes its own top-level
-      resource: `realm-id revoke create` revokes a service account,
-      `realm-id import create` imports users, and likewise `deactivate`,
-      `delink`, `disable`, `enable`, `hand-back`, `leave`, `pending`, `request`,
-      `reset-handle`, `revoke-all`, `tenant-choice`. Pre-dates ADR-097; found
-      2026-08-25 while diffing the tree for the `0.32.0` re-vendor, when the new
-      `/scopes/remove` path would have become the fourteenth. **Fixing one of
-      fourteen was tried and reverted** — it makes the tree less consistent while
-      reading as a fix. Each needs its own naming decision, and every rename is
-      breaking for a shipped binary, so this wants one deliberate pass.
-      Currently pinned as-is (and marked "not endorsed") by
-      `TestTopLevelResourceGroupsAreReviewed`.
+> ~~**Fourteen commands are mis-derived as top-level "resources" whose verb is
+> `create`**~~ — **CLOSED 2026-08-28**, in the one deliberate pass this item
+> asked for. All of them derive as `<parent collection> <action>` now:
+> `revoke create` → `service-accounts revoke`, `import create` → `users import`,
+> and so on for `deactivate`, `delink`, `disable`, `enable`, `hand-back`,
+> `leave`, `request`, `reset-handle`, `revoke-all`, `tenant-choice`, plus
+> `pending list` → `domains list-pending` (a filtered list, named like
+> `list-mine`). Old → new in full: `CHANGELOG.md` *Unreleased*; reasoning + RCA
+> in `DECISIONS.md` 2026-08-28.
+>
+> **The count in the heading was wrong in two directions, and the correction is
+> the finding.** Thirteen bogus GROUPS shipped, not fourteen — but sixteen spec
+> operations were affected, because `disable`, `enable` and `revoke` each appear
+> under two parents. Named after the segment instead of the parent, those pairs
+> COLLIDED, and `buildCommands`' "fewest path params wins" tie-break resolved
+> each by discarding one operation. `roles disable`, `roles enable` and
+> `sessions revoke` were not misnamed, they were **ABSENT**, and no test looked
+> at `dropped`. A missing allowlist entry deleted a capability, it did not just
+> mis-spell one. The tree goes 94 commands / 44 groups → 97 / 35.
+>
+> **What actually changed is the default, not the list.** `actionVerb` gained
+> the thirteen segments, but the durable half is that an unclassified trailing
+> segment now yields NO command instead of a guessed one, and
+> `TestEverySpecSegmentIsClassified` — subject list derived from the embedded
+> spec, with a positive control because "empty" is its pass condition — goes red
+> while any segment is unclassified. `TestTopLevelResourceGroupsAreReviewed` had
+> been *pinning* all thirteen with a "not endorsed" comment since 2026-08-25:
+> the guard worked, there was simply no rule for it to fail against, so the
+> defect looked exactly like a decision.
+>
+> Verified: `go test ./... -count=1` green (45 tests, 0 failures), `gofmt -l .`
+> and `go vet ./...` clean, tree diffed before/after. Five mutations, all caught
+> — dropping `revoke` from `actionVerb`; `pending` → `pending` instead of
+> `list-pending`; **deleting the unclassified-skip branch** (caught only by
+> `TestUnclassifiedTrailingSegmentIsSkippedNotInvented`, which is why that
+> synthetic-path test exists); dropping `permissions` from
+> `listOnlyCollections`; making the derived collection set empty.
+>
+> **NOT released.** Every rename breaks a script written against any of the
+> fourteen existing tags; tagging is a separate deliberate act.
 
-- [ ] **`cli/CHANGELOG.md` does not exist** — `DECISIONS.md`'s header and this
-      file's own preamble both point at one ("shipped items live in
-      `CHANGELOG.md` / git tags"), and there are twelve tags with no release
-      notes. Either write it going forward or correct both pointers to say git
-      tags are the only record. Not backfilled 2026-08-25: reconstructing twelve
-      releases from commit subjects yields a document that looks authoritative
-      and is not.
+> ~~**`cli/CHANGELOG.md` does not exist**~~ — **CLOSED 2026-08-28.** Written,
+> going forward only. It opens by saying so: the pre-existing tags are not
+> backfilled, and the file states why in its own text rather than leaving the
+> gap to be discovered. The first entry is the *Unreleased* command-rename break
+> above. Both pointers (`DECISIONS.md`'s header, this file's preamble) are now
+> true as written, so neither needed correcting.
+>
+> **The item's own count was stale: there are FOURTEEN tags, not twelve** —
+> `v0.2.0`–`v0.2.11`, `v0.3.0`, `v0.3.1`. It was written before the two `v0.3.x`
+> releases and never revised, which is the argument against backfilling from
+> memory stated by an item that was itself a memory. Recorded in the changelog's
+> preamble rather than silently corrected.
 
