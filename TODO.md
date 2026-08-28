@@ -70,11 +70,20 @@ warning against concurrent `auth login`); these are the code fixes.
 
 ## Broken today
 
-> ⚠️ **THIS SECTION IS EMPTY — everything below is a FIXED-note kept for its
-> findings.** Recorded 2026-08-21 because the heading alone reads as a live
-> pool of bugs, and it was mistaken for one during that day's cross-file sweep,
-> before the sweep actually reached the file. The open CLI work is the two
-> Device-flow DX items above.
+> ⚠️ **THIS SECTION HOLDS THREE OPEN ITEMS — read to the bottom.** They are
+> below the FIXED-notes, not above them: the vendored-spec version check, the
+> fourteen mis-derived `create` commands, and the missing `CHANGELOG.md`.
+>
+> **This banner said "THIS SECTION IS EMPTY" until 2026-08-28**, which stopped
+> being true on 2026-08-25 when those three were filed under it. It was written
+> on 2026-08-21 for the opposite failure — the heading alone reading as a live
+> pool of bugs when everything under it was fixed — and then survived the
+> additions unchanged. **A banner that tells a sweep to skip a section is a
+> claim with a date on it, and this one outlived its truth by three days**; it
+> is the same shape as the root `TODO.md` items stranded under a RETIRED
+> heading (umbrella `DECISIONS.md` 2026-08-28, TODO sweep). Keep it accurate or
+> delete it — a stale "nothing here" is worse than no banner, because it is
+> believed.
 
 > **FIXED 2026-08-06 — `platforms set-config` bound to GET or PATCH at random.**
 > `actionVerb` keyed on the trailing path segment alone, so the GET and the
