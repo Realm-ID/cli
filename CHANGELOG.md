@@ -23,7 +23,9 @@ first. Versions are the git tags that trigger `release.yml`.
 
 ---
 
-## Unreleased
+## v0.3.2 — the spec re-vendor for ADR-101's role set (2026-08-30)
+
+### Changes
 
 ### Changed — ADR-101: the role set is RealmID's, and one command disappears
 
