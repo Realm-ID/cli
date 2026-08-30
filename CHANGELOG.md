@@ -3,6 +3,20 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## v0.3.3 — the role vocabulary reaches the CLI (2026-08-30)
+
+- Spec re-vendored to issuer `0.37.0`, which adds the **`role-templates`**
+  resource (ADR-101 D1's write side): `create`, `list`, `update`.
+- Exposing it was a deliberate review decision, not a side effect of the
+  re-vendor — `TestTopLevelResourceGroupsAreReviewed` fails on any NEW resource
+  group until someone decides. The reasoning is recorded there: the surface is
+  base-realm-GATED rather than RI-private, so a partner reaching it gets an
+  honest `403` naming the ADR-097 replacement, and D1 exists precisely so
+  RealmID can add a role without a release — which an agent-first CLI is the
+  natural place to script.
+- No `delete` verb, matching `roles`: ADR-062 §5 skips a destructive DELETE that
+  is not a revocation.
+
 ## This file starts on 2026-08-28, and the fourteen releases before it are not in it
 
 `v0.2.0` through `v0.3.1` — fourteen tags — shipped with no release notes, and

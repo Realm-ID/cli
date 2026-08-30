@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-12 entries. Newest first.
+13 entries. Newest first.
 
+- [2026-08-30 — re-vendor to 0.37.0: a new resource group, exposed on purpose](#2026-08-30--re-vendor-to-0370-a-new-resource-group-exposed-on-purpose)
 - [2026-08-30 — re-vendor to 0.36.0: the ADR predicted a resource would disappear, and the binary says otherwise](#2026-08-30--re-vendor-to-0360-the-adr-predicted-a-resource-would-disappear-and-the-binary-says-otherwise)
 - [2026-08-28 — thirteen action segments were top-level "resources" with a `create` verb; the derivation now refuses to guess](#2026-08-28--thirteen-action-segments-were-top-level-resources-with-a-create-verb-the-derivation-now-refuses-to-guess)
 - [2026-08-27 — re-vendor to 0.33.0: the command tree moves in BOTH directions, and the §5 amendment loses its subject](#2026-08-27--re-vendor-to-0330-the-command-tree-moves-in-both-directions-and-the-5-amendment-loses-its-subject)
@@ -21,6 +22,27 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-08-30 — re-vendor to 0.37.0: a new resource group, exposed on purpose
+
+**What.** Spec re-vendored to issuer `0.37.0`. It carries ADR-101 D1's write
+side, so a NEW top-level resource group — `role-templates` — reached the binary:
+`create`, `list`, `update`.
+
+**Why it is exposed.** `TestTopLevelResourceGroupsAreReviewed` fails on any new
+group until a human decides, which is the whole point of that guard: a spec
+re-vendor must not be able to grow the CLI's surface silently. The decision here
+is to expose it, on the same reasoning that keeps `roles` after ADR-101 — the
+surface is base-realm-GATED, not RI-private. A partner who runs it gets an
+honest `403 role_authoring_retired` naming the ADR-097 replacement, which is a
+better outcome than a resource that simply is not there when RealmID's own
+operators need it. And D1 exists precisely so RealmID can add a role WITHOUT a
+release; an agent-first CLI is the natural place to script that.
+
+**Why there is no `delete`.** ADR-062 §5 skips a destructive DELETE that is not
+a revocation, so removing a template is not offered — exactly as `roles` offers
+no `delete`. Worth stating because its absence looks like a derivation gap and
+is not: the guard surfaced the group for review, and this is the review.
 
 ## 2026-08-30 — re-vendor to 0.36.0: the ADR predicted a resource would disappear, and the binary says otherwise
 

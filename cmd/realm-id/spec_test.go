@@ -402,7 +402,19 @@ func TestTopLevelResourceGroupsAreReviewed(t *testing.T) {
 		"integrations": true, "invitations": true, "login-attempts": true,
 		"mfa": true, "origins": true, "permissions": true, "platforms": true,
 		"roles": true, "scopes": true, "service-accounts": true,
-		"signing-keys": true, "sources": true, "sso-domains": true,
+		// "role-templates" ADDED by ADR-101 D1's write side (issuer, 2026-08-30).
+		// REVIEWED and deliberately EXPOSED, on the same reasoning that keeps
+		// `roles` above: the surface is base-realm-GATED, not RI-private, and a
+		// partner reaching it gets an honest 403 naming the ADR-097 replacement
+		// rather than a mystery. Exposing it is the point — D1 exists so that
+		// RealmID can add a role WITHOUT a release, and an agent-first CLI is
+		// the natural place to script that.
+		//
+		// Three verbs, not four: `delete` is absent because ADR-062 §5 skips a
+		// destructive DELETE that is not a revocation — the same reason `roles`
+		// has no `delete`. That is the rule working, not a gap.
+		"role-templates": true,
+		"signing-keys":   true, "sources": true, "sso-domains": true,
 		// "starter-roles" was REMOVED by ADR-101 D2/D3 (issuer, 2026-08-30).
 		// The endpoint opted a realm into the `admin`/`viewer` templates;
 		// `admin` is now part of the set every realm receives and `viewer` no

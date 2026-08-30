@@ -74,7 +74,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.36.0
+  version: 0.37.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -3086,6 +3086,130 @@ components:
         next_cursor: { type: string, nullable: true }
         total: { type: integer, nullable: true }
 
+    RoleTemplate:
+      type: object
+      description: |
+        One row of RealmID's role VOCABULARY (ADR-101 D1) — the recipe a realm's
+        role is stamped from. Not a role: a role belongs to a realm and has
+        holders; a template is what a role is created from.
+      properties:
+        id: { type: string, format: uuid }
+        level:
+          type: string
+          enum: [platform, tenant]
+          description: |
+            Part of the IDENTITY with `name`. The same name at both levels is
+            two different roles carrying different authority.
+        name: { type: string }
+        display_name: { type: string }
+        permissions:
+          type: array
+          items: { type: string }
+          description: |
+            ADR-074 catalog grants. Empty is meaningful and common — `owner` is
+            implicit-all resolved before any list is read, and `member` is
+            identity with no authority.
+        assignable_to:
+          type: array
+          items: { type: string, enum: [human, service] }
+          description: |
+            ADR-081 principal-kind constraint. Never empty — an empty set is an
+            unfinished row, not "any kind".
+        is_system:
+          type: boolean
+          description: The flag the stamped role lands with, which is what makes PATCH/DELETE on it answer system_role_immutable.
+        optional:
+          type: boolean
+          description: |
+            `false` means the template is part of the FLOOR every realm
+            receives, and creating it FANS OUT. `true` means it is only created
+            when named. Deliberately separate from `is_system` — "cannot be
+            edited" and "is not created unless asked for" are different claims.
+        created_at: { type: integer, description: "Unix seconds." }
+        updated_at: { type: integer, description: "Unix seconds." }
+
+    RoleTemplateList:
+      type: object
+      properties:
+        role_templates:
+          type: array
+          items: { $ref: '#/components/schemas/RoleTemplate' }
+
+    CreateRoleTemplateRequest:
+      type: object
+      required: [level, name, assignable_to]
+      properties:
+        level: { type: string, enum: [platform, tenant] }
+        name:
+          type: string
+          description: Lowercase alphanumeric + `_-`, 2-32 chars — the same rule a realm role name obeys, because this becomes one.
+        display_name:
+          type: string
+          description: Defaulted from `name` when omitted.
+        permissions:
+          type: array
+          items: { type: string }
+          description: ADR-074 catalog grants. An unknown string is a 400 — a template fans out, so a typo here would reach every realm at once.
+        assignable_to:
+          type: array
+          items: { type: string, enum: [human, service] }
+          description: Required and non-empty (ADR-081 § Amendment 2).
+        is_system: { type: boolean, default: false }
+        optional:
+          type: boolean
+          default: false
+          description: "`false` (the default) FANS OUT to every realm at this level."
+
+    RoleTemplateCreated:
+      type: object
+      properties:
+        role_template: { $ref: '#/components/schemas/RoleTemplate' }
+        realms_stamped:
+          type: integer
+          description: |
+            How many realm role rows the fan-out created. `0` for an optional
+            template (which does not fan out) and for a floor template every
+            realm already held.
+
+    PatchRoleTemplateRequest:
+      type: object
+      description: |
+        Every field optional. An OMITTED key preserves the stored value; a sent
+        value replaces it. `level` and `name` are absent on purpose — they are
+        the identity and are immutable.
+      properties:
+        display_name: { type: string }
+        permissions:
+          type: array
+          items: { type: string }
+        assignable_to:
+          type: array
+          items: { type: string, enum: [human, service] }
+        is_system: { type: boolean }
+        optional: { type: boolean }
+
+    RoleTemplatePatched:
+      type: object
+      properties:
+        role_template: { $ref: '#/components/schemas/RoleTemplate' }
+        drifted_realms:
+          type: integer
+          description: |
+            Realms whose stamped role no longer matches this template. An edit
+            does NOT propagate, so this is the drift the edit just created.
+            **`-1` means the count could not be taken — never "none".**
+
+    RoleTemplateDeleted:
+      type: object
+      properties:
+        status: { type: string, example: deleted }
+        realms_still_holding:
+          type: integer
+          description: |
+            Realms still holding a role stamped from the deleted template. The
+            vocabulary row is gone; those roles and their holders are not.
+            **`-1` means the count could not be taken.**
+
     SigningKeysResponse:
       type: object
       description: Owner-scoped view of the realm's signing keyring + rotation policy.
@@ -5599,6 +5723,148 @@ paths:
           description: invalid_role_name | display_name_required | unknown_permission (ADR-074) | unknown_mfa_method (ADR-075)
         '409':
           description: role_exists
+
+  /platforms/{id}/role-templates:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Platform Admin]
+      summary: List RealmID's role vocabulary (ADR-101 D1)
+      description: |
+        RealmID's own role VOCABULARY — the recipes a realm's roles are stamped
+        from — not one realm's roles. Distinct from `/platforms/{id}/roles`,
+        which lists what a single realm holds.
+
+        **Base realm only.** Gated by the same rule as role authoring (ADR-101
+        D4): a non-base realm gets `403 role_authoring_retired`. A partner's
+        product roles are ADR-097 opaque scopes and are never stored here.
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: level
+          schema: { type: string, enum: [platform, tenant] }
+          description: |
+            Restrict to one level. Omitted returns both. `(level, name)` is the
+            identity — the same name at both levels is two different roles with
+            different authority (a platform `admin` runs a realm; a tenant
+            `admin` runs one org).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleTemplateList' }
+        '403':
+          description: role_authoring_retired (not the base realm)
+        '501':
+          description: role_templates_unavailable (no writable vocabulary store wired)
+    post:
+      tags: [Platform Admin]
+      summary: Add a role to RealmID's vocabulary (ADR-101 D1)
+      description: |
+        Adds a role to RealmID's administrative vocabulary. This is what makes
+        "RealmID adds a role" a console action rather than a migration.
+
+        **A non-optional (floor) template FANS OUT**: it is stamped into every
+        realm governed at its level, skipping realms that already hold the name.
+        `realms_stamped` reports how many rows that created. An `optional: true`
+        template does not fan out — optional means "created only when named".
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRoleTemplateRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleTemplateCreated' }
+        '400':
+          description: invalid_level | invalid_role_template | assignable_to_required | unknown_permission (ADR-074)
+        '403':
+          description: role_authoring_retired (not the base realm)
+        '409':
+          description: role_template_exists (that level and name already exist)
+        '501':
+          description: role_templates_unavailable
+
+  /platforms/{id}/role-templates/{templateId}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: templateId
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Platform Admin]
+      summary: Edit a role template (ADR-101 D1)
+      description: |
+        Changes the RECIPE only. Realms that already hold a role stamped from
+        this template keep exactly what they were stamped with — **an edit does
+        not propagate**. The alternative would let one call widen authority
+        across every realm at once, which is a worse failure than drift a reader
+        can see.
+
+        `drifted_realms` reports how many realms now hold something different
+        from the template. **`-1` means the count could not be taken**, never
+        "none".
+
+        `level` and `name` are the IDENTITY and cannot be changed — a rename is
+        a delete plus a create, and conflating them would orphan every role
+        already stamped from the old name.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchRoleTemplateRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleTemplatePatched' }
+        '400':
+          description: role_template_identity_immutable | invalid_role_template | assignable_to_required | unknown_permission
+        '403':
+          description: role_authoring_retired (not the base realm)
+        '404':
+          description: role_template_not_found
+        '501':
+          description: role_templates_unavailable
+    delete:
+      tags: [Platform Admin]
+      summary: Remove a role from RealmID's vocabulary (ADR-101 D1)
+      description: |
+        Removes the RECIPE. Roles already stamped from it **keep their rows and
+        their holders**: removing a role from a realm is a membership change
+        that needs a reviewed holder remap, not a side effect of tidying a
+        vocabulary row.
+
+        `realms_still_holding` reports how many realms hold a role stamped from
+        the deleted template, so the orphan is stated rather than discovered.
+        **`-1` means the count could not be taken.**
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleTemplateDeleted' }
+        '403':
+          description: role_authoring_retired (not the base realm)
+        '404':
+          description: role_template_not_found
+        '501':
+          description: role_templates_unavailable
 
   /platforms/{id}/roles/{roleId}:
     parameters:
