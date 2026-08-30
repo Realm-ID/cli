@@ -18,6 +18,32 @@ info:
     invitations, and `/tenants/{id}/service-accounts` (ADR-071)). Clients
     should accept the whole `2xx` class; the RealmID SDKs already do.
 
+    **This document is served by the running service**, anonymously, at
+    `GET /.well-known/openapi.json`, with a Swagger UI at `/.well-known/swagger`
+    (GoFr renders both from `static/openapi.json`, generated from this file at
+    build time by `tools/openapi-json` — this YAML is the source of truth and the
+    JSON is never committed). It used to be served nowhere at all, while
+    `realmid.dev/docs` linked a `swagger.yaml` path that answered 404.
+
+    **Ignored-field warning (any write endpoint).** A request body key that the
+    endpoint does not accept is DISCARDED — it always was — but the response now
+    carries a `Warning` header naming it:
+
+        Warning: 299 realmid "ignored unknown fields: allowed_domains"
+
+    RFC 9110 §5.5, warn-code 299. It is a DIAGNOSTIC and never changes the
+    outcome: the request succeeds or fails exactly as it did before, and nothing
+    is rejected for being unknown. Treat its ABSENCE as "nothing to report or
+    could not tell", never as "every field was honoured" — non-JSON bodies are
+    not inspected, and only TOP-LEVEL keys are compared (descending into a
+    free-form object such as `custom_claims` would flag every key it exists to
+    carry). At most 10 names are listed, then `...`.
+
+    It exists because the opposite failure has now happened twice in one
+    handler: `signup_mode` was documented, sent by all three SDKs, and bound by
+    nothing for months; `allowed_domains` was removed by ADR-094 R3 and went on
+    being accepted. If you are integrating, log this header.
+
     Retired in this release (returned 404):
     `/auth/select-tenant`, `/auth/token/switch`, `/auth/user-token`,
     `/auth/cross-platform-token`, and the `choice_token` machinery.
@@ -48,7 +74,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.33.0
+  version: 0.36.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -83,8 +109,7 @@ tags:
       (a service JWT scoped to the base realm OR a user JWT whose tenant
       is the base realm's admin tenant with role=owner). Customer
       partners get 403 even on the GET routes — these are surfaces RI
-      ops uses, not partner self-service. Spec lives in
-      `ui/web/docs/v2-handoff.md` G3.3-G3.5 + `ui/TODO.md` decision #15.
+      ops uses, not partner self-service.
 
 components:
   securitySchemes:
@@ -1425,14 +1450,14 @@ components:
       type: object
       required: [domain]
       properties:
-        domain: { type: string, example: automahn.com }
+        domain: { type: string, example: acme.example }
 
     ClaimDomainResponse:
       type: object
       properties:
         domain: { type: string }
         status: { type: string, enum: [pending, verified] }
-        dns_record_name: { type: string, example: _realmid-verification.automahn.com }
+        dns_record_name: { type: string, example: _realmid-verification.acme.example }
         dns_record_value: { type: string }
 
     PendingDomain:
@@ -1443,7 +1468,7 @@ components:
       properties:
         domain: { type: string }
         status: { type: string, enum: [pending] }
-        dns_record_name: { type: string, example: _realmid-verification.automahn.com }
+        dns_record_name: { type: string, example: _realmid-verification.acme.example }
         dns_record_value: { type: string }
         created_at: { type: integer, format: int64 }
         expires_at: { type: integer, format: int64 }
@@ -2032,9 +2057,10 @@ components:
             ADR-078 — when true, a login token that carried a provider-native
             MFA proof (google/microsoft/firebase only) satisfies the GENERIC MFA
             requirement (the ADR-075 floor + org policy) for that session,
-            removing the double-challenge for federated users. It NEVER satisfies
-            a role's `required_mfa_methods`. Default false = fail-closed (RI always
-            challenges). Surfaced on GET /platforms/mine.
+            removing the double-challenge for federated users. Default false =
+            fail-closed (RI always challenges). Surfaced on GET /platforms/mine.
+            (Before ADR-101 this also never satisfied a role's
+            `required_mfa_methods`; that per-role floor no longer exists.)
         provider_mfa_ttl_seconds:
           type: integer
           minimum: 0
@@ -2075,9 +2101,9 @@ components:
             Gates `POST /auth/mfa/verify` with `method=otp`
             (two-factor: first-factor login → manager-issued OTP as
             second factor). Default false. Per-user activation also
-            requires the user (or one of the user's role assignments)
-            to be enrolled in `otp` — see `users.mfa_methods`
-            and `roles.required_mfa_methods`.
+            requires the user to be enrolled in `otp` — see
+            `users.mfa_methods`. (The per-role `required_mfa_methods` that used
+            to be unioned in here was retired by ADR-101.)
 
         # ---- ADR-094 D4: per-org domain SSO -------------------------------
         domain_sso:
@@ -2576,10 +2602,11 @@ components:
           type: array
           items: { type: string, enum: [totp, otp] }
           description: |
-            Per-user MFA enrollment (v0.6.0). When non-empty (or when
-            unioned with the user's role's `required_mfa_methods` is
-            non-empty), the first-factor login response gates with
-            `mfa_required: true` and `methods[]` listing the union.
+            Per-user MFA enrollment (v0.6.0). When non-empty, the first-factor
+            login response gates with `mfa_required: true` and `methods[]`
+            listing the enrolled methods. (Until ADR-101 this was unioned with
+            the user's role's `required_mfa_methods`; that per-role floor is
+            gone, and zero realms ever configured one.)
             TOTP confirm/disable mirrors into this array; `otp`
             entries are added/removed by the partner via the user
             patch surface.
@@ -3027,19 +3054,6 @@ components:
         disabled_at:
           type: integer
           description: "Unix seconds when the role was disabled; omitted when enabled."
-        required_mfa_methods:
-          type: array
-          items: { type: string, enum: [totp, otp] }
-          description: |
-            Per-role MFA requirement (v0.6.0; **writable** since ADR-075). At
-            login time the auth server unions this with the user's `mfa_methods`
-            and filters by the realm-enabled methods; if the result is non-empty
-            the switch-tenant response gates on MFA (a monotonic floor — a role
-            can only add a requirement, never remove one). Only the two real
-            methods (`totp`, `otp`) are accepted; unknown/unsupported methods
-            (e.g. `webauthn`, `sms`) return 400 `unknown_mfa_method`. AutoMahn's
-            `sales_agent` role sets this to `["otp"]` so every SA auto-gates
-            without per-user toggles.
         assignable_to:
           type: array
           items: { type: string, enum: [human, service] }
@@ -3059,21 +3073,6 @@ components:
           description: |
             ADR-081 §2.5 — the role those holders were migrated to. Present only
             alongside `migrated_holders`.
-        can_invite_roles:
-          type: array
-          items: { type: string }
-          description: |
-            ADR-076 WP4 invitation **scope**: the role names a holder of this
-            role may invite new members at (create only). Orthogonal to the
-            `invitations:manage` **capability** — a member may create an
-            invitation only if their role holds `invitations:manage` AND the
-            target role is in this list (owner + a realm M2M principal are
-            implicit-all and bypass the scope). `owner` is never a valid entry
-            (ownership moves via transfer, not invitation) — writes reject it
-            with `400 owner_not_invitable`; an unknown role name returns
-            `400 unknown_invite_role`. The seeded `admin` role carries every
-            non-owner, non-bot role name (back-compat for its
-            `invitations:manage`). Always an array (never null).
         created_at: { type: integer, description: "Unix seconds." }
         updated_at: { type: integer, description: "Unix seconds." }
 
@@ -3180,19 +3179,6 @@ components:
         permissions:
           type: array
           items: { type: string }
-        required_mfa_methods:
-          type: array
-          items: { type: string, enum: [totp, otp] }
-          description: |
-            Per-role MFA requirement (v0.6.0). Defaults to `[]`.
-        can_invite_roles:
-          type: array
-          items: { type: string }
-          description: |
-            ADR-076 WP4 invitation scope (defaults to `[]`). Each entry must be
-            a known non-owner role name in the realm (`owner` → 400
-            `owner_not_invitable`; unknown → 400 `unknown_invite_role`). Inert
-            unless the role also holds `invitations:manage`.
         assignable_to:
           type: array
           items: { type: string, enum: [human, service] }
@@ -3216,17 +3202,6 @@ components:
         permissions:
           type: array
           items: { type: string }
-        required_mfa_methods:
-          type: array
-          items: { type: string, enum: [totp, otp] }
-          description: |
-            Per-role MFA requirement (v0.6.0). Send `[]` to clear.
-        can_invite_roles:
-          type: array
-          items: { type: string }
-          description: |
-            ADR-076 WP4 invitation scope. Send `[]` to clear. Same validation as
-            create (`owner_not_invitable` / `unknown_invite_role`).
         assignable_to:
           type: array
           items: { type: string, enum: [human, service] }
@@ -5570,70 +5545,6 @@ paths:
                         resource: { type: string, example: users }
                         action:   { type: string, example: manage }
                         label:    { type: string, example: Manage users (role, status, contacts) }
-  /platforms/{id}/starter-roles:
-    parameters:
-      - in: path
-        name: id
-        required: true
-        schema: { type: string, format: uuid }
-    post:
-      tags: [Platform Admin]
-      summary: Opt into RealmID's starter role templates
-      description: |
-        Creates the named starter templates (`admin`, `viewer`) in this realm's
-        catalog, pre-filled with their ADR-074 permission sets — a shortcut for
-        authoring them by hand in the role editor.
-
-        Starter roles are **opt-in as of issuer v0.54.0**. A freshly-created
-        realm holds only the three system rows (`owner`, `member`,
-        `platform_api`); before v0.54.0 `admin` and `viewer` were seeded
-        unconditionally, which handed every realm a 23-permission operator role
-        it never asked for and created the name partner role-imports most often
-        collide with. The same opt-in is available at creation time via
-        `starter_roles` on `POST /platforms`.
-
-        Idempotent, and **never destructive**: seeding is ON CONFLICT DO
-        NOTHING, so a name the realm already holds — whether from an earlier
-        call or a partner-authored role that happens to be called `admin` — is
-        left completely untouched, with its own permissions. The response
-        echoes the rows that now exist under the requested names, so a caller
-        can see whether a pre-existing role was preserved.
-
-        **Owner-only (ADR-091 D3).** `roles:manage` was RETIRED from the
-        permission catalog: authority over a realm's role vocabulary is not
-        delegable, because a role that can edit roles can widen itself. This is
-        an explicit owner-pointer check, not an unmatchable permission string.
-      security: [{ BearerAccess: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [starter_roles]
-              properties:
-                starter_roles:
-                  type: array
-                  description: |
-                    Subset of the offered templates. An unknown name is
-                    rejected with 400 `unknown_starter_role` rather than
-                    silently skipped, so a typo cannot leave an owner believing
-                    they provisioned a role that does not exist.
-                  items: { type: string, enum: [admin, viewer] }
-      responses:
-        '200':
-          description: The roles now present under the requested names.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/RoleObject' }
-        '400':
-          description: unknown_starter_role / missing_fields
-        '403':
-          description: '`forbidden` — realm owner only (ADR-091 D3)'
-        '404':
-          description: realm_not_found
   /platforms/{id}/roles:
     parameters:
       - in: path
@@ -5771,12 +5682,15 @@ paths:
       summary: Atomically rename a custom role (ADR-040)
       description: |
         Renames the catalog row AND every reference to it inside the platform's
-        realm, in one transaction: `users.role`, `invitations.role` and every
-        other role's `can_invite_roles`.
+        realm, in one transaction: `users.role` and `invitations.role`.
 
-        `can_invite_roles` and `invitations.role` were **added in ADR-097** (D1
-        and D2). Before that, renaming a role silently stripped "may invite at
-        this tier" from every role that had it — a CLOSED failure, so nothing
+        **Base-realm only since ADR-101 D4** — a partner cannot author a role,
+        so this answers `403 role_authoring_retired` for every other realm.
+        The `can_invite_roles` leg of the cascade is gone with the column.
+
+        `invitations.role` was **added in ADR-097** (D2). Before that, renaming
+        a role silently stripped "may invite at this tier" from every role that
+        had it — a CLOSED failure, so nothing
         errored and nothing logged.
 
         System roles return 400 `system_role_immutable`. Target name collision
@@ -6754,6 +6668,13 @@ paths:
           description: |
             Import report. `committed:true` = all rows written;
             `committed:false` = validation rejected the file, nothing written.
+
+            Per-row `error` codes include `forbidden_role` — the caller may not
+            seat a principal at that row's role. Emitted when the row names a
+            role that confers administrative authority and the caller is not the
+            tenant OWNER (ADR-101 D6), as well as for the pre-existing
+            `owner`/`platform_api` refusal. Because the import is
+            whole-file-atomic, one such row refuses the whole batch.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ImportUsersResponse' }
@@ -6880,7 +6801,13 @@ paths:
         '400':
           description: invalid_role | use_transfer_owner
         '403':
-          description: forbidden (caller is not an owner of the tenant)
+          description: >-
+            forbidden (caller lacks users:manage on the tenant) |
+            role_owner_only — only the tenant OWNER may seat a principal at a
+            role that confers administrative authority, i.e. one holding any
+            permission whose action is not "read" (ADR-101 D6). A non-owner with
+            users:manage may still re-role between roles that confer no
+            authority.
         '404':
           description: user_not_found
         '409':
@@ -6949,9 +6876,19 @@ paths:
         this org that holds the chosen role. Gated on `org_grants:manage` (only
         the org owner by default). RI hosts no consent screen — this endpoint IS
         the consent surface, rendered by the partner's own console (ADR-083 §5).
-        The role MUST be authored specifically for service use — its
-        `assignable_to` must be exactly `["service"]` (ADR-082 §7.1); a role that
-        merely permits service (e.g. `["human","service"]`) is rejected.
+
+        **BREAKING (ADR-101 D7).** `role_id` is GONE. An installation now STATES
+        the authority it confers, as a non-empty `permissions` array of ADR-074
+        catalog strings. Naming a role is no longer possible — under ADR-101 D1
+        no role in either set satisfies the old install predicate — and stating
+        the grant also removes post-approval drift: there is no mutable role row
+        left to be disabled, re-typed or deleted out from under the edge.
+
+        The grant is bounded by the INSTALLING actor's own authority: the tenant
+        owner may grant anything in the catalog, and anyone else may grant only
+        what they themselves hold. `org_grants:manage` is delegable, so without
+        that bound a non-owner holding it could install an integration carrying
+        `users:manage` and act through the brokered principal.
       security: [{ BearerAccess: [] }]
       requestBody:
         required: true
@@ -6959,15 +6896,26 @@ paths:
           application/json:
             schema:
               type: object
-              required: [integration_id, role_id]
+              required: [integration_id, permissions]
               properties:
                 integration_id: { type: string, format: uuid }
-                role_id: { type: string, format: uuid, description: 'a role whose assignable_to is exactly ["service"]' }
+                permissions:
+                  type: array
+                  minItems: 1
+                  items: { type: string }
+                  description: >-
+                    ADR-074 catalog permissions this installation confers on the
+                    brokered principal. Non-empty; stored sorted and
+                    de-duplicated. Must not exceed the installing actor's own
+                    authority.
+                  example: ["users:read", "audit:read"]
       responses:
         '201':
           description: Installed
         '400':
-          description: invalid_integration_id | invalid_role_id | integration_disabled | invalid_role | role_not_installable | role_disabled | role_not_service_typed
+          description: invalid_integration_id | integration_disabled | permissions_required | unknown_permission
+        '403':
+          description: permissions_exceed_grantor — you may not grant a permission you do not hold
         '404':
           description: integration_not_found | tenant_not_found
         '409':
@@ -7039,6 +6987,15 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Invitation' }
+        '400':
+          description: owner_not_invitable — ownership moves via transfer, not invitation
+        '403':
+          description: >-
+            role_owner_only — only the tenant OWNER may seat a principal at a
+            role that confers administrative authority (ADR-101 D6). The
+            narrower ADR-076 WP4 `can_invite_roles` scope that also guarded this
+            path was retired by ADR-101: it bounded one of four seating paths
+            while D6 bounds all four.
 
   /tenants/{id}/invitations/{inviteId}:
     delete:
@@ -7602,6 +7559,14 @@ paths:
         this session (a switch re-pins within the session realm and a
         foreign-realm tenant fails MintForTenant with not_a_member).
 
+        `realm_id` names the realm each membership's TENANT LIVES IN.
+        It is NOT a synonym for `platform_id`: on an admin tenant that
+        field is the realm being ADMINISTERED, while the tenant itself
+        lives in the base realm (ADR-015). Every membership in one
+        response is in the session's realm today — that is this
+        endpoint's filter, not a property of the data, so read the field
+        rather than assuming it.
+
         `permissions` (ADR-090) is the caller's FULLY RESOLVED effective
         permission set for that membership — the role's stored grant, or
         the whole catalog when the caller owns the tenant, intersected
@@ -7637,10 +7602,25 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [tenant_id, platform_id, display_name, role, is_owner, is_admin_tenant, permissions]
+                      required: [tenant_id, platform_id, realm_id, display_name, role, is_owner, is_admin_tenant, permissions]
                       properties:
                         tenant_id: { type: string, format: uuid }
                         platform_id: { type: string, format: uuid }
+                        realm_id:
+                          type: string
+                          format: uuid
+                          description: >-
+                            The realm this membership's TENANT LIVES IN
+                            (`tenants.realm_id`) — which `platform_id` cannot
+                            express. For an ordinary org the two coincide; for
+                            an ADMIN tenant they do not, because `platform_id`
+                            names the realm that tenant ADMINISTERS while the
+                            tenant itself lives in the base realm (ADR-015).
+                            Use this, not an inference from `is_admin_tenant`,
+                            to decide whether a platform bearer you hold can act
+                            on the tenant: compare it against the realm your own
+                            bearer was issued in (ADR-097 §E refuses a mint
+                            across realms). Always present.
                         display_name: { type: string }
                         role: { type: string }
                         owner_user_id:

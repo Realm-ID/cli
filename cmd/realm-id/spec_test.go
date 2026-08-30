@@ -403,7 +403,19 @@ func TestTopLevelResourceGroupsAreReviewed(t *testing.T) {
 		"mfa": true, "origins": true, "permissions": true, "platforms": true,
 		"roles": true, "scopes": true, "service-accounts": true,
 		"signing-keys": true, "sources": true, "sso-domains": true,
-		"starter-roles": true, "stats": true, "tenants": true,
+		// "starter-roles" was REMOVED by ADR-101 D2/D3 (issuer, 2026-08-30).
+		// The endpoint opted a realm into the `admin`/`viewer` templates;
+		// `admin` is now part of the set every realm receives and `viewer` no
+		// longer exists, so it could only ever refuse. Deleted server-side
+		// rather than left returning 400, so it answers 404 and its absence is
+		// anonymously provable — the ADR-100 precedent.
+		//
+		// `roles` SURVIVES, deliberately: ADR-101's own consequences list said
+		// the resource would disappear, and that is wrong. Authoring is
+		// base-realm-GATED, not deleted, and `GET /roles` plus disable/enable
+		// stay open to every realm owner — so the resource keeps four verbs and
+		// the CLI keeps offering them.
+		"stats": true, "tenants": true,
 		"user-api-keys": true, "users": true,
 
 		// Parents of a trailing action segment, reached only that way. They are

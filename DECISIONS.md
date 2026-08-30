@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-11 entries. Newest first.
+12 entries. Newest first.
 
+- [2026-08-30 — re-vendor to 0.36.0: the ADR predicted a resource would disappear, and the binary says otherwise](#2026-08-30--re-vendor-to-0360-the-adr-predicted-a-resource-would-disappear-and-the-binary-says-otherwise)
 - [2026-08-28 — thirteen action segments were top-level "resources" with a `create` verb; the derivation now refuses to guess](#2026-08-28--thirteen-action-segments-were-top-level-resources-with-a-create-verb-the-derivation-now-refuses-to-guess)
 - [2026-08-27 — re-vendor to 0.33.0: the command tree moves in BOTH directions, and the §5 amendment loses its subject](#2026-08-27--re-vendor-to-0330-the-command-tree-moves-in-both-directions-and-the-5-amendment-loses-its-subject)
 - [2026-08-25 (later+1) — the 9.7 MB binary is untracked, and the ignore pattern the TODO proposed is a trap](#2026-08-25-later1--the-97-mb-binary-is-untracked-and-the-ignore-pattern-the-todo-proposed-is-a-trap)
@@ -20,6 +21,41 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-08-30 — re-vendor to 0.36.0: the ADR predicted a resource would disappear, and the binary says otherwise
+
+**What happened.** ADR-101's consequences list states: "**The `roles` resource
+disappears from the CLI** via the spec re-vendor, since CLI commands derive from
+the embedded swagger at runtime." The re-vendor happened. The resource did not
+disappear.
+
+**Why the prediction was wrong.** ADR-101 D4 gates authoring on the base realm;
+it does not delete the routes. `POST /platforms/{id}/roles` and its three
+siblings still exist and now answer `403 role_authoring_retired` outside
+RealmID's own realm, while `GET /roles` and `disable`/`enable` are untouched and
+open to every realm owner. Only `POST /platforms/{id}/starter-roles` was
+actually deleted, so only `starter-roles create` left the tree.
+
+**Decision — the CLI keeps them.** A tree that hid four commands the API still
+serves would be lying about the contract, and this CLI's whole design is that
+the tree IS the contract: it derives at runtime precisely so it cannot drift
+from what the server offers. A user who runs `roles create` against a partner
+realm should get the server's own `403` with its own explanation, which names
+the replacement (product roles reach RealmID as ADR-097 scopes), rather than
+"unknown command".
+
+**The guard is what surfaced this, and it did so as a REFUSAL.**
+`TestTopLevelResourceGroupsAreReviewed` failed with "resource group
+`starter-roles` DISAPPEARED from the binary. A removal breaks callers silently;
+confirm it was intended, then drop it from this list." That is the check working
+exactly as designed — a re-vendor is a bulk import of someone else's decisions,
+and the one failure mode worth blocking on is a capability vanishing without
+anybody noticing. Confirming the removal is a two-line edit; NOT being told would
+have been a silent break.
+
+**Recorded in the list rather than only here**, with the `roles` non-removal
+next to it, because the next person reading ADR-101 will look for the resource
+to be gone and needs to find out why it is not.
 
 ## 2026-08-28 — thirteen action segments were top-level "resources" with a `create` verb; the derivation now refuses to guess
 

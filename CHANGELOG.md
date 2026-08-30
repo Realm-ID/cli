@@ -25,6 +25,34 @@ first. Versions are the git tags that trigger `release.yml`.
 
 ## Unreleased
 
+### Changed — ADR-101: the role set is RealmID's, and one command disappears
+
+Spec re-vendor to issuer `0.36.0`. The command tree derives from the embedded
+OpenAPI contract at runtime, so this is what actually changed in the binary:
+
+- **`starter-roles create` is GONE.** It opted a realm into the `admin`/`viewer`
+  templates. `admin` is now part of the set every realm receives and `viewer`
+  no longer exists, so the endpoint could only refuse; it was deleted
+  server-side rather than left returning 400, and answers `404`.
+
+- **`roles` SURVIVES with all four verbs**, and that is worth stating because
+  ADR-101's own consequences list predicted the resource would disappear. It
+  does not: authoring is base-realm-GATED, not deleted. `roles create` /
+  `update` / `delete` / `rename` still exist and now answer
+  `403 role_authoring_retired` for every realm but RealmID's own, while
+  `roles list` and `roles disable` / `enable` are unchanged and open to every
+  realm owner. A CLI that hid them would be lying about the API.
+
+- **`roles create` and `roles update` no longer accept `--field
+  required_mfa_methods=…` or `--field can_invite_roles=…`.** Both fields left
+  the contract with the columns behind them; the issuer now ANNOUNCES an ignored
+  body key via a `Warning: 299` header (issuer v0.108.0), so a stale script gets
+  told rather than silently dropped.
+
+- **`integration-installations create` takes `permissions`, not `role_id`.** An
+  installation states the authority it confers as an array of ADR-074 catalog
+  permissions, bounded by the installing actor's own authority (ADR-101 D7).
+
 ### Changed — BREAKING: sixteen generated commands are renamed
 
 The typed command tree derives `<resource> <verb>` from the embedded OpenAPI
