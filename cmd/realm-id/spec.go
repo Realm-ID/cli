@@ -136,6 +136,29 @@ func actionVerb(method, seg string) (string, bool) {
 		return "set-status", true
 	case "owner":
 		return "set-owner", true
+	case "password":
+		// Added 2026-09-01 with the spec 0.38.0 re-vendor (ADR-104). Same shape
+		// as `role`/`status`/`owner` above: a PUT that REPLACES a named
+		// sub-resource of the parent, so `PUT /me/password` is
+		// `me set-password`.
+		//
+		// Exposing it is a review decision, not a side effect. It is the SELF
+		// route — the caller changes their own password and must present
+		// `current_password` unless none is set — so the CLI cannot use it to
+		// act on anyone else, and an agent holding the session already holds
+		// the authority it confers.
+		return "set-password", true
+	case "credentials":
+		// Added 2026-09-01 (ADR-104). The ADMIN counterpart:
+		// `PUT /tenants/{tid}/users/{uid}/credentials` is
+		// `users set-credentials`.
+		//
+		// ⚠️ What it writes is an ASSERTION, not a proof — the credential
+		// carries `must_change`, and the holder's next login answers
+		// `403 password_must_change` until they replace it. An operator
+		// reaching for this to "log in as" somebody does not get that, by
+		// design, and the CLI must not describe it as a way in.
+		return "set-credentials", true
 	}
 	return "", false
 }

@@ -3,6 +3,39 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## v0.3.4 — credential commands reach the CLI (2026-09-01)
+
+Re-vendors the issuer spec `0.37.0` → `0.38.0` (ADR-102/103/104/105), which
+prod has been serving since issuer `v0.116.0`. As with the last two releases the
+CLI is tagged AFTER the deploy, so prod served the surface before the CLI
+described it.
+
+### Added — `me set-password` and `users set-credentials` (ADR-104)
+
+The re-vendor introduced two trailing segments the derivation could not
+classify, and `TestEverySpecSegmentIsClassified` failed rather than quietly
+dropping them — which is the guard working. An unclassified operation is ABSENT
+from the typed tree and reachable only through `realm-id api`.
+
+Both are classified the same way as the existing `role` / `status` / `owner`
+segments: a PUT that REPLACES a named sub-resource of its parent.
+
+- `me set-password` — `PUT /me/password`. The SELF route: the caller changes
+  their own password and must present `current_password` unless none is set, so
+  the CLI cannot use it to act on anyone else, and an agent holding the session
+  already holds the authority it confers.
+- `users set-credentials` — `PUT /tenants/{tid}/users/{uid}/credentials`, the
+  admin counterpart. ⚠️ What it writes is an ASSERTION, not a proof: the
+  credential carries `must_change` and the holder's next login answers
+  `403 password_must_change` until they replace it. An operator reaching for
+  this to "log in as" somebody does not get that, by design.
+
+### Unchanged — no command for the rest of the release
+
+ADR-102's `product_roles` is a request FIELD on `/auth/token`, not a route;
+ADR-103's `delivery_mode` likewise. ADR-105 removes wire fields and adds
+nothing. None of them grows the command tree, and none needed a decision.
+
 ## v0.3.3 — the role vocabulary reaches the CLI (2026-08-30)
 
 - Spec re-vendored to issuer `0.37.0`, which adds the **`role-templates`**

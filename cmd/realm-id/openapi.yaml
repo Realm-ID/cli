@@ -74,7 +74,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.37.0
+  version: 0.38.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -341,8 +341,8 @@ components:
         its announced `Sunset: 2026-08-01`. A body carrying only
         `method` now 400s `missing_grant_type`; send `grant_type`
         (+ `provider` for `provider_token`). `grant_type=password` is
-        reserved and unconditionally 400s `unknown_method`
-        (ADR-042 slot).
+        **IMPLEMENTED as of ADR-104** — it filled the ADR-042 slot and no
+        longer 400s `unknown_method`.
 
         ADR-046 (still applies under `provider_token`/`google`):
         `tenant_id` is required on tenant-scoped origins so the
@@ -475,40 +475,79 @@ components:
       type: object
       required: [grant_type, identifier, presented]
       description: |
-        **Reserved, not implemented.** `grant_type=password` is the
-        ADR-042 native u/p schema slot: the grant name is recognised on
-        the wire, but there is no native password verifier — the handler
-        **unconditionally returns `400 unknown_method`**
-        ("grant_type=password not enabled"). The field shapes below are
-        the reserved contract for when it ships. Inbound bearer:
-        platform access JWT.
+        **ADR-104 — native username/password, tenant-scoped.** Fills the
+        ADR-042 u/p slot, which was reserved on the wire and unimplemented
+        until this release. Inbound bearer: platform access JWT.
+
+        Credentials are Argon2id (issuer-side; no SDK ever hashes a password).
+        A `kind=service` account may NOT hold one — its lane is `api_key` and
+        `otp`/`view_bff` (ADR-071); a service account with a human-chosen
+        secret is a shared password by another name.
+
+        Every existing gate applies and none is added: MFA floors
+        (ADR-059/075), Kind x Method and App x Method eligibility (ADR-072),
+        `login_attempts` rate limiting, session classes, ADR-004's tenant lock.
       properties:
         grant_type: { type: string, enum: [password] }
         identifier:
           type: string
           description: |
-            Identifier the user logs in with — typically email or
-            E.164 phone, resolved through the realm's user lookup.
-            Resolution failure surfaces as `invalid_credentials`
-            (no enumeration).
+            Identifier the user logs in with — email, E.164 phone, or
+            **username** (ADR-104). Resolution failure surfaces as
+            `invalid_credentials` (no enumeration).
+
+            The identifier is CLASSIFIED ONCE, never tried as several kinds in
+            turn: contains `@` -> email; matches E.164 -> phone; matches the
+            username grammar -> username; otherwise the login fails having
+            queried nothing. A fallthrough would make a string that is a valid
+            username AND a valid something-else resolve differently depending
+            on which store answered first — a nondeterministic identity.
+
+            **Username grammar** (case-FOLDED, 3-32 chars):
+            `^[a-z0-9]([a-z0-9._-]{1,30})[a-z0-9]$`. No `@`, no `+`, not
+            all-digits — the three classes are disjoint by construction. There
+            is no per-realm username policy knob.
         presented:
           type: string
           format: password
-          description: The presented password.
+          description: |
+            The presented password. Minimum **12** bytes, maximum **1024**
+            (a KDF-cost bound, not a policy opinion). No composition rules.
         tenant_id:
           type: string
           format: uuid
           description: |
-            Optional. When set and the user is a member, the
-            response is single-tenant and an access token is
-            minted on the first call.
+            Optional for email/phone — when set and the user is a member, the
+            response is single-tenant and an access token is minted on the
+            first call.
+
+            **Load-bearing for a USERNAME login.** Usernames are unique per
+            TENANT, not per realm (`alice` in two orgs is routinely two
+            people), so a username alone does not identify a principal. The
+            tenant is resolved as: this field if present, else the tenant
+            derived from the request's subdomain / `Origin`. **Explicit wins**,
+            including when the two disagree — a partner BFF is server-side and
+            its Origin is its own, not the end user's org, so an Origin-wins
+            rule would make BFF-fronted username login unimplementable without
+            one host per org.
+
+            This is a hint about WHERE TO LOOK, never about who the caller is:
+            the resolved user's own `tenant_id` governs everything downstream,
+            and the password still has to be right in that namespace.
+
+            Neither source yielding a tenant on a username login is
+            `400 tenant_required` — a NAMED code, not a generic credential
+            failure, because it is a caller-integration mistake rather than a
+            wrong password and the two must not look alike in your logs. It
+            leaks nothing: it is answerable before any identifier lookup runs.
         custom_claims:
           type: object
           additionalProperties: true
       example:
         grant_type: password
-        identifier: alice@example.com
-        presented: hunter2
+        identifier: alice
+        tenant_id: 018f0c9f-2c1f-7c6c-9a0b-3a8b1d4c2f00
+        presented: correct-horse-battery-staple
 
     LoginRequestOTP:
       type: object
@@ -573,12 +612,11 @@ components:
 
         1. **The key itself** — revoked or past `expires_at` returns the same
            envelope either way, so a holder cannot distinguish the two states.
-        2. **Live org membership** — for `org_scope=selected`, `org_ids` no
-           longer resolvable are dropped; for `all`, memberships are resolved
-           fresh. Revocation on membership loss is an async sweep, not
-           transactional (reachability of an org dies through many events across
-           other tenants' transactions), so a key may LIST an org it can no
-           longer MINT into.
+        2. **Live org membership** — the key's ONE org (ADR-105) must still
+           hold an active row for the holder. Revocation on membership loss is
+           an async sweep, not transactional (reachability of an org dies
+           through many events across other tenants' transactions), so a key may
+           survive a moment past the loss of the membership it depends on.
         3. **The MFA floor** — exempt if and only if MFA was proven at mint
            (`minted_mfa_at IS NOT NULL`). Without that exemption a headless
            script could never log in to a realm with a mandatory floor, making
@@ -957,6 +995,54 @@ components:
             SDK's `CapAllows`, which reads live and has zero lag.
 
             Not accepted on a service-class refresh (`scope_not_supported`).
+        product_roles:
+          type: array
+          items: { type: string }
+          description: |
+            **ADR-102 — the PARTNER's role NAME, carried and never read.**
+
+            `scope` carries *authority*; this carries the *name of the role*
+            the bearer holds in YOUR system, for display ("Signed in as:
+            Dispatch"), routing, report defaults and your own audit trail.
+            The two ride the same token and answer different questions.
+
+            ⚠️ **Do not branch AUTHORIZATION on this claim.** A name is a
+            label, a scope is a grant. Keying authorization off the name
+            re-creates exactly the coupling ADR-101 spent four migrations
+            removing — add a role and every service needs editing. Use
+            `scope`.
+
+            **Distinct from `role`**, which is RealmID's OWN vocabulary and is
+            a trusted authorization lookup key on the direct-bearer lane. The
+            two claims are never merged and this one reaches no RealmID gate;
+            a test asserts the claim name appears nowhere in the issuer's
+            authorization surface.
+
+            **Validated for SHAPE ONLY**, then written onto the token
+            verbatim. Nothing is stored, compared against a catalog, or
+            intersected. An ARRAY, not a space-delimited string: partner role
+            names are not constrained to the RFC 6749 §3.3 scope charset, and
+            a legitimate `"Regional Manager"` must survive.
+
+            **Bounds are CONSTANTS, not realm config**: at most **16**
+            elements of at most **64 bytes** each — `too_many_product_roles`
+            / `product_role_too_long`. Each element must be non-empty, valid
+            UTF-8 and free of control characters (`invalid_product_role`).
+            Deliberately NOT the `user_api_keys.max_permission_strings` knobs,
+            which already govern two unrelated things.
+
+            **Re-resolved on every mint, never stored on the session.** Send
+            it each time. Omitting it mints no `product_roles` at all — an
+            absent claim and an empty array mean the same thing, which is why
+            an empty array mints nothing rather than `[]`.
+
+            **Reserved**: it cannot be forged through `custom_claims`
+            (`reserved_claim_key`).
+
+            **`/auth/token` only** — `POST /auth/login` does not accept it, so
+            the token login returns carries no `product_roles`. The RealmID
+            SDKs close that gap for you: `Login` follows the login with a
+            `/auth/token` mint once the tenant is settled (ADR-102 D10).
         role_permissions:
           type: array
           nullable: true
@@ -1152,7 +1238,7 @@ components:
             behavior of the partner OTP primitive.
         delivery_mode:
           type: string
-          enum: [view_bff, email]
+          enum: [view_bff, email, sms]
           default: view_bff
           description: |
             Mint transport (ADR-071 §4, threaded by ADR-095 D7).
@@ -1167,19 +1253,38 @@ components:
             response and `delivered` reports `email`. Returning the code as
             well would make the mode confer nothing.
 
-            **`email` is refused for `purpose=login`** with
-            `400 unsupported_delivery_mode`: that path targets a `kind=service`
-            account (ADR-071 §5), which has no mailbox, so there is no correct
-            destination for the message.
+            `sms` (**ADR-103**) has RealmID text the code to the SUBJECT's
+            first active `contact.KindPhone`. Same withholding rule as
+            `email`: `value` is omitted and `delivered` reports `sms`.
+            There is no `users.phone` column — the address comes from
+            `user_contacts` only, which is ADR-042's source of truth.
+
+            **There is NO fallback between modes.** A caller asking for `sms`
+            never silently receives an email: substituting the channel the
+            subject controls would defeat the whole property. A subject with
+            no address of the requested kind is a `400 no_delivery_address`
+            and the issue FAILS.
+
+            **Login-mode matrix (ADR-103 D3/D4)** — `purpose=login`:
+
+            | mode | login | why |
+            |---|---|---|
+            | `view_bff` | **allowed**, `kind=service` subjects ONLY | the PARTNER reads the plaintext, so a human must not be authenticable this way |
+            | `sms` | **allowed**, any kind | the SUBJECT reads the plaintext, on a channel only they hold |
+            | `email` | **refused** | a login code mailed to an address turns mailbox access into account access with no second factor. That is a distinct security decision (ADR-077's territory), not a delivery-mode enum value |
+
+            The `kind=service` restriction on a login OTP is therefore re-keyed
+            onto `delivery_mode`, not removed — the same move ADR-099 made on
+            ADR-080 Part 2's nOAuth gate.
 
             Errors: `400 unsupported_delivery_mode` (unknown mode, or `email`
             on a login OTP); `400 no_delivery_address` (the subject has no
-            email on record — the issue FAILS rather than returning an id for
-            a code nobody will receive); `503 delivery_unavailable` (the mode
-            is legal but this deployment has no transport wired).
+            address of the requested kind — the issue FAILS rather than
+            returning an id for a code nobody will receive);
+            `503 delivery_unavailable` (the mode is legal but this deployment
+            has no transport wired — for `sms`, `TWILIO_*` unset).
 
-            `sms`/`whatsapp` remain deferred behind the
-            credential-custodian/KMS work and still return
+            `whatsapp` remains out of scope and returns
             `400 unsupported_delivery_mode`.
 
     OTPIssueResponse:
@@ -1195,12 +1300,12 @@ components:
             display, partner SMS / email). Re-displayable via
             `GET /auth/otp/{id}` until TTL expires.
 
-            **OMITTED when `delivery_mode=email`** (ADR-095 D7): RealmID
-            delivered the code to the subject, so the caller does not get it.
-            Check `delivered` to tell that apart from a fault.
+            **OMITTED when `delivery_mode` is `email` or `sms`** (ADR-095 D7,
+            ADR-103): RealmID delivered the code to the subject, so the caller
+            does not get it. Check `delivered` to tell that apart from a fault.
         delivered:
           type: string
-          enum: [view_bff, email]
+          enum: [view_bff, email, sms]
           description: |
             The transport actually used (ADR-095 D7). Lets a caller
             distinguish "no `value` because it was emailed" from "no `value`
@@ -1443,6 +1548,37 @@ components:
         providers:
           type: array
           items: { $ref: '#/components/schemas/PublicIdentityProvider' }
+        credential_methods:
+          type: array
+          items: { type: string, enum: [password, otp] }
+          description: |
+            The NON-IdP login methods this realm can actually complete:
+            `password` (ADR-104) and `otp` (ADR-103).
+
+            ⚠️ **They cannot ride in `providers`**, and this is not a stylistic
+            choice. That array is `identity_providers` rows, whose `type` is a
+            closed enum of IdPs and whose entries carry a `client_id`. A
+            password is not an IdP and has no client id, so a login screen
+            driven off `providers` alone can never offer one — which is exactly
+            what happened: the console already had labels and a keyboard
+            shortcut for `password`, and the button could not render because
+            nothing ever put it in the list.
+
+            **Advertised only when COMPLETABLE.** `password` appears only when
+            the deployment has a credential store wired (without one,
+            `grant_type=password` answers `400 unknown_method`); `otp` only when
+            the realm's `otp_login_enabled` is set. Offering a method the
+            deployment cannot finish is the "coming soon" failure — a user picks
+            it and nothing happens.
+
+            **ABSENT means "the server did not say"**, never "none". This field
+            is omitted entirely when neither is available and by any issuer
+            older than ADR-103, so a client must not read absence as "credential
+            login is off" and hide a working method.
+
+            Anonymous, like the rest of this response, and deliberately: a login
+            screen must say how to log in, and "this realm accepts passwords" is
+            the same class of fact as "this realm accepts Google".
 
     # ---- platforms ----
 
@@ -2217,26 +2353,12 @@ components:
                 non-expiring key returns `400 non_expiring_not_allowed`. A
                 permanent user credential should be a conscious realm-level
                 decision, not what you get by omitting a field.
-            org_scope_default:
-              type: string
-              enum: ["", selected, all]
-              description: |
-                ADR-084 §6 — `org_scope` used when a mint request omits it.
-                `selected` (default) pins the key to a **frozen** allowlist of
-                org ids, defaulting to just the user's current org; memberships
-                acquired later do **not** widen the key. Setting this to `all`
-                still requires `allow_all_orgs`.
-            allow_all_orgs:
-              type: boolean
-              description: |
-                ADR-084 §6 — gates `org_scope=all`, default **false**. `all`
-                means "every org in this realm the user belongs to, now *and in
-                future*", resolved fresh at every exchange rather than
-                snapshotted (a snapshot would mean "all orgs as of Tuesday",
-                which is neither thing a user could mean). It is the one mode
-                that widens with no human in the loop — hence its own opt-in,
-                and the requirement that the mint UI label it
-                forward-inclusive. `400 all_orgs_not_allowed` when false.
+            # `org_scope_default` and `allow_all_orgs` were REMOVED by
+            # ADR-105 (a key is bound to ONE org). A realm that already stores
+            # either key keeps it in the config blob, where it is INERT — the
+            # write path rejects it and nothing reads it. It is not migrated
+            # out: deleting a key from every realm's blob is a write against
+            # every realm to remove something nothing reads.
             max_permission_strings:
               type: integer
               minimum: 1
@@ -2420,8 +2542,6 @@ components:
             max_ttl_seconds: { type: integer }
             default_ttl_seconds: { type: integer }
             allow_non_expiring: { type: boolean }
-            org_scope_default: { type: string }
-            allow_all_orgs: { type: boolean }
             max_permission_strings: { type: integer }
             max_permission_string_len: { type: integer }
             require_mfa_at_mint: { type: boolean, nullable: true }
@@ -3504,10 +3624,9 @@ components:
         replace (`PUT`).** One shape means one validation path rather than two
         that can drift.
 
-        ⚠️ **The `PUT` RESETS WHAT IT OMITS.** An update carries `label`,
-        `org_scope` and `org_ids` too, and anything left out is cleared — so a
-        caller changing only the cap must READ THE KEY FIRST and send the rest
-        back unchanged. That is the price of one schema instead of two, and it
+        ⚠️ **The `PUT` RESETS WHAT IT OMITS.** An update carries `label` too,
+        and anything left out is cleared — so a caller changing only the cap
+        must READ THE KEY FIRST and send the rest back unchanged. That is the price of one schema instead of two, and it
         is deliberate: `PATCH` would make `uncapped` and `permissions_cap` an
         order-dependent pair that can arrive half-specified.
 
@@ -3520,24 +3639,11 @@ components:
             Human label. **The only handle on a key**: listing returns a
             non-secret hash prefix, never the plaintext, so a found
             `uk_live_…` cannot otherwise be correlated to its row.
-        org_scope:
-          type: string
-          enum: [selected, all]
-          description: |
-            ADR-084 §6. `selected` (realm default) pins the key to a FROZEN
-            allowlist — memberships acquired later do NOT widen it. `all` is
-            **forward-inclusive**: every org in this realm the user belongs to,
-            now *and in future*, resolved fresh at each exchange rather than
-            snapshotted. `all` requires the realm's
-            `user_api_keys.allow_all_orgs`, else `400 all_orgs_not_allowed`,
-            and the minting UI must label it forward-inclusive.
-        org_ids:
-          type: array
-          items: { type: string, format: uuid }
-          description: |
-            The frozen allowlist for `org_scope=selected`; defaults to just the
-            user's current org. Every id must be a live membership of `{uid}`,
-            else `400 org_not_a_membership`. Ignored when `org_scope=all`.
+        # ADR-105 DELETED `org_scope` and `org_ids` from this schema. A user
+        # API key is bound to exactly ONE org — the minting principal's own —
+        # and the mint takes no org input at all. Sending either field is
+        # ignored (the issuer does not reject unknown request fields) and is
+        # announced back in a `Warning: 299` header (issuer v0.108.0).
         uncapped:
           type: boolean
           description: |
@@ -3640,10 +3746,12 @@ components:
             classifiable at a glance and the two lookup paths cannot be
             confused.
         label: { type: string }
-        org_scope: { type: string, enum: [selected, all] }
-        org_ids:
-          type: array
-          items: { type: string, format: uuid }
+        org_id:
+          type: string
+          format: uuid
+          description: |
+            ADR-105 — the ONE org this key mints into. Always the minting
+            principal's own tenant.
         uncapped:
           type: boolean
           description: |
@@ -3675,16 +3783,14 @@ components:
           type: string
           description: Non-secret prefix derived from the stored hash.
         label: { type: string }
-        org_scope: { type: string, enum: [selected, all] }
-        org_ids:
-          type: array
-          items: { type: string, format: uuid }
+        org_id:
+          type: string
+          format: uuid
           description: |
-            For `selected`, the frozen allowlist AS STORED. An org listed here
-            may no longer be resolvable: revocation on membership loss is an
-            async sweep, and live membership is re-intersected at every
-            exchange, so a key can LIST an org it can no longer MINT into
-            (ADR-084 §9).
+            ADR-105 — the ONE org this key mints into. It may briefly outlive
+            the membership it depends on: revocation on membership loss is an
+            async sweep and live membership is re-checked at every exchange, so
+            a key can LIST an org it can no longer MINT into (ADR-084 §9).
         uncapped:
           type: boolean
           description: |
@@ -5153,13 +5259,13 @@ paths:
       tags: [User API Keys]
       summary: Replace a user API key's authority (ADR-100 D12)
       description: |
-        Replaces the key's cap, label, org scope and TTL in place. The **secret
+        Replaces the key's cap, label and TTL in place. The **secret
         is untouched**: no plaintext is re-issued and the response carries no
         `value`.
 
         ⚠️ **This is a PUT: it RESETS WHAT IT OMITS.** It shares one write
-        schema with the mint, so an update carries `label`, `org_scope` and
-        `org_ids` too and anything left out is cleared. A caller changing only
+        schema with the mint, so an update carries `label` too and anything
+        left out is cleared. A caller changing only
         the cap must read-then-write. `PATCH` was rejected deliberately:
         `uncapped` and `permissions_cap` are a cross-validated pair and a PATCH
         lets them arrive half-specified in either order.
@@ -5169,8 +5275,9 @@ paths:
         ADR-084 §8 `require_mfa_at_mint` step-up (ADR-100 D15 — no new knob),
         and D14's `allow_uncapped`. Without them the mint's gates are bypassed
         by minting a narrowly-capped key through the escort and then WIDENING it
-        here: `uncapped: false → true` is one widening vector, `org_scope:
-        selected → all` is a second, and D13's mutable expiry is a third. An
+        here: `uncapped: false → true` is one widening vector and D13's
+        mutable expiry is a second. (`org_scope: selected → all` was a third
+        until ADR-105 deleted the field.) An
         unescorted update is not a smaller hole than an unescorted mint — it is
         the same hole, reached by two calls.
 
@@ -5202,8 +5309,8 @@ paths:
             `uncapped_required` (the field is absent — authority is stated,
             never inferred), `bad_request` (`uncapped` and a non-empty
             `permissions_cap` together, or `uncapped=false` with no cap, or a
-            bad `label` / `org_scope`), `unknown_permission`,
-            `too_many_permissions`, `org_not_a_membership`, `ttl_exceeds_max`.
+            a bad `label`), `unknown_permission`, `too_many_permissions`,
+            `ttl_exceeds_max`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -8090,6 +8197,180 @@ paths:
             leaving, or `already_left` — the membership is already ended.
       security:
         - BearerAccess: []
+  /me/password:
+    put:
+      tags: [Auth]
+      summary: Set or change your own password (ADR-104)
+      description: |
+        The SELF path for the native credential.
+
+        **Replacing an existing password requires `current_password`.** A stolen
+        session must not be convertible into a permanent takeover, and changing
+        the password is exactly how you lock the real owner out. A FIRST set
+        needs none — the authenticated session is the proof, which is also why
+        no admin can reach this route for anybody else.
+
+        ⚠️ **The ADR-104 D7 "or a fresh MFA step-up" alternative is NOT
+        implemented, and that is a decision rather than a gap.** ADR-096 puts
+        operation step-up at the BFF and states that RealmID stores no route
+        list, so this handler has nothing to read a freshness verdict from.
+        Building a second step-up mechanism inside the issuer to serve one
+        endpoint is the duplication ADR-096 rejected. A partner who wants
+        step-up here gates the route on their own side, which IS the ADR-096
+        model.
+
+        The acting principal is the EFFECTIVE actor: on the ADR-050 BFF lane
+        the bearer is the partner's platform token and the user arrives as
+        `X-User-Token`.
+
+        A `kind=service` account cannot hold a password (ADR-071): its lanes are
+        `api_key` and `otp`/`view_bff`, and a service account with a
+        human-chosen secret is a shared password by another name.
+
+        A change emits `user.password_set` and sends the ADR-079 tamper-evidence
+        notice, which carries NO link and NO code — it reaches an address that
+        may no longer be the holder's, and a "wasn't me?" link in a takeover
+        notice is a phishing lure we would have written ourselves.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_password]
+              properties:
+                current_password:
+                  type: string
+                  format: password
+                  description: |
+                    Required when a password already exists; omitted on a first
+                    set.
+                new_password:
+                  type: string
+                  format: password
+                  description: |
+                    12..1024 bytes. The minimum is the only policy here; the
+                    maximum is a KDF-cost bound, not an opinion. There are
+                    deliberately NO composition rules — they measurably reduce
+                    entropy by pushing people to predictable patterns.
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: updated }
+        '400':
+          description: |
+            `password_too_short`, `password_too_long`,
+            `current_password_required`, `unknown_method` (the deployment has no
+            credential store), `bad_request` (a service account).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            `invalid_credentials` — `current_password` is wrong. Also returned
+            for a stored credential this build cannot verify: one generic
+            answer, never a hint about which.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /tenants/{tid}/users/{uid}/credentials:
+    put:
+      tags: [Users]
+      summary: Assign a member's username and/or an initial password (ADR-104)
+      description: |
+        The ADMIN path. Requires `users:manage` in the tenant.
+
+        ⚠️ **An admin-set password is an ASSERTION, not a proof** — the same
+        distinction ADR-080 makes for an admin-written address. It is stored
+        with a `must_change` obligation, and a login with it answers
+        `403 password_must_change` until the holder replaces it through
+        `PUT /me/password`. Without that, an admin could silently mint a working
+        credential for another person and use it.
+
+        **This is where `contact.KindUsername` gets its first real producer.**
+        The kind has been declared, valid and case-folded since ADR-042 and
+        written only by a test, which is what makes usernames greenfield rather
+        than a migration.
+
+        A username is stored as a `user_contacts` row, so it is resolvable by
+        the login classifier and lives under ADR-042's per-tenant uniqueness —
+        the same slot machinery email and phone use. It is **verified at
+        creation**, unlike an address, and that is not a shortcut: an address is
+        a claim about a channel somebody else controls, while a username is a
+        handle the ORG issues inside its own namespace. There is no third party
+        to ask.
+
+        Case-FOLDED before storage. That is a namespace policy, not a rewrite of
+        the caller's data, and it does not contradict ADR-103 D5's "the API
+        never rewrites a phone": a phone has ONE canonical form, whereas a
+        username's canonical form IS the decision that `alice` and `Alice` are
+        the same name. The display form is not preserved — one value, folded.
+
+        Emits `user.username_set` and/or `user.password_set`. A `kind=service`
+        account may hold neither.
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - { in: path, name: tid, required: true, schema: { type: string, format: uuid } }
+        - { in: path, name: uid, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Send a username, a password, or both. Neither is a 400.
+              properties:
+                username:
+                  type: string
+                  description: |
+                    3-32 characters after folding, matching
+                    `^[a-z0-9][a-z0-9._-]{1,30}[a-z0-9]$`, and never all-digits.
+                    No `@` (that reads as an email) and no `+` (that reads as a
+                    phone): the three identifier classes are DISJOINT by
+                    construction, so an identifier is classified once and never
+                    tried as several kinds in turn. There is no per-realm
+                    username policy knob.
+                password:
+                  type: string
+                  format: password
+                  description: 12..1024 bytes. Written with `must_change`.
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: updated }
+        '400':
+          description: |
+            `invalid_username`, `password_too_short`, `password_too_long`,
+            `unknown_method`, `bad_request` (nothing sent, or a service account).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `user_not_found`. A missing user and a user in another tenant
+            collapse to this: no existence oracle.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `identifier_collision` — that username is taken in this org.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /me/tenant-choice:
     post:
       tags: [Auth]
