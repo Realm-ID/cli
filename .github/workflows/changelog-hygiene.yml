@@ -1,0 +1,32 @@
+name: Changelog hygiene
+
+# CHANGELOG.md reads in descending order at all times — a property of the file,
+# not just of a release — so this runs on EVERY push to main with NO
+# paths-ignore. A release commit is routinely CHANGELOG-only, which is exactly
+# the class of commit this check exists to see; a path-filtered gate here would
+# repeat the fault a docs-only paths-ignore caused elsewhere in this workspace
+# (root TODO.md, the v0.106.0 promote-gate finding). This job is cheap (grep
+# over one file), so there is no cost tradeoff to make.
+#
+# The complementary "does THIS release have its own entry" check runs at
+# release time instead (release.yml), because only the tag push names the
+# version being checked.
+#
+# Run locally, from the repo root: ./scripts/changelog-hygiene.sh order
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  order:
+    name: CHANGELOG.md reads in descending order
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Descending order, at most one Unreleased heading
+        run: ./scripts/changelog-hygiene.sh order

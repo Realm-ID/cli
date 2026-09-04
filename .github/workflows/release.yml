@@ -12,7 +12,20 @@ permissions:
   # packages: write # uncomment when the ghcr Docker target is enabled
 
 jobs:
+  # This tag has its own CHANGELOG.md entry. Every other repo in the workspace
+  # gates this at deploy/promote time; the CLI has no separate promote step —
+  # `goreleaser` runs directly off the tag push — so the gate is a job of its
+  # own that `goreleaser` depends on, ahead of anything getting released.
+  changelog:
+    name: This tag has its own CHANGELOG.md entry
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./scripts/changelog-hygiene.sh tag "$GITHUB_REF_NAME"
+
   goreleaser:
+    needs: changelog
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
