@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-13 entries. Newest first.
+14 entries. Newest first.
 
+- [2026-09-04 — re-vendor to 0.44.0: a six-release catch-up that moved nothing in the command tree](#2026-09-04--re-vendor-to-0440-a-six-release-catch-up-that-moved-nothing-in-the-command-tree)
 - [2026-08-30 — re-vendor to 0.37.0: a new resource group, exposed on purpose](#2026-08-30--re-vendor-to-0370-a-new-resource-group-exposed-on-purpose)
 - [2026-08-30 — re-vendor to 0.36.0: the ADR predicted a resource would disappear, and the binary says otherwise](#2026-08-30--re-vendor-to-0360-the-adr-predicted-a-resource-would-disappear-and-the-binary-says-otherwise)
 - [2026-08-28 — thirteen action segments were top-level "resources" with a `create` verb; the derivation now refuses to guess](#2026-08-28--thirteen-action-segments-were-top-level-resources-with-a-create-verb-the-derivation-now-refuses-to-guess)
@@ -22,6 +23,30 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-09-04 — re-vendor to 0.44.0: a six-release catch-up that moved nothing in the command tree
+
+**Problem.** The vendored spec was tracked as "FIVE issuer releases behind" —
+that title itself was stale; the measured gap was **SIX** (`0.38.0` → `0.44.0`).
+
+**Decision.** Re-vendor from `issuer/docs/swagger.yaml`, then diff the command
+tree via the CLI's own `buildCommands()` (before/after, `zzdump_test.go`
+scratch harness, never committed), per this repo's own convention of diffing
+rather than inferring from a path count.
+
+**Result: the tree does not move.** 0 commands added/removed, 0 flags renamed,
+0 required-ness changes. 3 endpoints gained OPTIONAL pagination flags only
+(`--cursor`/`--limit` on `service-accounts list`, `sources list`, `sso-domains
+list`), tracking the issuer's pagination-input-validation rollout across 23
+operations. `role-templates` (create/list/update, no delete) is unchanged,
+still no `delete` verb per ADR-062 §5. The new `409 last_owner` and
+`400 invalid_cursor`/`400 invalid_limit` responses are response-shape/status
+additions the command struct doesn't model (method/path/params/query/body-
+presence only) and needed no code change — the CLI already forwards whatever
+status the issuer returns.
+
+**No compat shim needed** — pure drop-in. `go build ./...` clean; `go test
+./...` green, 12.172s, no skips introduced.
 
 ## 2026-08-30 — re-vendor to 0.37.0: a new resource group, exposed on purpose
 

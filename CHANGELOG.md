@@ -3,6 +3,16 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## Unreleased
+
+### Changed
+
+- Re-vendored the issuer spec `0.38.0` → `0.44.0` (the measured gap was six
+  releases, not the five the tracking item's title said). Command tree
+  unchanged at the group/verb/path level — 3 endpoints gained optional
+  pagination flags (`--cursor`/`--limit`) only, no breaking changes. See
+  `DECISIONS.md`.
+
 ## v0.3.4 — credential commands reach the CLI (2026-09-01)
 
 Re-vendors the issuer spec `0.37.0` → `0.38.0` (ADR-102/103/104/105), which
@@ -50,7 +60,7 @@ nothing. None of them grows the command tree, and none needed a decision.
 - No `delete` verb, matching `roles`: ADR-062 §5 skips a destructive DELETE that
   is not a revocation.
 
-## This file starts on 2026-08-28, and the fourteen releases before it are not in it
+### This file starts on 2026-08-28, and the fourteen releases before it are not in it
 
 `v0.2.0` through `v0.3.1` — fourteen tags — shipped with no release notes, and
 they are **deliberately not backfilled**. Reconstructing them from commit

@@ -44,6 +44,36 @@ info:
     nothing for months; `allowed_domains` was removed by ADR-094 R3 and went on
     being accepted. If you are integrating, log this header.
 
+    **Pagination input is VALIDATED (new in 0.43.0 — BREAKING).** Every list
+    endpoint takes `?cursor=` and `?limit=`, and until this release both
+    absorbed anything: `?limit=garbage` silently became 50, `?cursor=garbage`
+    silently became the first page, and a cursor no server ever issued got a
+    polite `200`. That was never a decision — it was the shape of the first
+    parser written — and a caller who corrupted a cursor mid-walk was handed
+    page one and could not tell. Both are now rejected:
+
+    - **`400 invalid_cursor`** — the cursor is not one this server issued.
+      Omit `cursor` to start at the first page, or pass a previous response's
+      `next_cursor` **verbatim**; the SDKs are contractually forbidden from
+      parsing or authoring it. A well-formed cursor that lands PAST the end of
+      the collection is still a normal empty last page, not an error: rows can
+      be deleted between two pages of a walk, and that race is not the caller's
+      fault.
+    - **`400 invalid_limit`** — `limit` is not a whole number of at least 1.
+      `limit=0`, `limit=-1` and `limit=abc` name no page size, so the server no
+      longer invents one. A `limit` ABOVE the maximum is still **clamped to
+      200**, not rejected: "give me at most 500" is fully satisfied by 200, and
+      `next_cursor`/`has_more` still say there is more.
+
+    Both are the standard coded envelope, `{"error": "...", "code": "..."}`.
+    Neither message echoes the offending value back.
+
+    This applies to all three cursor codecs on the surface — the base-10 offset
+    cursor, the base64 offset cursor used by the `/admin/*` console lists, and
+    the keyset cursor on `GET /tenants/{id}/users` and
+    `GET /tenants/{id}/invitations` — and to `?limit=` on every list endpoint,
+    including the four that take a limit and no cursor.
+
     Retired in this release (returned 404):
     `/auth/select-tenant`, `/auth/token/switch`, `/auth/user-token`,
     `/auth/cross-platform-token`, and the `choice_token` machinery.
@@ -74,7 +104,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.38.0
+  version: 0.44.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -2618,6 +2648,39 @@ components:
         display_name: { type: string }
         created_at: { type: string, format: date-time }
 
+    ServiceAccountList:
+      type: object
+      description: |
+        One PAGE of a tenant's service accounts, plus the two fields that say
+        whether it is the whole set.
+
+        `has_more` is always present. It is not derivable from `items` — a page
+        of exactly `limit` rows may or may not be the last one — and it is the
+        field this response exists to carry: before spec 0.41.0 this endpoint
+        returned a bare `{"items": [...]}` over every service account in the
+        tenant, so a client had no way to ask for less and no way to tell it had
+        been given everything.
+
+        There is deliberately no `total`. Counting a tenant's service accounts
+        to describe one page of them re-issues the unbounded statement the page
+        was introduced to remove. `has_more` answers the question a caller
+        walking pages actually has, at a cost of one row.
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ServiceAccount' }
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque cursor for the next page, or null when this is the last one.
+            Pass it back as `?cursor=`. Non-null exactly when `has_more` is true.
+        has_more:
+          type: boolean
+          description: |
+            True when the tenant holds service accounts beyond this page.
+
     ServiceAccountCreateRequest:
       type: object
       required: [handle]
@@ -2663,10 +2726,36 @@ components:
 
     SourceList:
       type: object
+      description: |
+        One PAGE of a platform's sources, plus the two fields that say whether
+        it is the whole set.
+
+        `has_more` is always present. It is not derivable from `items` — a page
+        of exactly `limit` rows may or may not be the last one — and it is the
+        field this response exists to carry: before spec 0.40.0 this endpoint
+        returned a bare `{"items": [...]}` over every source the platform had,
+        so a client had no way to ask for less and no way to tell it had been
+        given everything.
+
+        There is deliberately no `total`. Counting a platform's sources to
+        describe one page of them reads every row the page was introduced to
+        stop reading. `has_more` answers the question a caller walking pages
+        actually has, at a cost of one row.
+      required: [items, next_cursor, has_more]
       properties:
         items:
           type: array
           items: { $ref: '#/components/schemas/Source' }
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque cursor for the next page, or null when this is the last one.
+            Pass it back as `?cursor=`. Non-null exactly when `has_more` is true.
+        has_more:
+          type: boolean
+          description: |
+            True when the platform holds sources beyond this page.
 
     CreateSourceRequest:
       type: object
@@ -3815,13 +3904,54 @@ components:
 
     UserAPIKeyListPage:
       type: object
-      description: Paginated list envelope per SDK SPEC §7.
+      description: |
+        One PAGE of a user's API keys, plus the field that says whether it is
+        the whole set.
+
+        ⚠️ **This envelope existed before it was true.** Until spec 0.42.0 the
+        route accepted `cursor` and `limit` — both documented here — and IGNORED
+        both, returning every key the user had ever minted with `next_cursor`
+        and `total` hard-wired to `null`. A client that implemented the cursor
+        protocol exactly as specified read one page containing everything and
+        stopped, because `next_cursor` was null; that is indistinguishable from
+        a correct short list, which is why the drift went unnoticed. As of
+        0.42.0 the parameters are honoured and `next_cursor` is real.
+
+        `has_more` is NEW in 0.42.0 and is always present. It is not derivable
+        from `items` — a page of exactly `limit` rows may or may not be the last
+        one — and it is the field a caller should branch on.
+
+        `total` is still here and is still ALWAYS NULL. It is neither populated
+        nor removed, deliberately: counting a user's key history to describe one
+        page of it re-issues the unbounded statement the page was introduced to
+        remove, and this list is over a table that is never pruned (revoked and
+        expired keys keep their rows on purpose, because this surface shows
+        them). Removing the field would break a client that reads it, for no
+        gain. Treat `has_more` as the truncation signal and ignore `total`.
+      required: [items, next_cursor, has_more]
       properties:
         items:
           type: array
           items: { $ref: '#/components/schemas/UserAPIKeyListItem' }
-        next_cursor: { type: string, nullable: true }
-        total: { type: integer, nullable: true }
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque cursor for the next page, or null when this is the last one.
+            Pass it back as `?cursor=`. Non-null exactly when `has_more` is true.
+            Do not parse it.
+        total:
+          type: integer
+          nullable: true
+          description: |
+            ALWAYS NULL. Retained for wire compatibility; see the schema
+            description. Use `has_more`.
+        has_more:
+          type: boolean
+          description: |
+            True when the user holds keys beyond this page. Always present, true
+            or false — "present and false" is a different fact from "this server
+            does not tell you".
 
   responses:
     Unauthorized:
@@ -3836,6 +3966,18 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     NotFound:
       description: 404 not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InvalidPageParams:
+      description: |
+        `invalid_cursor` (not a cursor this server issued — omit it for the
+        first page, or pass a previous response's `next_cursor` verbatim)
+        | `invalid_limit` (`limit` is not a whole number of at least 1; a
+        `limit` above 200 is clamped, not rejected)
+
+        New in spec 0.43.0. Before it, both inputs were silently absorbed with
+        a default. See the pagination paragraph in the top-level description.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -4501,6 +4643,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SessionListPage' }
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
     delete:
       tags: [Sessions]
       summary: Revoke every session for this user
@@ -4905,6 +5048,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /platforms/{pid}/tenants:
     parameters:
       - in: path
@@ -5063,6 +5207,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/TenantListPage' }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /platforms/{pid}/stats:
     parameters:
       - in: path
@@ -5207,7 +5352,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
     get:
       tags: [User API Keys]
-      summary: List a user's API keys
+      summary: List one page of a user's API keys
       description: |
         Returns the label plus a non-secret hash prefix — never the plaintext.
         `{uid}` must be the caller, or an org admin holding `user_api_keys:read`
@@ -5216,14 +5361,37 @@ paths:
         `user_api_keys:read` / `:manage` are distinct from `platform_api_keys:read` /
         `:manage` on purpose: an org admin managing members' keys must not
         thereby gain platform-key power.
+
+        Revoked and expired keys ARE included. That is the endpoint's purpose —
+        nothing in the system prunes them, and a holder needs to see the key
+        they revoked last week.
+
+        **BREAKING-ish, new in spec 0.42.0 — this response is now a PAGE.** It
+        used to return every key the user had ever minted. It now returns at
+        most `limit` (default 50, maximum 200), and `has_more` tells you whether
+        there are more. `cursor` and `limit` were documented here before 0.42.0
+        and were silently ignored; they are honoured now, so a client that was
+        already sending them gets the behaviour it asked for. A client that was
+        reading `items` and assuming completeness must follow `next_cursor`
+        while `has_more` is true. See `UserAPIKeyListPage` for why `total` is
+        still null.
       security: [{ BearerAccess: [] }]
       parameters:
         - in: query
           name: cursor
+          description: |
+            Opaque cursor from a previous response's `next_cursor`, passed back
+            VERBATIM. Omit for the first page. Since spec 0.43.0 a value this
+            server did not issue is `400 invalid_cursor` — it is no longer
+            silently treated as the first page.
           schema: { type: string }
         - in: query
           name: limit
-          schema: { type: integer }
+          description: |
+            Page size. Default 50, maximum 200. Above 200 is clamped to 200;
+            since spec 0.43.0 a non-numeric or non-positive value is
+            `400 invalid_limit` rather than the default.
+          schema: { type: integer, default: 50, maximum: 200 }
       responses:
         '200':
           description: OK
@@ -5241,6 +5409,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{tid}/users/{uid}/user-api-keys/{id}:
     parameters:
       - in: path
@@ -5487,6 +5656,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/APIKeyListPage' }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /platforms/{id}/api-keys/{keyId}:
     parameters:
       - in: path
@@ -5635,6 +5805,7 @@ paths:
           description: not_authorized (caller is not a realm admin / owner)
         '404':
           description: realm_not_found | federation_disabled
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
       tags: [Platform Admin]
       summary: Register a federation binding (ADR-057)
@@ -5811,6 +5982,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RoleListPage' }
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
       tags: [Platform Admin]
       summary: Create a custom role (ADR-040)
@@ -6280,6 +6452,7 @@ paths:
       responses:
         '200':
           description: OK
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
       tags: [Platform Admin]
       summary: Register an integration (ADR-083 §4.1)
@@ -6656,18 +6829,55 @@ paths:
       tags: [Platform Admin]
       summary: List app/source registrations
       description: |
-        Returns every source (including disabled) for a platform. A source is a
-        first-class client app (web/android/ios/desktop human app, or the `bot`
-        service-account app) and carries `allowed_methods` — ADR-072 mapping-2,
-        the login methods that app surfaces. Gated on
+        Returns one PAGE of a platform's sources (including disabled ones). A
+        source is a first-class client app (web/android/ios/desktop human app,
+        or the `bot` service-account app) and carries `allowed_methods` —
+        ADR-072 mapping-2, the login methods that app surfaces. Gated on
         `requireRealmPermission(platform_id, "sources:read")` (ADR-074):
         the platform owner, the realm's own M2M token, or a member whose
         realm role grants `sources:read`.
+
+        **BREAKING FOR A CLIENT THAT ASSUMED COMPLETENESS — new in spec
+        0.40.0.** Until now this endpoint had no pagination at all: it returned
+        `{"items": [...]}` containing every source the platform had ever
+        registered, with no `limit`, no cursor, and no field saying whether that
+        was everything. It now honours `limit` (default 50, max 200) and
+        `cursor`, and the response carries `next_cursor` and `has_more`.
+
+        A client that read `items` and stopped now sees at most 50 sources.
+        That IS the fix — the previous response grew without bound — and the
+        two new fields exist so the truncation is visible: keep requesting with
+        `?cursor=<next_cursor>` while `has_more` is true. A platform with 50 or
+        fewer sources (the overwhelmingly common case, and every platform in
+        production today) sees a byte-identical `items` array plus
+        `"next_cursor": null, "has_more": false`.
+
+        **There is deliberately no `total`.** Counting a platform's sources to
+        describe one page of them reads every row the page exists to stop
+        reading. This is the `totalKnown = false` case other list endpoints
+        already use, and `total` is omitted from the body rather than sent as
+        null.
       parameters:
         - in: query
           name: platform_id
           required: true
           schema: { type: string, format: uuid }
+        - in: query
+          name: limit
+          required: false
+          description: |
+            Page size. Default 50, maximum 200. Above 200 is clamped to 200;
+            since spec 0.43.0 a non-numeric or non-positive value is
+            `400 invalid_limit` rather than a fall-back to 50.
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          required: false
+          description: |
+            Opaque cursor from a previous response's `next_cursor`, passed back
+            VERBATIM. Since spec 0.43.0 an unparseable cursor is
+            `400 invalid_cursor` — it no longer starts from the beginning.
+          schema: { type: string }
       security: [{ BearerAccess: [] }]
       responses:
         '200':
@@ -6676,7 +6886,11 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SourceList' }
         '400':
-          description: missing_platform_id
+          description: |
+            `missing_platform_id`
+            | `invalid_cursor` / `invalid_limit` (spec 0.43.0 — malformed
+            pagination input is rejected, not absorbed; see the top-level
+            description)
         '403':
           description: forbidden
     post:
@@ -6788,6 +7002,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/TenantListPage' }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{id}:
     parameters:
       - in: path
@@ -6958,6 +7173,7 @@ paths:
                         created_at: { type: string, format: date-time }
         '403':
           description: forbidden (not the tenant owner)
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{id}/users:
     get:
       tags: [Tenants]
@@ -6993,6 +7209,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/UserListPage' }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{id}/users/import:
     post:
       tags: [Tenants]
@@ -7211,9 +7428,26 @@ paths:
                 status:
                   type: string
                   enum: [active, suspended, invited, deactivated]
+      description: |
+        Flips a member's status.
+
+        ⚠️ **`deactivated` is guarded; `suspended` is not.** Deactivating the
+        tenant's owner is refused with `409 last_owner` — it is terminal and
+        cascades a contact release, so ownership must be transferred first via
+        `PUT /tenants/{id}/owner`. Suspension is deliberately NOT guarded,
+        because it is reversible and needs no ownership handover: **suspending
+        the sole owner succeeds**, and leaves the tenant with a suspended owner
+        and no administrator until someone unsuspends or transfers.
+
+        The ownership check fails CLOSED — if it cannot be evaluated, the
+        request is refused rather than allowed through.
       responses:
         '200':
           description: OK
+        '409':
+          description: |
+            last_owner — cannot deactivate the owner; transfer ownership first.
+            Only raised for `status: deactivated`.
 
   /tenants/{id}/integration-installations:
     parameters:
@@ -7241,6 +7475,7 @@ paths:
       responses:
         '200':
           description: OK
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
       tags: [Platform Admin]
       summary: Install an integration into this org (ADR-083 §4.2)
@@ -7345,6 +7580,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/InvitationListPage' }
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
       tags: [Invitations]
       summary: Create an invitation
@@ -7398,27 +7634,62 @@ paths:
         schema: { type: string, format: uuid }
     get:
       tags: [Service Accounts]
-      summary: List the tenant's service accounts (owner/admin or service_accounts:read)
+      summary: List one page of the tenant's service accounts (owner/admin or service_accounts:read)
       description: |
-        Lists the `kind=service` accounts in the tenant (ADR-071 §10).
-        Caller must be owner/admin of the tenant, the realm's own M2M
-        token, OR a non-owner/admin whose realm role grants
-        `service_accounts:read` (or `service_accounts:manage`, which
-        implies read) (ADR-074 §I-06). Reached via the BFF on-behalf
-        pattern (platform bot + the user's verified `X-User-Token`; the
-        bare `X-On-Behalf-Of-User` id was removed 2026-07-27).
+        Lists the `kind=service` accounts in the tenant (ADR-071 §10),
+        oldest first. Caller must be owner/admin of the tenant, the
+        realm's own M2M token, OR a non-owner/admin whose realm role
+        grants `service_accounts:read` (or `service_accounts:manage`,
+        which implies read) (ADR-074 §I-06). Reached via the BFF
+        on-behalf pattern (platform bot + the user's verified
+        `X-User-Token`; the bare `X-On-Behalf-Of-User` id was removed
+        2026-07-27).
+
+        **BREAKING FOR A CLIENT THAT ASSUMED COMPLETENESS — new in spec
+        0.41.0.** Until now this endpoint had no pagination at all: it returned
+        `{"items": [...]}` containing every service account in the tenant, with
+        no `limit`, no cursor, and no field saying whether that was everything.
+        It now honours `limit` (default 50, max 200) and `cursor`, and the
+        response carries `next_cursor` and `has_more`.
+
+        A client that read `items` and stopped now sees at most 50 service
+        accounts. That IS the fix — the previous response grew without bound,
+        and the query behind it read every USER in the tenant, humans included,
+        to find them — and the two new fields exist so the truncation is
+        visible: keep requesting with `?cursor=<next_cursor>` while `has_more`
+        is true. A tenant with 50 or fewer service accounts (the overwhelmingly
+        common case, and every tenant in production today) sees a byte-identical
+        `items` array plus `"next_cursor": null, "has_more": false`.
+
+        **There is deliberately no `total`.** Counting a tenant's service
+        accounts to describe one page of them re-issues the unbounded statement
+        this page exists to remove. `total` is omitted from the body rather than
+        sent as null.
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          description: |
+            Page size. Default 50, maximum 200. Above 200 is clamped to 200;
+            since spec 0.43.0 a non-numeric or non-positive value is
+            `400 invalid_limit` rather than a fall-back to 50.
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          required: false
+          description: |
+            Opaque cursor from a previous response's `next_cursor`, passed back
+            VERBATIM. Since spec 0.43.0 an unparseable cursor is
+            `400 invalid_cursor` — it no longer starts from the beginning.
+          schema: { type: string }
       security: [{ BearerAccess: [] }]
       responses:
         '200':
           description: OK
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  items:
-                    type: array
-                    items: { $ref: '#/components/schemas/ServiceAccount' }
+              schema: { $ref: '#/components/schemas/ServiceAccountList' }
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
       tags: [Service Accounts]
       summary: Provision a service account (owner/admin)
@@ -7657,6 +7928,7 @@ paths:
         '200':
           description: OK
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{id}/contact-drift-reviews/{reviewId}/accept:
     post:
       tags: [Contact Drift]
@@ -7813,6 +8085,7 @@ paths:
         '200':
           description: OK
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{id}/contact-verifications/{cvId}/approve:
     post:
       tags: [Contact Verifications]
@@ -8674,6 +8947,14 @@ paths:
         description: |
           Comma-separated status filter, e.g. `pending` for the approval queue.
           Omitted returns every grant in the platform.
+      - in: query
+        name: cursor
+        required: false
+        schema: { type: string }
+      - in: query
+        name: limit
+        required: false
+        schema: { type: integer, default: 50, maximum: 200 }
     get:
       tags: [Platform Admin]
       summary: List every SSO domain grant in a platform (approval queue)
@@ -8681,6 +8962,23 @@ paths:
         Platform-scoped, so platform-gated: an org owner has no business
         enumerating every other org's domains (ADR-067, the same reasoning that
         keeps rosters org-private).
+
+        **Paginated (SPEC §7), and as of spec 0.39.0 that is REAL.** This
+        endpoint previously answered with `next_cursor: null` over an unbounded
+        query — the envelope claimed the list was complete whatever its size,
+        and there was no way to page it because there was nothing to page with.
+        It now honours `limit` (default 50, max 200) and returns a usable
+        `next_cursor`. A client that read `items` and assumed completeness must
+        now follow `next_cursor`: keep requesting while `next_cursor` is
+        non-null, and stop when it is null.
+
+        **There is deliberately no `total`.** Counting the queue in order to
+        describe one page of it reads every matching grant, which is the cost
+        this endpoint was paginated to remove — a `total` would have reinstated
+        it in the same release that removed it. `next_cursor` answers the
+        question a caller walking a queue actually has ("is there more?"). This
+        is the same `totalKnown = false` case other list endpoints already use,
+        and `total` is omitted from the body rather than sent as null.
       security: [{ BearerPlatformToken: [] }]
       responses:
         '200':
@@ -8694,7 +8992,12 @@ paths:
                     type: array
                     items: { $ref: '#/components/schemas/SSODomainGrant' }
                   next_cursor: { type: string, nullable: true }
-        '400': { description: invalid_status }
+        '400':
+          description: |
+            `invalid_status`
+            | `invalid_cursor` / `invalid_limit` (spec 0.43.0 — malformed
+            pagination input is rejected, not absorbed; see the top-level
+            description)
         '401': { description: unauthorized }
         '403': { description: forbidden }
 
@@ -9209,6 +9512,7 @@ paths:
                 $ref: '#/components/schemas/AdminPlatformsResponse'
         '403': { description: not base-realm staff }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /admin/stats:
     get:
       tags: [Internal ops]
@@ -9275,6 +9579,7 @@ paths:
                 $ref: '#/components/schemas/AdminEventsResponse'
         '403': { description: not base-realm staff }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /platforms/{id}/audit-events:
     get:
       tags: [Realms]
@@ -9333,6 +9638,7 @@ paths:
         '401': { description: missing or invalid bearer }
         '403': { description: not a platform admin / realm mismatch }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /admin/search:
     get:
       tags: [Internal ops]
@@ -9361,6 +9667,7 @@ paths:
                 $ref: '#/components/schemas/AdminSearchResponse'
         '403': { description: not base-realm staff }
 
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
   /admin/platforms/{id}:
     parameters:
       - in: path
@@ -9448,6 +9755,7 @@ paths:
                     nullable: true
         '403': { description: not base-realm staff }
         '404': { description: platform_not_found }
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
       tags: [Internal ops]
       summary: Append a new internal platform note

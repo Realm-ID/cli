@@ -12,7 +12,21 @@ Open work only; shipped items live in `CHANGELOG.md` / git tags.
 
 ## The vendored spec is FIVE issuer releases behind (`0.38.0` vs `0.44.0`)
 
-Measured 2026-09-04. `cmd/realm-id/openapi.yaml` declares `info.version 0.38.0`;
+- [x] **CLOSED 2026-09-04.** Re-vendored `cmd/realm-id/openapi.yaml` from
+      `issuer/docs/swagger.yaml`, `info.version` `0.38.0` → `0.44.0`. The
+      title's "FIVE" was itself stale — the measured gap was **SIX**. Command-
+      tree diff (via the CLI's own `buildCommands()`, before/after) is the
+      deliverable: **0 commands added/removed, 0 flags renamed, 0
+      required-ness changes.** 3 endpoints gained optional pagination flags
+      only (`--cursor`/`--limit` on `service-accounts list`, `sources list`,
+      `sso-domains list`), matching the issuer's pagination-input-validation
+      rollout. `role-templates` (create/list/update, no delete) unchanged,
+      still no `delete` verb, per ADR-062 §5. The `409 last_owner` and the new
+      `400 invalid_cursor`/`400 invalid_limit` are response-shape/status
+      additions the command struct doesn't model and needed no code change —
+      the CLI already forwards whatever status the issuer returns. No breaking
+      changes; `go build ./...` clean, `go test ./...` green (12.172s).
+      ~~Original finding:~~ Measured 2026-09-04. `cmd/realm-id/openapi.yaml` declares `info.version 0.38.0`;
 the issuer serves `0.44.0`. The path count matches (120 both sides), so the
 command TREE is probably unaffected — but that is an inference from one number,
 not a diff, and it is exactly the inference this repo's own convention warns
