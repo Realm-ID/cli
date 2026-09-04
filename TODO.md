@@ -10,6 +10,29 @@ Open work only; shipped items live in `CHANGELOG.md` / git tags.
 
 ---
 
+## The vendored spec is FIVE issuer releases behind (`0.38.0` vs `0.44.0`)
+
+Measured 2026-09-04. `cmd/realm-id/openapi.yaml` declares `info.version 0.38.0`;
+the issuer serves `0.44.0`. The path count matches (120 both sides), so the
+command TREE is probably unaffected — but that is an inference from one number,
+not a diff, and it is exactly the inference this repo's own convention warns
+against: the CLI derives its surface from the embedded spec at runtime, so a
+spec re-vendor is how a new verb arrives, and a stale spec is how one silently
+does not.
+
+What changed across those five versions is not audited here. At minimum
+`0.44.0` documents the `409 last_owner` on
+`PATCH /tenants/{id}/users/{uid}/status`, which the CLI currently describes as
+`200`-only.
+
+Not folded into the ADR-107 release that surfaced it: a five-version catch-up
+needs its own command-tree diff (`realm-id --help` before/after, per the repo
+convention), and smuggling it into an unrelated release is how an unreviewed
+surface change ships.
+
+**Do this as: re-vendor, diff the command tree, then tag.** In that order.
+
+
 ## Device-flow DX (Traide integration feedback, 2026-06-29)
 
 Surfaced provisioning the Traide prod realm via CLI device login
