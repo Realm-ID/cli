@@ -219,7 +219,12 @@ check_tag() {
   # must be written under it, not merely a heading with nothing beneath it
   # before the next one. Require >=1 non-blank line in that span.
   local next_line body_nonblank
-  next_line=$(fenced_headings "$CHANGELOG" | awk -F: -v start="$heading_line" '$1>start{print $1; exit}')
+  # NO `exit` in this awk, deliberately. `exit` closes the pipe while
+  # fenced_headings is still scanning, the writer takes SIGPIPE, and `pipefail`
+  # turns that into rc=141 -- which killed the v0.120.0 promotion. It is
+  # platform-dependent: it passes on macOS and dies on Linux, so it cannot be
+  # caught by running this script locally. Read the whole stream instead.
+  next_line=$(fenced_headings "$CHANGELOG" | awk -F: -v start="$heading_line" '$1>start && !f {print $1; f=1}')
   if [ -z "$next_line" ]; then
     body_nonblank=$(awk -v start="$heading_line" 'NR>start && NF{c++} END{print c+0}' "$CHANGELOG")
   else
