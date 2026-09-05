@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# Tracked pre-push gate. Install once: make install-hooks
+# Bypass: git push --no-verify   (or REALMID_SKIP_PREPUSH=1)
+if [ -n "$REALMID_SKIP_PREPUSH" ]; then
+  echo "pre-push: SKIPPED via REALMID_SKIP_PREPUSH" >&2
+  exit 0
+fi
+echo "pre-push: make check   (bypass: git push --no-verify)" >&2
+make check

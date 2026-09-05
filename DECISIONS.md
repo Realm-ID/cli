@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-17 entries. Newest first.
+18 entries. Newest first.
 
+- [2026-09-05 (latest) — a local `make check` before `git push`, not just a CI verdict after it](#2026-09-05-latest--a-local-make-check-before-git-push-not-just-a-ci-verdict-after-it)
 - [2026-09-05 (later) — the test suite gated nothing, and the release is now gated by the same workflow as a commit](#2026-09-05-later--the-test-suite-gated-nothing-and-the-release-is-now-gated-by-the-same-workflow-as-a-commit)
 - [2026-09-05 — every query flag is labelled "(filter)", including a safety-guard override](#2026-09-05--every-query-flag-is-labelled-filter-including-a-safety-guard-override)
 - [2026-09-05 — re-vendor to 0.46.0: the ADR-101 seat guard reaches `role-templates update`](#2026-09-05--re-vendor-to-0460-the-adr-101-seat-guard-reaches-role-templates-update)
@@ -26,6 +27,57 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-09-05 (latest) — a local `make check` before `git push`, not just a CI verdict after it
+
+**Problem.** This repo has a 100% CI success rate (0 failures / 28 runs) — the
+one clean repo in the `Realm-ID/project` workspace. That is not because its
+gates are weaker; it is because they are cheap and few (`gofmt`, `go build`,
+`go vet`, `go test -race`, a changelog-order grep). A workspace-wide audit
+(`CI-FAILURE-AUDIT-2026-09-05.md`, root) found 61% of all failures across the
+other six repos are exactly this class of check — fully determined by the
+working tree, no network/secrets/Docker required — reaching CI only because no
+repo had a local entry point that would have asked first. `.git/hooks/` was
+empty and there was no `Makefile`, here same as everywhere else; the absence
+just hadn't cost anything yet.
+
+**Decision.** Add the same three deliverables every repo in the workspace is
+getting this pass (`.scratch/preflight/SPEC.md`, workspace root, is the single
+contract all of them implement):
+
+- `Makefile` — `check` runs gofmt/build/vet/`go test -race`/changelog-order
+  with the SAME command strings `tests.yml` and `changelog-hygiene.yml` use
+  (measured cold: ~24.7s, well under the 60s budget); `release-check
+  VERSION=x.y.z` runs `release.yml`'s changelog-tag-entry gate against the
+  working tree, before any tag exists; `install-hooks` points
+  `core.hooksPath` at the tracked `.githooks/`; `self-test` runs the new
+  checker script's own tests.
+- `.githooks/pre-push` — runs `make check`, bypassable via `--no-verify` or
+  `REALMID_SKIP_PREPUSH=1`. Not version-controlled by git itself, hence the
+  tracked directory + `core.hooksPath` indirection.
+- `scripts/preflight-parity.sh` (+ `preflight-parity_test.sh`) — this repo's
+  gofmt/build/vet/test/changelog commands are re-typed in the Makefile rather
+  than called through a shared script, because in the YAML they are one-liners
+  inline in `tests.yml`/`changelog-hygiene.yml`, not their own script. A second
+  copy of a command string is exactly the class of drift this workspace has
+  been burned by before (a private seed-list copy diverging from the real one,
+  root memory `feedback_never_duplicate_a_seed_list`), so `preflight-parity.sh`
+  asserts the two copies still match and runs first in `check`, ahead of the
+  gates it protects. Its own test file runs before it in `self-test`/`check`
+  per the checker-tests rule — a broken checker must fail as a broken checker,
+  never manufacture a false finding, the fault `scripts/todo-ranking-hygiene.py`
+  shipped with once already.
+
+**Deliberately excluded.** No golangci-lint step: `tests.yml` runs no lint job
+on this repo, so mirroring one would make the local gate diverge from CI in the
+other direction (stricter than the tree it is meant to predict). No
+`goreleaser` dry-run in `release-check`: `release.yml`'s `goreleaser` job needs
+network + `GITHUB_TOKEN` and is not a working-tree-determined gate; the
+existing `changelog: tag` script is the only assertion `release-check` runs,
+per the SPEC's "reuse the hygiene script, don't reimplement the release."
+
+**Why now, not earlier.** `tests.yml` itself is one day old (previous entry,
+below) — there was nothing worth mirroring locally until it existed.
 
 ## 2026-09-05 (later) — the test suite gated nothing, and the release is now gated by the same workflow as a commit
 
