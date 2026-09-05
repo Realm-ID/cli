@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-14 entries. Newest first.
+15 entries. Newest first.
 
+- [2026-09-05 — re-vendor to 0.46.0: the ADR-101 seat guard reaches `role-templates update`](#2026-09-05--re-vendor-to-0460-the-adr-101-seat-guard-reaches-role-templates-update)
 - [2026-09-04 — re-vendor to 0.44.0: a six-release catch-up that moved nothing in the command tree](#2026-09-04--re-vendor-to-0440-a-six-release-catch-up-that-moved-nothing-in-the-command-tree)
 - [2026-08-30 — re-vendor to 0.37.0: a new resource group, exposed on purpose](#2026-08-30--re-vendor-to-0370-a-new-resource-group-exposed-on-purpose)
 - [2026-08-30 — re-vendor to 0.36.0: the ADR predicted a resource would disappear, and the binary says otherwise](#2026-08-30--re-vendor-to-0360-the-adr-predicted-a-resource-would-disappear-and-the-binary-says-otherwise)
@@ -23,6 +24,35 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-09-05 — re-vendor to 0.46.0: the ADR-101 seat guard reaches `role-templates update`
+
+**Problem.** The vendored spec (`0.44.0`) was two issuer releases behind
+(`0.45.0`/issuer `v0.121.0` then `0.46.0`/issuer `v0.121.1`). `0.45.0` added
+the ADR-101 seat guard to `PATCH`/`DELETE /platforms/{id}/role-templates/{templateId}`
+— an `override_seated` query param plus `409 role_template_seated` and
+`503 role_template_seat_check_failed`; `0.46.0` only corrected what counts as
+a seat (federation bindings now count) and reworded the `409` description, no
+new paths or parameters.
+
+**Decision.** Re-vendor from `issuer/docs/swagger.yaml`, then diff the command
+tree via the CLI's own `buildCommands()` (before/after, the same
+`zzdump_test.go` scratch harness as the 0.44.0 entry above, never committed).
+
+**Result: exactly one flag reaches the binary.** `role-templates update`
+gains `--override_seated` (an optional query flag on the existing PATCH
+command); 0 commands added/removed, 0 required-ness changes elsewhere.
+`role-templates` stays create/list/update with **no `delete` verb** —
+confirmed unaffected: `skipDestructive` filters every DELETE that is not an
+ADR-085 §8 revocation BEFORE `buildCommands` ever classifies it, so the spec
+carrying a `delete` operation on this path (it always has) was never the
+reason the CLI lacked one, and re-vendoring changes nothing about that filter.
+The new `409 role_template_seated` / `503 role_template_seat_check_failed`
+responses are response-shape/status additions the command struct doesn't
+model and needed no code change.
+
+**No compat shim needed** — pure drop-in. `go build ./...`, `go vet ./...`
+clean; `go test ./...` green, no skips introduced.
 
 ## 2026-09-04 — re-vendor to 0.44.0: a six-release catch-up that moved nothing in the command tree
 

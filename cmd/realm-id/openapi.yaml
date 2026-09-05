@@ -104,7 +104,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.44.0
+  version: 0.46.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -6084,7 +6084,7 @@ paths:
         schema: { type: string, format: uuid }
     patch:
       tags: [Platform Admin]
-      summary: Edit a role template (ADR-101 D1)
+      summary: Edit a role template (ADR-101 D1, § Amendment 2026-09-04)
       description: |
         Changes the RECIPE only. Realms that already hold a role stamped from
         this template keep exactly what they were stamped with — **an edit does
@@ -6099,7 +6099,39 @@ paths:
         `level` and `name` are the IDENTITY and cannot be changed — a rename is
         a delete plus a create, and conflating them would orphan every role
         already stamped from the old name.
+
+        **§ Amendment 2026-09-04 — seat guard.** Refused with `409
+        role_template_seated` when any realm anywhere holds a seat at this
+        template's `(level, name)`. Pass `?override_seated=true` to
+        proceed anyway; the override is audited (`role_template.seated_override`)
+        with the exact seat count. A seat count that could not be taken refuses
+        the write as `503 role_template_seat_check_failed` — **unconditionally,
+        even with the override** — because an override states "I reviewed N
+        seats", which cannot be said truthfully when N is unknown.
+
+        **What counts as a seat (§ Amendment 2026-09-05).** Any way the role is
+        actually HELD, which is wider than `users.role`:
+
+        - a `users` row seated at the name — humans, service accounts, and
+          cross-realm integration principals (which are written as real users
+          rows);
+        - an **active** federation binding whose `mapped_role` is the name. A
+          federated workload never gets a `users.role` write at all: the
+          binding's `mapped_role` becomes the token's `role` claim directly. A
+          **revoked** binding is not a seat — it cannot exchange a token.
+
+        The number is a count of SEATS, not of distinct principals: one
+        workload holding the role both ways is counted twice. It over-reports
+        rather than under-reports, on purpose.
       security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: override_seated
+          schema: { type: boolean }
+          description: |
+            Explicit override for the seat guard. Must be exactly `true`;
+            anything else is treated as absent. Never a header — a deliberate,
+            per-call parameter only.
       requestBody:
         required: true
         content:
@@ -6117,11 +6149,15 @@ paths:
           description: role_authoring_retired (not the base realm)
         '404':
           description: role_template_not_found
+        '409':
+          description: role_template_seated (this role is held — by a users row or by an active federation binding's mapped_role; pass ?override_seated=true)
         '501':
           description: role_templates_unavailable
+        '503':
+          description: role_template_seat_check_failed (seat count could not be taken; refused even with override_seated=true)
     delete:
       tags: [Platform Admin]
-      summary: Remove a role from RealmID's vocabulary (ADR-101 D1)
+      summary: Remove a role from RealmID's vocabulary (ADR-101 D1, § Amendment 2026-09-04)
       description: |
         Removes the RECIPE. Roles already stamped from it **keep their rows and
         their holders**: removing a role from a realm is a membership change
@@ -6131,7 +6167,35 @@ paths:
         `realms_still_holding` reports how many realms hold a role stamped from
         the deleted template, so the orphan is stated rather than discovered.
         **`-1` means the count could not be taken.**
+
+        **§ Amendment 2026-09-04 — seat guard.** Same precondition as PATCH:
+        `409 role_template_seated` when any realm holds a seat, overridable
+        via `?override_seated=true` (audited), and a failed seat count refuses
+        the delete as `503 role_template_seat_check_failed` unconditionally.
+
+        **What counts as a seat (§ Amendment 2026-09-05).** Any way the role is
+        actually HELD, which is wider than `users.role`:
+
+        - a `users` row seated at the name — humans, service accounts, and
+          cross-realm integration principals (which are written as real users
+          rows);
+        - an **active** federation binding whose `mapped_role` is the name. A
+          federated workload never gets a `users.role` write at all: the
+          binding's `mapped_role` becomes the token's `role` claim directly. A
+          **revoked** binding is not a seat — it cannot exchange a token.
+
+        The number is a count of SEATS, not of distinct principals: one
+        workload holding the role both ways is counted twice. It over-reports
+        rather than under-reports, on purpose.
       security: [{ BearerAccess: [] }]
+      parameters:
+        - in: query
+          name: override_seated
+          schema: { type: boolean }
+          description: |
+            Explicit override for the seat guard. Must be exactly `true`;
+            anything else is treated as absent. Never a header — a deliberate,
+            per-call parameter only.
       responses:
         '200':
           description: OK
@@ -6142,8 +6206,12 @@ paths:
           description: role_authoring_retired (not the base realm)
         '404':
           description: role_template_not_found
+        '409':
+          description: role_template_seated (this role is held — by a users row or by an active federation binding's mapped_role; pass ?override_seated=true)
         '501':
           description: role_templates_unavailable
+        '503':
+          description: role_template_seat_check_failed (seat count could not be taken; refused even with override_seated=true)
 
   /platforms/{id}/roles/{roleId}:
     parameters:

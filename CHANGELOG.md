@@ -3,6 +3,16 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## v0.3.6 — the seat guard reaches `role-templates update` (2026-09-05)
+
+### Changed
+
+- Re-vendored the issuer spec `0.44.0` → `0.46.0` (issuer `v0.121.0`/
+  `v0.121.1`, ADR-101). `role-templates update` gains an optional
+  `--override_seated` flag; no other command, flag, or required-ness changed.
+  `role-templates` stays create/list/update, no `delete` verb (ADR-062 §5).
+  See `DECISIONS.md`.
+
 ## v0.3.5 — the spec catches up six issuer releases (2026-09-04)
 
 ### Changed
