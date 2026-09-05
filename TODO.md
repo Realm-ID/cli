@@ -105,6 +105,28 @@ warning against concurrent `auth login`); these are the code fixes.
 > `auth login`, so the CLI itself can no longer produce two live codes on one
 > machine. The multi-machine / stale-tab case remains.)*
 
+## CI runs NO tests at all (found 2026-09-05)
+
+`release.yml` runs `changelog-hygiene.sh` and `goreleaser release`; nothing in
+`.github/` or `.goreleaser.yaml` invokes `go test`. **This repo's test suite has
+never gated anything.**
+
+It stopped being theoretical on 2026-09-05: the `queryParamLabel` regression
+test added that day (`cmd/realm-id/commands_test.go`) exists specifically so a
+future refactor cannot silently relabel a write-side flag as a read filter —
+and it will never run in CI. A test that no runner executes is not a gate; it
+is a comment that takes longer to write.
+
+Note also that "run it the way CI runs it" is a NULL instruction on this repo
+and will silently produce a false green for anyone who follows it. That phrasing
+is correct guidance everywhere else in this workspace, which is what makes it
+dangerous here.
+
+**Fix**: a `tests.yml` running `go build ./... && go vet ./... && go test ./...`
+on push and PR. Not done — an unrequested CI change to a repo is the owner's
+call, and the Go version and trigger set should match the other repos rather
+than be invented here.
+
 ## Broken today
 
 > ⚠️ **THIS SECTION HOLDS ONE OPEN ITEM — read to the bottom.** It is below the

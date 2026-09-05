@@ -3,7 +3,7 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
-## Unreleased
+## v0.3.7 — write-side query flags stop calling themselves filters (2026-09-05)
 
 ### Fixed
 
