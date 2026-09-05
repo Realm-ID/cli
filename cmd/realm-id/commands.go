@@ -374,6 +374,30 @@ func exchangeAPIKey(cfg *Config, apiKey string) (string, error) {
 	return platformTokenCache, nil
 }
 
+// queryParamLabel classifies a query parameter's help annotation from the one
+// spec-derivable fact every command already carries: its HTTP method. A GET
+// can only ever narrow or page through what it returns — nothing on a read
+// path mutates state — so every query parameter attached to one is honestly a
+// "(filter)". A parameter on a non-GET (POST/PATCH/PUT/DELETE) is attached to
+// an operation whose whole point is to change something; such a parameter is
+// never narrowing a result set, it is steering what the write DOES, so
+// labelling it a filter is actively misleading (e.g. `?override_seated=true`
+// on `PATCH role-templates` overrides a safety guard; `?dry_run=true` on
+// `POST scopes/rename` skips the write entirely).
+//
+// This is deliberately NOT a hand-maintained list of "dangerous" parameter
+// names — that list rots the moment a new one is added and nobody remembers
+// to update it (see the `override_seated` case this function exists to fix).
+// The method/verb split is read straight off the same `command` the rest of
+// the CLI already trusts, so a future write-side query parameter is labelled
+// correctly with zero maintenance.
+func queryParamLabel(method string) string {
+	if method == "GET" {
+		return "(filter)"
+	}
+	return "(option — changes what this call does, not what it returns)"
+}
+
 func printCommandHelp(w io.Writer, cmd command) {
 	fmt.Fprintf(w, "realm-id %s %s — %s\n\n", strings.Join(cmd.Group, " "), cmd.Verb, cmd.Summary)
 	fmt.Fprintf(w, "  %s %s\n\n", cmd.Method, cmd.Path)
@@ -388,7 +412,7 @@ func printCommandHelp(w io.Writer, cmd command) {
 		}
 	}
 	for _, q := range cmd.Query {
-		fmt.Fprintf(w, "  --%-14s (filter)\n", q.Name+" <val>")
+		fmt.Fprintf(w, "  --%-14s %s\n", q.Name+" <val>", queryParamLabel(cmd.Method))
 	}
 	if cmd.HasBody {
 		fmt.Fprintf(w, "  --json '<obj>' | --field k=v … | (JSON on stdin)\n")

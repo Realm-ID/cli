@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-15 entries. Newest first.
+16 entries. Newest first.
 
+- [2026-09-05 — every query flag is labelled "(filter)", including a safety-guard override](#2026-09-05--every-query-flag-is-labelled-filter-including-a-safety-guard-override)
 - [2026-09-05 — re-vendor to 0.46.0: the ADR-101 seat guard reaches `role-templates update`](#2026-09-05--re-vendor-to-0460-the-adr-101-seat-guard-reaches-role-templates-update)
 - [2026-09-04 — re-vendor to 0.44.0: a six-release catch-up that moved nothing in the command tree](#2026-09-04--re-vendor-to-0440-a-six-release-catch-up-that-moved-nothing-in-the-command-tree)
 - [2026-08-30 — re-vendor to 0.37.0: a new resource group, exposed on purpose](#2026-08-30--re-vendor-to-0370-a-new-resource-group-exposed-on-purpose)
@@ -24,6 +25,54 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-09-05 — every query flag is labelled "(filter)", including a safety-guard override
+
+**Problem.** `role-templates update --help` rendered
+`--override_seated <val> (filter)`. `override_seated` does not filter
+anything — it overrides the ADR-101 §Amendment 2026-09-04 seat guard, forcing
+through an edit the issuer would otherwise refuse with
+`409 role_template_seated`. `printCommandHelp` annotated **every** query
+parameter on **every** generated command as `(filter)` with no exceptions;
+`scopes rename`'s `dry_run` had the identical problem (labelled a filter when
+it actually skips the write).
+
+**Decision: derive the label from the operation's HTTP method, not a list of
+parameter names.** A GET can only ever narrow or page through what it
+returns — nothing on a read path mutates state — so every query parameter on
+a GET command stays honestly `(filter)`. A query parameter on any other verb
+(POST/PATCH/PUT/DELETE) is attached to an operation whose point is to change
+something, so it is steering what the write DOES, never narrowing a result
+set; it gets a neutral `(option — changes what this call does, not what it
+returns)` instead.
+
+**Why not a hand-maintained list of "dangerous" parameter names** — the option
+this repo's brief explicitly asked to be ruled out first. This workspace has
+been bitten by exactly that shape before (root `feedback_hand_maintained_check_lists.md`):
+the list is correct on the day it's written and silently wrong the day the
+next dangerous parameter ships, because nothing forces a return visit. Method
+is already a field on every `command` the rest of the CLI trusts
+(`cmd.Method`), computed once in `buildCommands` straight from the spec, so
+the rule needs zero maintenance as the spec grows — a future write-side query
+parameter is labelled correctly the moment it's vendored in, with no PR to
+this file. The alternative of trying to read intent from the parameter's own
+`description` text was rejected too: descriptions are prose for a human, not a
+machine-checkable contract, and matching keywords in them is the same
+hand-maintained-list problem one layer down.
+
+**Verified with the same disposable harness as the 0.46.0 entry below**: a
+`zzdump_test.go` scratch file (never committed) dumped `printCommandHelp` for
+every `(group, verb)` in the tree, before and after, sorted, and diffed. Only
+two lines changed — `role-templates update`'s `--override_seated` and
+`scopes rename`'s `--dry_run` — confirming the fix is a relabel, not a
+structural change: 0 commands/verbs/flags added or removed.
+
+**Scope note.** GET-side pagination flags (`cursor`, `limit`) keep the
+`(filter)` label rather than a separate "(pagination)" category — they narrow
+which rows come back exactly as a `status` or `q` filter does, and inventing
+a third bucket would need its own name-based rule (is `limit` a filter or
+pagination? is `sort`?) with the same rot risk this decision exists to avoid.
+The method split is the one distinction the spec itself makes for free.
 
 ## 2026-09-05 — re-vendor to 0.46.0: the ADR-101 seat guard reaches `role-templates update`
 

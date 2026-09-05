@@ -228,3 +228,52 @@ func TestResolveCredential_SessionMode(t *testing.T) {
 		t.Fatalf("session mode: base=%q bearer=%q, want bff/api + session", base, bearer)
 	}
 }
+
+// TestQueryParamLabel pins the read/write split behind the help annotation on
+// a query flag. A GET only ever narrows or pages what it returns, so its
+// query params are honestly "(filter)"; a query param on any other method is
+// steering what the write DOES — e.g. `?override_seated=true` on the
+// role-templates PATCH forces through an edit the issuer would otherwise
+// refuse with `409 role_template_seated` — and must never be labelled a
+// filter.
+func TestQueryParamLabel(t *testing.T) {
+	cases := []struct {
+		method string
+		want   string
+	}{
+		{"GET", "(filter)"},
+		{"PATCH", "(option — changes what this call does, not what it returns)"},
+		{"POST", "(option — changes what this call does, not what it returns)"},
+		{"PUT", "(option — changes what this call does, not what it returns)"},
+		{"DELETE", "(option — changes what this call does, not what it returns)"},
+	}
+	for _, c := range cases {
+		if got := queryParamLabel(c.method); got != c.want {
+			t.Errorf("queryParamLabel(%q) = %q, want %q", c.method, got, c.want)
+		}
+	}
+}
+
+// TestPrintCommandHelp_OverrideSeatedIsNotAFilter is the exact regression this
+// fix exists for: `role-templates update --help` must not describe
+// `override_seated` — a safety-guard override, not a narrowing parameter — as
+// a "(filter)".
+func TestPrintCommandHelp_OverrideSeatedIsNotAFilter(t *testing.T) {
+	cmd := command{
+		Group:   []string{"role-templates"},
+		Verb:    "update",
+		Method:  "PATCH",
+		Path:    "/platforms/{id}/role-templates/{templateId}",
+		Query:   []queryParam{{Name: "override_seated"}},
+		HasBody: true,
+	}
+	var buf strings.Builder
+	printCommandHelp(&buf, cmd)
+	out := buf.String()
+	if strings.Contains(out, "override_seated <val> (filter)") {
+		t.Fatalf("override_seated is a safety-guard override, not a filter; got:\n%s", out)
+	}
+	if !strings.Contains(out, "override_seated <val> (option") {
+		t.Fatalf("expected override_seated labelled as an option, got:\n%s", out)
+	}
+}

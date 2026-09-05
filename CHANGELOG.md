@@ -3,6 +3,18 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## Unreleased
+
+### Fixed
+
+- `--help` no longer labels every query flag "(filter)". A flag on a GET
+  (narrows or pages a result set) still reads `(filter)`; a flag on a
+  write (POST/PATCH/PUT/DELETE) now reads `(option — changes what this
+  call does, not what it returns)`. Fixes `role-templates update`'s
+  `--override_seated` (an ADR-101 seat-guard override, not a filter) and
+  `scopes rename`'s `--dry_run` (skips the write, not a filter). See
+  `DECISIONS.md`.
+
 ## v0.3.6 — the seat guard reaches `role-templates update` (2026-09-05)
 
 ### Changed
