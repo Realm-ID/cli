@@ -11,6 +11,17 @@ permissions:
   contents: write   # create the GitHub Release + upload archives/checksums
   # packages: write # uncomment when the ghcr Docker target is enabled
 
+defaults:
+  run:
+    # GitHub's implicit default omits pipefail
+    shell: bash
+
+concurrency:
+  # NOT cancel-in-progress: a cancelled run of this workflow can leave
+  # half-applied state behind. Queue instead.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # This tag has its own CHANGELOG.md entry. Every other repo in the workspace
   # gates this at deploy/promote time; the CLI has no separate promote step —
@@ -21,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: ./scripts/changelog-hygiene.sh tag "$GITHUB_REF_NAME"
 
   # The suite, run against the TAGGED tree, as a hard dependency of the
@@ -40,17 +51,19 @@ jobs:
   goreleaser:
     needs: [changelog, test]
     runs-on: ubuntu-latest
+    # Runaway guard, not an SLA (GitHub's default is 360m).
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0   # GoReleaser needs full history + tags for the changelog
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: '1.23'
           cache: true
 
-      - uses: goreleaser/goreleaser-action@v7
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: '~> v2'
