@@ -52,9 +52,19 @@ jobs:
       - name: Reject mutable action refs
         run: |
           # Matches `uses: owner/repo@ref` where ref is not a 40-char hex SHA.
-          # Local (`./…`) and reusable-workflow refs are excluded by `[^./]`.
+          # Local (`./…`) refs are excluded by `[^./]`.
+          #
+          # FIRST-PARTY REUSABLE WORKFLOWS ARE EXCLUDED ON PURPOSE.
+          # `Just-Git-Dev/reusable-workflows/...@vX.Y.Z` must stay a RELEASE TAG:
+          # semver there tracks the workflow's INPUT CONTRACT, which is what a
+          # consumer needs to reason about, and the platform's own rule is that
+          # consumers pin an exact `vX.Y.Z` — never a SHA, never `@main`. A SHA
+          # would pin the bytes and discard the contract. The supply-chain risk
+          # this job exists to stop is a MOVED THIRD-PARTY TAG; a first-party
+          # repo under the same ownership is not that risk.
           if grep -rnP '^\s*(-\s*)?uses:\s*[^./][^@]+@(?![0-9a-f]{40}\s*($|#))' \
-               --include='*.yml' --include='*.yaml' .github/workflows; then
+               --include='*.yml' --include='*.yaml' .github/workflows \
+             | grep -v 'Just-Git-Dev/reusable-workflows/'; then
             echo "::error::Third-party actions must be pinned to a full commit SHA."
             exit 1
           fi
@@ -66,12 +76,28 @@ jobs:
       - name: Self-test — the pin check actually fires
         run: |
           tmp=".github/workflows/zz-selftest.yml"
+          scan() {
+            grep -rP '^\s*(-\s*)?uses:\s*[^./][^@]+@(?![0-9a-f]{40}\s*($|#))' \
+              --include='*.yml' "$1" | grep -v 'Just-Git-Dev/reusable-workflows/'
+          }
+
+          # MUST FIRE: a third-party action on a mutable tag.
           printf 'on: push\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n' > "$tmp"
-          if grep -rqP '^\s*(-\s*)?uses:\s*[^./][^@]+@(?![0-9a-f]{40}\s*($|#))' \
-               --include='*.yml' .github/workflows; then
-            rm -f "$tmp"; echo "self-test: the pin check fires on a mutable ref."
-          else
+          if ! scan "$tmp" >/dev/null; then
             rm -f "$tmp"
-            echo "::error::self-test FAILED — the pin check did not fire on actions/checkout@v4."
+            echo "::error::self-test FAILED — the check did not fire on actions/checkout@v4."
             exit 1
           fi
+
+          # MUST STAY SILENT: a first-party reusable workflow on a release tag.
+          # Without this half, tightening the exclusion into a catch-all would
+          # pass unnoticed, and the gate would stop checking anything.
+          printf 'on: push\njobs:\n  x:\n    uses: Just-Git-Dev/reusable-workflows/.github/workflows/ci-go.yml@v2.6.0\n' > "$tmp"
+          if scan "$tmp" >/dev/null; then
+            rm -f "$tmp"
+            echo "::error::self-test FAILED — the check fired on a first-party reusable workflow pinned to a release tag."
+            exit 1
+          fi
+
+          rm -f "$tmp"
+          echo "self-test: fires on a mutable third-party ref, silent on a first-party release tag."
