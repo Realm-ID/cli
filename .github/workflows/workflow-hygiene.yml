@@ -1,0 +1,77 @@
+name: Workflow hygiene
+
+# Two checks over this repo's OWN workflow files. Neither existed here before:
+# `actionlint` ran only in the umbrella repo, which does not contain these files,
+# so nothing linted them — and this repo has shipped workflows that failed at
+# startup, which is the failure a linter catches for free.
+#
+#   1. actionlint  — workflow syntax + expression checking, and shellcheck over
+#                    every `run:` body.
+#   2. pinned      — third-party actions must be pinned to a full commit SHA.
+#                    A moved tag on an action used by a deploy workflow is a
+#                    supply-chain event with production blast radius.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR pushes supersede each other; nothing here is mid-flight state.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # GitHub's implicit default omits pipefail
+    shell: bash
+
+jobs:
+  lint:
+    name: actionlint + shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pinned, not `curl … | bash`: installing the linter from a moving branch
+      # is the exact supply-chain shape the `pinned` job below rejects.
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          fail-on-error: true
+
+  pinned:
+    name: third-party actions are SHA-pinned
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Reject mutable action refs
+        run: |
+          # Matches `uses: owner/repo@ref` where ref is not a 40-char hex SHA.
+          # Local (`./…`) and reusable-workflow refs are excluded by `[^./]`.
+          if grep -rnP '^\s*(-\s*)?uses:\s*[^./][^@]+@(?![0-9a-f]{40}\s*($|#))' \
+               --include='*.yml' --include='*.yaml' .github/workflows; then
+            echo "::error::Third-party actions must be pinned to a full commit SHA."
+            exit 1
+          fi
+          echo "All third-party action references are SHA-pinned."
+
+      # A gate that greps must be shown to fire, or a narrowed pattern is
+      # indistinguishable from a clean tree. This plants a violation, requires
+      # the grep to catch it, and cleans up.
+      - name: Self-test — the pin check actually fires
+        run: |
+          tmp=".github/workflows/zz-selftest.yml"
+          printf 'on: push\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n' > "$tmp"
+          if grep -rqP '^\s*(-\s*)?uses:\s*[^./][^@]+@(?![0-9a-f]{40}\s*($|#))' \
+               --include='*.yml' .github/workflows; then
+            rm -f "$tmp"; echo "self-test: the pin check fires on a mutable ref."
+          else
+            rm -f "$tmp"
+            echo "::error::self-test FAILED — the pin check did not fire on actions/checkout@v4."
+            exit 1
+          fi
