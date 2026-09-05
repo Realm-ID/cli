@@ -1,0 +1,95 @@
+name: Tests
+
+# This repo's test gate. Until 2026-09-05 there wasn't one: `release.yml` ran
+# changelog-hygiene + goreleaser, and nothing in `.github/` or `.goreleaser.yaml`
+# ever invoked `go test`. Four test files existed and none of them gated
+# anything — including the `queryParamLabel` regression test, which exists so a
+# refactor cannot silently relabel a write-side flag as a read filter.
+#
+# A consequence worth stating because it misled a reader here: "run it the way
+# CI runs it" was a NULL instruction on this repo. It is correct guidance
+# everywhere else in the workspace, which is exactly what made it dangerous.
+#
+# TRIGGERS: push to main (code only) + pull_request + workflow_call + manual.
+#
+# `push: main` is load-bearing, not belt-and-braces — this repo pushes straight
+# to main with no PRs, so a `pull_request`-only gate would never fire.
+#
+# `paths-ignore` keeps the batched-release cost posture: a release bundle here
+# is mostly CHANGELOG/TODO commits and those stay free. In the issuer that
+# filter opened a hole at release time (the tagged commit is docs-only, so the
+# tagged tree got no run, and two releases were promoted on a guessed verdict).
+# It cannot open that hole here: `workflow_call` lets `release.yml` invoke this
+# same workflow ON THE TAG as a hard dependency of goreleaser, so the tagged
+# tree is always run against, whatever `paths-ignore` did on the way in.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Pushes supersede each other; nothing here is mid-flight state.
+  #
+  # The literal `tests-` prefix is load-bearing. Under `workflow_call`,
+  # `github.workflow` resolves to the CALLER's name — so without it this group
+  # would evaluate to exactly `release.yml`'s own group at tag time, where that
+  # workflow sets `cancel-in-progress: false` on purpose and this one sets
+  # true. The prefix keeps the two from ever sharing a group.
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # GitHub's implicit default omits pipefail
+    shell: bash
+
+jobs:
+  test:
+    name: Unit (go test ./...)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # 1.23 to match `release.yml` and go.mod, deliberately — NOT the issuer's
+      # 1.26. The gate must compile what goreleaser ships; a newer toolchain
+      # here would test a tree the release never builds.
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.23'
+          cache: true
+
+      # A gate, not hygiene. `gofmt -l` derives the file list from the tree,
+      # which is the point: elsewhere in this workspace the drift was tracked as
+      # a hand-written list of filenames in TODO.md, and every re-check found
+      # the NAMED files clean and DIFFERENT files drifted. Printed before
+      # failing so the log names the files rather than the count.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l cmd)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reports unformatted files:"
+            echo "$unformatted"
+            gofmt -d cmd
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - name: Build + vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      # -race was measured clean before being added (2026-09-05: 0 races, one
+      # package, 21.2s), and that is the whole argument for adding it AT that
+      # moment — the ratchet is one line while it is green, and an open-ended
+      # debugging session once it is not.
+      - name: Test
+        run: go test -race ./...

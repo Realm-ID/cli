@@ -105,27 +105,47 @@ warning against concurrent `auth login`); these are the code fixes.
 > `auth login`, so the CLI itself can no longer produce two live codes on one
 > machine. The multi-machine / stale-tab case remains.)*
 
-## CI runs NO tests at all (found 2026-09-05)
+## ~~CI runs NO tests at all~~ — **RESOLVED 2026-09-05**
 
-`release.yml` runs `changelog-hygiene.sh` and `goreleaser release`; nothing in
-`.github/` or `.goreleaser.yaml` invokes `go test`. **This repo's test suite has
-never gated anything.**
+Until 2026-09-05, `release.yml` ran `changelog-hygiene.sh` and `goreleaser
+release`, and nothing in `.github/` or `.goreleaser.yaml` invoked `go test`.
+**This repo's test suite had never gated anything.**
 
 It stopped being theoretical on 2026-09-05: the `queryParamLabel` regression
 test added that day (`cmd/realm-id/commands_test.go`) exists specifically so a
 future refactor cannot silently relabel a write-side flag as a read filter —
-and it will never run in CI. A test that no runner executes is not a gate; it
+and it would never have run. A test that no runner executes is not a gate; it
 is a comment that takes longer to write.
 
-Note also that "run it the way CI runs it" is a NULL instruction on this repo
-and will silently produce a false green for anyone who follows it. That phrasing
-is correct guidance everywhere else in this workspace, which is what makes it
-dangerous here.
+Note also that "run it the way CI runs it" **was** a NULL instruction on this
+repo and silently produced a false green for anyone who followed it. That
+phrasing is correct guidance everywhere else in the workspace, which is exactly
+what made it dangerous here. It is now true here as well.
 
-**Fix**: a `tests.yml` running `go build ./... && go vet ./... && go test ./...`
-on push and PR. Not done — an unrequested CI change to a repo is the owner's
-call, and the Go version and trigger set should match the other repos rather
-than be invented here.
+**Fixed 2026-09-05** by `.github/workflows/tests.yml`: gofmt, `go build`,
+`go vet`, `go test -race`, on push-to-main + pull_request + workflow_dispatch.
+Go `1.23`, matching `release.yml` and `go.mod` rather than the issuer's `1.26` —
+the gate must compile what goreleaser actually ships.
+
+Two choices worth keeping:
+
+* **The release is gated too, not just the branch.** `tests.yml` also declares
+  `workflow_call`, and `release.yml`'s `goreleaser` job now `needs: [changelog,
+  test]`, invoking that same workflow against the TAGGED tree. Without it the
+  `paths-ignore: '**.md'` filter would reproduce the issuer's hole — that repo
+  tags a docs-only CHANGELOG commit, so the tagged SHA got no run and two
+  releases were promoted on a guessed verdict. Invoking the workflow rather
+  than copying its steps means a release can never be gated by a weaker check
+  than a routine commit is.
+* **`-race` and `gofmt` were measured clean BEFORE being added**, not assumed:
+  0 races over the one package in 21.2s, and `gofmt -l cmd` empty. Ratcheting
+  either one in while it is red is an open-ended debugging session; while it is
+  green it is one line.
+
+Note the concurrency group carries a literal `tests-` prefix: under
+`workflow_call`, `github.workflow` resolves to the CALLER's name, so without it
+the group would collide with `release.yml`'s own — which sets
+`cancel-in-progress: false` on purpose where this one sets `true`.
 
 ## Broken today
 

@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-16 entries. Newest first.
+17 entries. Newest first.
 
+- [2026-09-05 (later) — the test suite gated nothing, and the release is now gated by the same workflow as a commit](#2026-09-05-later--the-test-suite-gated-nothing-and-the-release-is-now-gated-by-the-same-workflow-as-a-commit)
 - [2026-09-05 — every query flag is labelled "(filter)", including a safety-guard override](#2026-09-05--every-query-flag-is-labelled-filter-including-a-safety-guard-override)
 - [2026-09-05 — re-vendor to 0.46.0: the ADR-101 seat guard reaches `role-templates update`](#2026-09-05--re-vendor-to-0460-the-adr-101-seat-guard-reaches-role-templates-update)
 - [2026-09-04 — re-vendor to 0.44.0: a six-release catch-up that moved nothing in the command tree](#2026-09-04--re-vendor-to-0440-a-six-release-catch-up-that-moved-nothing-in-the-command-tree)
@@ -25,6 +26,61 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-09-05 (later) — the test suite gated nothing, and the release is now gated by the same workflow as a commit
+
+**Problem.** This repo had four test files and no runner. `release.yml` ran
+`changelog-hygiene.sh` and `goreleaser release`; nothing in `.github/` or
+`.goreleaser.yaml` invoked `go test`. The suite had never gated anything, in
+any repo state, since the CLI was created.
+
+It stopped being theoretical the same day: the `queryParamLabel` regression
+test (the entry below) exists precisely so a future refactor cannot silently
+relabel a write-side flag as a read filter — and nothing would ever have run
+it. A second-order cost is worse than the first: "run it the way CI runs it" is
+correct guidance everywhere else in this workspace and was a NULL instruction
+here, so following it produced a false green.
+
+**Decision: one workflow, invoked from both places.** `tests.yml` runs gofmt,
+`go build`, `go vet` and `go test -race` on push-to-main, pull_request and
+workflow_dispatch — and also declares `workflow_call`, which `release.yml`'s
+`goreleaser` job now depends on via `needs: [changelog, test]`.
+
+*Why the release gate, and not just the branch gate.* `paths-ignore: '**.md'`
+keeps the batched-release cost posture — a release bundle here is mostly
+CHANGELOG/TODO commits and those stay free. In the issuer that same filter
+opened a hole at release time: it tags a docs-only CHANGELOG commit, so the
+TAGGED SHA got no run and `await_ci` had to guess a verdict, which promoted a
+red tree (`v0.106.0`) and an unverified one (`v0.117.0`). The CLI has no
+promote step to teach, so the gate is a dependency instead. Invoking the
+workflow rather than copying its steps is the point: a release cannot come to
+be gated by a weaker check than a routine commit is, because there is only one
+check.
+
+*Why `1.23` and not the issuer's `1.26`.* The gate must compile what goreleaser
+ships. A newer toolchain in the test job would be testing a tree the release
+never builds.
+
+*Why `-race` and `gofmt` are in from day one.* Both were MEASURED clean before
+being added — 0 races over the single package in 21.2s, `gofmt -l cmd` empty —
+and that measurement is the whole argument for adding them at that moment. The
+ratchet is one line while it is green and an open-ended debugging session once
+it is not. `gofmt -l` also derives its file list from the tree, which matters:
+elsewhere in this workspace the same drift was tracked as a hand-written list
+of filenames, and every re-check found the NAMED files clean and DIFFERENT ones
+drifted.
+
+**Trap recorded.** `tests.yml`'s concurrency group carries a literal `tests-`
+prefix. Under `workflow_call`, `github.workflow` resolves to the CALLER's name,
+so the bare `${{ github.workflow }}-${{ github.ref }}` would evaluate at tag
+time to exactly `release.yml`'s own group — which sets `cancel-in-progress:
+false` deliberately, where this one sets `true`.
+
+**Not done.** The pinned-SHA rewrite of `release.yml` and `changelog-hygiene.yml`
+is in flight on `ci/workflow-hygiene` and is not duplicated here; this commit
+touches only the `goreleaser` job's `needs:` line and adds a job above it, so
+that branch should merge with at most a trivial conflict. `tests.yml` is itself
+SHA-pinned and passes that branch's pin check as written.
 
 ## 2026-09-05 — every query flag is labelled "(filter)", including a safety-guard override
 

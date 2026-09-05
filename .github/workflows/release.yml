@@ -24,8 +24,21 @@ jobs:
       - uses: actions/checkout@v7
       - run: ./scripts/changelog-hygiene.sh tag "$GITHUB_REF_NAME"
 
+  # The suite, run against the TAGGED tree, as a hard dependency of the
+  # release. `tests.yml` is the same workflow that gates pushes to main; it is
+  # invoked here rather than duplicated so the release can never be gated by a
+  # weaker check than a routine commit is.
+  #
+  # This is what closes the `paths-ignore` hole for this repo. The issuer hit
+  # it twice — it tags a docs-only CHANGELOG commit, so the tagged SHA got no
+  # run and the promote step had to guess a verdict, which promoted a red tree
+  # (`v0.106.0`) and an unverified one (`v0.117.0`). The CLI has no promote
+  # step to teach, so the gate is a dependency instead.
+  test:
+    uses: ./.github/workflows/tests.yml
+
   goreleaser:
-    needs: changelog
+    needs: [changelog, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
