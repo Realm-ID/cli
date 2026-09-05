@@ -12,39 +12,39 @@ Open work only; shipped items live in `CHANGELOG.md` / git tags.
 
 ## The vendored spec is FIVE issuer releases behind (`0.38.0` vs `0.44.0`)
 
-- [x] **CLOSED 2026-09-04.** Re-vendored `cmd/realm-id/openapi.yaml` from
-      `issuer/docs/swagger.yaml`, `info.version` `0.38.0` → `0.44.0`. The
-      title's "FIVE" was itself stale — the measured gap was **SIX**. Command-
-      tree diff (via the CLI's own `buildCommands()`, before/after) is the
-      deliverable: **0 commands added/removed, 0 flags renamed, 0
-      required-ness changes.** 3 endpoints gained optional pagination flags
-      only (`--cursor`/`--limit` on `service-accounts list`, `sources list`,
-      `sso-domains list`), matching the issuer's pagination-input-validation
-      rollout. `role-templates` (create/list/update, no delete) unchanged,
-      still no `delete` verb, per ADR-062 §5. The `409 last_owner` and the new
-      `400 invalid_cursor`/`400 invalid_limit` are response-shape/status
-      additions the command struct doesn't model and needed no code change —
-      the CLI already forwards whatever status the issuer returns. No breaking
-      changes; `go build ./...` clean, `go test ./...` green (12.172s).
-      ~~Original finding:~~ Measured 2026-09-04. `cmd/realm-id/openapi.yaml` declares `info.version 0.38.0`;
-the issuer serves `0.44.0`. The path count matches (120 both sides), so the
-command TREE is probably unaffected — but that is an inference from one number,
-not a diff, and it is exactly the inference this repo's own convention warns
-against: the CLI derives its surface from the embedded spec at runtime, so a
-spec re-vendor is how a new verb arrives, and a stale spec is how one silently
-does not.
-
-What changed across those five versions is not audited here. At minimum
-`0.44.0` documents the `409 last_owner` on
-`PATCH /tenants/{id}/users/{uid}/status`, which the CLI currently describes as
-`200`-only.
-
-Not folded into the ADR-107 release that surfaced it: a five-version catch-up
-needs its own command-tree diff (`realm-id --help` before/after, per the repo
-convention), and smuggling it into an unrelated release is how an unreviewed
-surface change ships.
-
-**Do this as: re-vendor, diff the command tree, then tag.** In that order.
+> ~~**CLOSED 2026-09-04.**~~ **CLOSED 2026-09-04** — Re-vendored `cmd/realm-id/openapi.yaml` from
+> `issuer/docs/swagger.yaml`, `info.version` `0.38.0` → `0.44.0`. The
+> title's "FIVE" was itself stale — the measured gap was **SIX**. Command-
+> tree diff (via the CLI's own `buildCommands()`, before/after) is the
+> deliverable: **0 commands added/removed, 0 flags renamed, 0
+> required-ness changes.** 3 endpoints gained optional pagination flags
+> only (`--cursor`/`--limit` on `service-accounts list`, `sources list`,
+> `sso-domains list`), matching the issuer's pagination-input-validation
+> rollout. `role-templates` (create/list/update, no delete) unchanged,
+> still no `delete` verb, per ADR-062 §5. The `409 last_owner` and the new
+> `400 invalid_cursor`/`400 invalid_limit` are response-shape/status
+> additions the command struct doesn't model and needed no code change —
+> the CLI already forwards whatever status the issuer returns. No breaking
+> changes; `go build ./...` clean, `go test ./...` green (12.172s).
+> ~~Original finding:~~ Measured 2026-09-04. `cmd/realm-id/openapi.yaml` declares `info.version 0.38.0`;
+> the issuer serves `0.44.0`. The path count matches (120 both sides), so the
+> command TREE is probably unaffected — but that is an inference from one number,
+> not a diff, and it is exactly the inference this repo's own convention warns
+> against: the CLI derives its surface from the embedded spec at runtime, so a
+> spec re-vendor is how a new verb arrives, and a stale spec is how one silently
+> does not.
+>
+> What changed across those five versions is not audited here. At minimum
+> `0.44.0` documents the `409 last_owner` on
+> `PATCH /tenants/{id}/users/{uid}/status`, which the CLI currently describes as
+> `200`-only.
+>
+> Not folded into the ADR-107 release that surfaced it: a five-version catch-up
+> needs its own command-tree diff (`realm-id --help` before/after, per the repo
+> convention), and smuggling it into an unrelated release is how an unreviewed
+> surface change ships.
+>
+> **Do this as: re-vendor, diff the command tree, then tag.** In that order.
 
 
 ## Device-flow DX (Traide integration feedback, 2026-06-29)
