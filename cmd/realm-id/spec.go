@@ -9,12 +9,23 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// openapiYAML is the issuer's OpenAPI 3.0.3 contract, vendored from
-// issuer/docs/swagger.yaml. The typed command tree (ADR-062 §1) is generated
-// from it at startup so it stays in lockstep as the API evolves — re-sync with
-// `go generate ./...` and rebuild.
+// openapiYAML is the issuer's OpenAPI 3.0.3 contract, vendored from a
+// Realm-ID/issuer RELEASE TAG — see ISSUER_CONTRACT next to it for which one.
+// The typed command tree (ADR-062 §1) is generated from this at startup, so
+// the file is not documentation: it is the source of every command, flag and
+// argument this binary has.
 //
-//go:generate cp ../../../issuer/docs/swagger.yaml openapi.yaml
+// RE-SYNC WITH `../../scripts/revendor-spec.sh vX.Y.Z`, NOT `go generate`.
+// This used to carry `//go:generate cp ../../../issuer/docs/swagger.yaml
+// openapi.yaml` — a copy from the sibling WORKING TREE, which could vendor an
+// unreleased, mid-edit or dirty spec with nothing noticing, and a wrong vendor
+// here is a wrong PROGRAM, not a wrong document. The script refuses anything
+// that is not a release tag, reads the tagged blob (never the worktree), and
+// records tag + info.version + sha256 in ISSUER_CONTRACT. The `go:generate`
+// directive is deliberately NOT replaced with one that calls the script: a
+// bare `go generate ./...` must not silently re-vendor, because choosing the
+// issuer release is a decision, not a build step.
+//
 //go:embed openapi.yaml
 var openapiYAML []byte
 

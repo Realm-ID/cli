@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-18 entries. Newest first.
+19 entries. Newest first.
 
+- [2026-09-06 — the spec is vendored from a release tag, because a wrong vendor here is a wrong program](#2026-09-06--the-spec-is-vendored-from-a-release-tag-because-a-wrong-vendor-here-is-a-wrong-program)
 - [2026-09-05 (latest) — a local `make check` before `git push`, not just a CI verdict after it](#2026-09-05-latest--a-local-make-check-before-git-push-not-just-a-ci-verdict-after-it)
 - [2026-09-05 (later) — the test suite gated nothing, and the release is now gated by the same workflow as a commit](#2026-09-05-later--the-test-suite-gated-nothing-and-the-release-is-now-gated-by-the-same-workflow-as-a-commit)
 - [2026-09-05 — every query flag is labelled "(filter)", including a safety-guard override](#2026-09-05--every-query-flag-is-labelled-filter-including-a-safety-guard-override)
@@ -27,6 +28,76 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-09-06 — the spec is vendored from a release tag, because a wrong vendor here is a wrong program
+
+**Problem.** `cmd/realm-id/spec.go` re-synced the embedded issuer contract with
+
+```go
+//go:generate cp ../../../issuer/docs/swagger.yaml openapi.yaml
+```
+
+a copy from the sibling **working tree**. Whatever bytes happened to be on disk
+became this binary's command surface. Three ways that goes wrong and nothing
+notices: the issuer checkout is on a feature branch or mid-edit (we ship
+commands for endpoints that exist nowhere), it is simply behind (we silently
+delete verbs), or — the only safe failure — the path is absent and `cp` errors.
+
+This matters more here than in any other repo that vendors this file. This CLI
+has **no SDK dependency**: `buildCommands()` derives every group, verb, flag and
+argument from the embedded spec at startup (ADR-062 §1). A wrong vendor does not
+produce a wrong document, it produces a wrong **program**. And the path is
+exercised often — this log already tracked eight re-vendors before this entry.
+
+**Found from the outside.** This was not noticed here. It surfaced while
+building `Realm-ID/api`'s contract-parity gate, whose tag-only constraint made
+the working-tree `cp` visible by contrast. Worth recording: the defect had
+survived eight uses of the mechanism it lives in.
+
+**Decision.** Vendor from a **release tag**, record the provenance, and prove it
+in a test.
+
+- `scripts/revendor-spec.sh <vX.Y.Z>` refuses anything that is not `vX.Y.Z` and
+  reads the *tagged blob* (`git show <tag>:docs/swagger.yaml`, or `gh api` at the
+  same `?ref=`), so a dirty worktree cannot leak in by construction rather than
+  by discipline.
+- `cmd/realm-id/ISSUER_CONTRACT` records the tag, `info.version` and a `sha256`.
+  The **tag** is the identity: `info.version` does not name a release (issuer
+  `v0.121.0` and `v0.121.1` both serve `0.46.0`), and this log's own re-vendor
+  entries are titled by `info.version`, which is why that ambiguity was easy to
+  miss.
+- `cmd/realm-id/spec_contract_test.go` makes the record load-bearing: the
+  embedded bytes must hash to what `ISSUER_CONTRACT` says, the pin must look like
+  a release tag, and — the non-vacuity half — a real command tree must still come
+  out of it. The hash check alone would pass just as happily on a valid but
+  gutted spec, and this binary's whole surface is derived from that file.
+
+**`go:generate` was deliberately NOT repointed at the script.** A bare `go
+generate ./...` must not re-vendor: choosing which issuer release this CLI
+targets is a decision someone makes, not a step a build runs.
+
+**The cross-repo half, and why it is not here.** In session mode — the default —
+every generated command goes to `bffURL() + "/api"` (`resolveCredential`,
+`commands.go`), i.e. through `Realm-ID/api`'s passthrough, which strips the
+prefix and forwards the issuer path verbatim. The chain is *CLI → BFF `/api/*` →
+issuer*, and the contract at both ends is the issuer's. So this CLI and that BFF
+must be pinned to the **same** issuer release, or we offer commands the BFF's own
+pinned contract does not describe. Neither repo can see the other — separate
+repos, separate CI checkouts — so the check lives in the umbrella
+(`Realm-ID/project`'s `scripts/issuer-pin-parity.py`, in its `make check`), which
+is the only place both are visible. That is the same split the owner's testing
+model names: each repo owns its own tests, the umbrella owns what spans repos.
+
+**Nothing changed in the binary.** The committed `openapi.yaml` already hashed
+byte-identical to issuer `v0.121.1`, so the command tree is untouched (101
+commands, 31 groups). The defect was **latent, not active** — which is exactly
+why it needed fixing before it wasn't.
+
+**Tradeoff.** `scripts/revendor-spec.sh` is a near-copy of the one in
+`Realm-ID/api`. Two separate repos with separate CI checkouts and separate
+release trains cannot share a script, and the umbrella pin-parity check is what
+stops the two copies drifting into disagreement about what is pinned. A shared
+script would be tidier and unrunnable.
 
 ## 2026-09-05 (latest) — a local `make check` before `git push`, not just a CI verdict after it
 

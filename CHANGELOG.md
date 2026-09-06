@@ -3,6 +3,38 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## Unreleased
+
+### Changed — the vendored issuer spec comes from a release TAG, not a working tree
+
+`openapi.yaml` is not documentation: the entire command tree is generated from
+it at startup, so a wrong vendor is a wrong **program**, not a wrong document.
+It was re-synced with `//go:generate cp ../../../issuer/docs/swagger.yaml
+openapi.yaml` — a copy from the sibling **working tree**, which could vendor an
+unreleased, mid-edit or dirty spec with nothing anywhere noticing.
+
+- **`scripts/revendor-spec.sh <vX.Y.Z>`** replaces that `cp`. Release tags only;
+  a branch, `HEAD` or a path is refused. Reads the *tagged blob* (`git show
+  <tag>:`, never the worktree) or `gh api` pinned to the same ref, and prints a
+  summary of which paths and schemas moved.
+- **`cmd/realm-id/ISSUER_CONTRACT`** — new: the issuer release tag this binary's
+  commands come from, plus the spec's `info.version` and a `sha256`.
+- **`cmd/realm-id/spec_contract_test.go`** — new: the embedded bytes must be the
+  bytes `ISSUER_CONTRACT` names, the pin must look like a release tag, and the
+  spec must still yield a real command tree (101 commands at issuer `v0.121.1`).
+- The `//go:generate` directive is **not** replaced with one that calls the
+  script: `go generate ./...` must not silently re-vendor, because choosing the
+  issuer release is a decision, not a build step.
+
+No change to the vendored spec itself — the committed copy already hashed
+byte-identical to issuer `v0.121.1`, so **the command tree is unchanged**. What
+changed is that this is now provable rather than assumed.
+
+Cross-repo: `Realm-ID/project`'s `scripts/issuer-pin-parity.py` (in its `make
+check`) fails when this pin and `Realm-ID/api`'s disagree — in session mode
+every generated command is sent through that BFF's `/api/*` passthrough, so the
+two must name the same issuer release.
+
 ## v0.3.7 — write-side query flags stop calling themselves filters (2026-09-05)
 
 ### Fixed

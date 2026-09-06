@@ -72,5 +72,12 @@ install-hooks:
 # scripts/changelog-hygiene.sh ships with no test suite of its own (it is a
 # pre-existing script, not new in this pass). preflight-parity.sh IS new and
 # renders a verdict, so its tests run here per the checker-tests rule.
+#
+# revendor-spec.sh renders a verdict too — it REFUSES to vendor the issuer spec
+# from anything but a release tag, which is the only thing standing between this
+# binary and a command tree generated from an unreleased spec. Its self-test
+# proves the refusal still fires. The vendored copy's own integrity gate is a Go
+# test (cmd/realm-id/spec_contract_test.go), already covered by `go test -race`.
 self-test:
 	./scripts/preflight-parity_test.sh
+	./scripts/revendor-spec.sh selftest
