@@ -1,5 +1,21 @@
 # TODO — cli (`realm-id`)
 
+> **Filed 2026-09-06 from `Realm-ID/api`'s contract-parity work — needs the
+> owner's call, NOT fixed inline (different repo, different release train).**
+>
+> - [ ] **`cmd/realm-id/spec.go:17` re-vendors the issuer spec from the sibling
+>       WORKING TREE**: `//go:generate cp ../../../issuer/docs/swagger.yaml
+>       openapi.yaml`. That can vendor an unreleased, mid-edit or dirty spec and
+>       nothing would notice — and this CLI's entire command tree is generated
+>       from that file at startup, so a bad vendor ships wrong commands. This
+>       repo's `DECISIONS.md` tracks eight re-vendors, so the path is exercised
+>       often, which raises the odds rather than lowering them.
+>       **Fix available:** `api/scripts/revendor-spec.sh` already does this
+>       tag-only (refuses a branch/`HEAD`/a path, sources the blob via
+>       `git show <tag>:` or `gh api ?ref=<tag>`, and records tag +
+>       `info.version` + `sha256`). Either reuse it or lift it.
+
+
 Open work only; shipped items live in `CHANGELOG.md` / git tags.
 
 > **Re-verified 2026-08-03** against the tree — all four items still stand, with
