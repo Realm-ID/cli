@@ -9,11 +9,29 @@
 
 Open work only; shipped items live in `CHANGELOG.md` / git tags.
 
-> **Re-verified 2026-08-03** against the tree — all four items still stand, with
-> the cited line numbers refreshed: `resolveCredential`
-> (`cmd/realm-id/commands.go:312-317`) still returns the raw `rk_live_…` as the
-> bearer for the issuer, and `authWhoami` (`cmd/realm-id/main.go:501-512`) still
-> prints `/me` verbatim with no `exp` decode.
+> **Re-verified 2026-09-13 against the tree. The previous note here was half
+> stale and is replaced.** It was dated 2026-08-03, claimed "all four items
+> still stand", and survived both the fix that closed one of them and the
+> sweeps that closed two others.
+>
+> - **CLOSED — `resolveCredential` does NOT send the raw `rk_live_…` as a
+>   bearer.** `cmd/realm-id/commands.go:325` performs the ADR-051 exchange
+>   (`POST /auth/login {grant_type: platform_api_key}`) and bears the returned
+>   platform JWT; the raw key is only ever the `api_key` BODY field. Fixed
+>   2026-08-05 — **two days after the note asserting otherwise was written.**
+>   The record is in [`TODO-ARCHIVE.md`](TODO-ARCHIVE.md), including the part
+>   worth remembering: the old `TestResolveCredential` asserted
+>   `bearer == "rk_live_1"`, so it restated the implementation and would have
+>   failed the moment anyone fixed the bug it was protecting.
+> - **STILL OPEN — `authWhoami` (`cmd/realm-id/main.go:534`) prints `/me`
+>   verbatim with no `exp` decode.** The CLI decodes `exp` NOWHERE. Note the
+>   partial mitigation, so it is not re-derived: `sessionHint` (`:523`) prints
+>   a re-login hint, but only on a **401** carrying `session_expired`,
+>   `session_missing` or `session_revoked` — reactive, after expiry has
+>   already bitten, and it never says when a live session will expire.
+>
+> Both line numbers in the old note had also drifted (`commands.go:312-317`
+> and `main.go:501-512` no longer point at either function).
 
 
 ## Device-flow DX (Traide integration feedback, 2026-06-29)
