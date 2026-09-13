@@ -17,6 +17,15 @@
 
 ## The vendored spec is FIVE issuer releases behind (`0.38.0` vs `0.44.0`)
 
+> ⚠️ **Read `0.44.0` below as HISTORY, not as current.** This record closes the
+> FIRST of two re-vendors. `cli v0.3.6` later took the spec `0.44.0` → `0.46.0`
+> (issuer `v0.121.0`/`v0.121.1`, ADR-101), which has its own `CHANGELOG.md`
+> entry. As of 2026-09-13 the vendored spec is byte-identical to
+> `issuer/docs/swagger.yaml` — both hash `5e139f99aa68c3b2…` — so the CLI is
+> not behind at all. What IS still open is narrower and lives in
+> [`TODO.md`](TODO.md): the pin is verified real and consistent, never
+> *current*.
+
 > ~~**CLOSED 2026-09-04.**~~ **CLOSED 2026-09-04** — Re-vendored `cmd/realm-id/openapi.yaml` from
 > `issuer/docs/swagger.yaml`, `info.version` `0.38.0` → `0.44.0`. The
 > title's "FIVE" was itself stale — the measured gap was **SIX**. Command-

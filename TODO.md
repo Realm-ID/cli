@@ -81,13 +81,40 @@ warning against concurrent `auth login`); these are the code fixes.
 > delete it — a stale "nothing here" is worse than no banner, because it is
 > believed.
 
-- [ ] **No test compares the vendored `info.version` against the issuer's** —
-      `cmd/realm-id/openapi.yaml` vs `issuer/docs/swagger.yaml`. Asked for by the
-      re-vendor item closed above and deliberately not built there: the check is
-      **cross-repo**, and `Realm-ID/cli`'s CI checks out only this repo, so a test
-      reading `../../../issuer/docs/swagger.yaml` would `t.Skip` in the one place
-      it needs to run — a guard that reports nothing. It belongs in the umbrella
-      repo's cross-repo CI (or needs the ADR-062 §6-era deploy-key setup), not in
-      `cmd/realm-id/spec_test.go`. Until then the drift is caught by a human
-      diffing the tree, plus `TestTopLevelResourceGroupsAreReviewed` catching the
-      subset of drift that changes the command surface.
+- [ ] **The vendored pin is verified REAL and CONSISTENT, never CURRENT** —
+      nothing notices when it falls behind the issuer's newest release.
+      ⚠️ **RE-SCOPED 2026-09-13. This item used to read "No test compares the
+      vendored `info.version` against the issuer's", and that is no longer
+      true** — it was written before the 2026-09-06 work and never revisited.
+      What exists today:
+  - `scripts/revendor-spec.sh` vendors from a **release tag**, replacing the
+    `//go:generate cp ../../../issuer/docs/swagger.yaml` that copied from the
+    sibling WORKING TREE and could vendor an unreleased or mid-edit spec.
+  - `cmd/realm-id/spec_contract_test.go` — the embedded bytes must hash to
+    what `ISSUER_CONTRACT` names, the pin must be a release tag, and a real
+    command tree must still come out of the spec (the non-vacuity half).
+  - The umbrella's `scripts/issuer-pin-parity.py` (in its `make check`) —
+    and it **does** reach the issuer, contrary to what this item claimed: it
+    verifies the pinned tag EXISTS in `issuer/` and that its
+    `docs/swagger.yaml` hashes to the recorded `spec_sha256`. It also holds
+    `api/` and `cli/` to the SAME issuer release, which matters because every
+    generated command is sent through the BFF's `/api/*` passthrough.
+
+      **The residual gap, stated precisely.** All three check that the pin is
+      real and internally consistent. **None checks that it is the NEWEST
+      issuer release.** A live instance as of 2026-09-13: `ISSUER_CONTRACT`
+      pins `issuer_tag=v0.121.1` while the issuer is tagged **`v0.122.0`**.
+      That is benign *only* because `docs/swagger.yaml` is byte-identical
+      across those two tags — verified, both blobs hash
+      `5e139f99aa68c3b2…`. **Had `v0.122.0` touched the spec, every gate above
+      would still be green and this CLI would ship an outdated command tree.**
+      For this repo that is a wrong PROGRAM, not a wrong document, because
+      `buildCommands()` derives the whole tree from the spec at startup.
+
+      **The obvious closer**: have `issuer-pin-parity.py` also compare the pin
+      against the issuer's newest tag and **WARN, not fail**, when it is
+      behind. Being behind is legitimate — re-vendoring is a decision, not a
+      build step (which is why `go generate` deliberately does not do it).
+      Being *unknowingly* behind is the defect. Keep it local-only for the
+      same reason the rest of that script is: this umbrella's CI checks out
+      only itself, so a CI copy could only ever report "NOT CHECKED".
