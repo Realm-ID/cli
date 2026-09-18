@@ -81,40 +81,18 @@ warning against concurrent `auth login`); these are the code fixes.
 > delete it — a stale "nothing here" is worse than no banner, because it is
 > believed.
 
-- [ ] **The vendored pin is verified REAL and CONSISTENT, never CURRENT** —
-      nothing notices when it falls behind the issuer's newest release.
-      ⚠️ **RE-SCOPED 2026-09-13. This item used to read "No test compares the
-      vendored `info.version` against the issuer's", and that is no longer
-      true** — it was written before the 2026-09-06 work and never revisited.
-      What exists today:
-  - `scripts/revendor-spec.sh` vendors from a **release tag**, replacing the
-    `//go:generate cp ../../../issuer/docs/swagger.yaml` that copied from the
-    sibling WORKING TREE and could vendor an unreleased or mid-edit spec.
-  - `cmd/realm-id/spec_contract_test.go` — the embedded bytes must hash to
-    what `ISSUER_CONTRACT` names, the pin must be a release tag, and a real
-    command tree must still come out of the spec (the non-vacuity half).
-  - The umbrella's `scripts/issuer-pin-parity.py` (in its `make check`) —
-    and it **does** reach the issuer, contrary to what this item claimed: it
-    verifies the pinned tag EXISTS in `issuer/` and that its
-    `docs/swagger.yaml` hashes to the recorded `spec_sha256`. It also holds
-    `api/` and `cli/` to the SAME issuer release, which matters because every
-    generated command is sent through the BFF's `/api/*` passthrough.
-
-      **The residual gap, stated precisely.** All three check that the pin is
-      real and internally consistent. **None checks that it is the NEWEST
-      issuer release.** A live instance as of 2026-09-13: `ISSUER_CONTRACT`
-      pins `issuer_tag=v0.121.1` while the issuer is tagged **`v0.122.0`**.
-      That is benign *only* because `docs/swagger.yaml` is byte-identical
-      across those two tags — verified, both blobs hash
-      `5e139f99aa68c3b2…`. **Had `v0.122.0` touched the spec, every gate above
-      would still be green and this CLI would ship an outdated command tree.**
-      For this repo that is a wrong PROGRAM, not a wrong document, because
-      `buildCommands()` derives the whole tree from the spec at startup.
-
-      **The obvious closer**: have `issuer-pin-parity.py` also compare the pin
-      against the issuer's newest tag and **WARN, not fail**, when it is
-      behind. Being behind is legitimate — re-vendoring is a decision, not a
-      build step (which is why `go generate` deliberately does not do it).
-      Being *unknowingly* behind is the defect. Keep it local-only for the
-      same reason the rest of that script is: this umbrella's CI checks out
-      only itself, so a CI copy could only ever report "NOT CHECKED".
+- [ ] **The vendored spec pin is verified REAL and CONSISTENT, never CURRENT —
+      and it is drifting right now.** ⚠️ **RE-SCOPED 2026-09-18.** The
+      mechanism half of this item SHIPPED: `scripts/revendor-spec.sh` and
+      `cmd/realm-id/spec_contract_test.go` both exist on `cli/main`, so the vendor
+      is now pinned to an issuer RELEASE TAG with an `ISSUER_CONTRACT` pin and a
+      contract test — no more `//go:generate cp` out of a sibling working tree.
+      **What is still missing is the FRESHNESS check**, and it is not hypothetical:
+      `scripts/issuer-pin-parity.py` verifies the pin is real and self-consistent
+      but has no notion of *newest*, and today the pin is **`v0.121.1`** against an
+      issuer at **`v0.125.0`** — four releases behind, reported by nothing.
+      Add a WARN (not a hard fail — a lagging pin is a decision, a silent one is
+      not) when the pinned tag is behind the issuer's newest.
+      ⚠️ **Note the shipped binary predates all of this**: `cli` is tagged
+      `v0.3.7` and `main` is 8 commits ahead, so the revendor machinery is
+      FIXED-ON-MAIN-BUT-UNRELEASED. Do not read it as live.
