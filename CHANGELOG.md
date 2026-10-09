@@ -5,6 +5,13 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Changed — embedded issuer spec re-pinned `v0.121.1` → `v0.131.0` (spec `0.46.0` → `0.52.0`)
+
+Kept in step with the BFF (`api` re-pinned the same day; `scripts/issuer-pin-parity.py`
+requires both to name one issuer release). **The command tree is unchanged**: listing the verbs
+of all 19 resources before and after gives identical output (137 lines). What moved is response
+schemas, e.g. `LogoutResponse` with `sid`/`revoked_sids` (ADR-109 D11).
+
 ### Changed — the vendored issuer spec comes from a release TAG, not a working tree
 
 `openapi.yaml` is not documentation: the entire command tree is generated from

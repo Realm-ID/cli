@@ -104,7 +104,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.46.0
+  version: 0.52.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -1406,7 +1406,22 @@ components:
         iat: { type: integer, format: int64 }
         nbf: { type: integer, format: int64 }
         exp: { type: integer, format: int64 }
-        jti: { type: string }
+        jti:
+          type: string
+          description: |
+            Token id, unique per token (RFC 7519 §4.1.7, ADR-109 Issuer B,
+            spec 0.51.0). Before Issuer B it equalled the session id and was
+            shared by every access token of a session; a reader that still
+            treats it as a session id MUST move to `sid`. Key revocation on
+            `sid`, never on `jti`.
+        sid:
+          type: string
+          description: |
+            ADR-109 (from Issuer A). The session id, stable across refresh;
+            present on every session-bound access token. Absent on tokens
+            minted before Issuer A and, by owner ruling, on ADR-083
+            integration tokens (they have no session). A reader falls back to
+            `jti` when absent.
         azp: { type: string }
         tenant_id: { type: string, format: uuid }
         role: { type: string }
@@ -1423,7 +1438,37 @@ components:
       type: object
       properties:
         refresh_token: { type: string }
-        all: { type: boolean, default: false }
+        all:
+          type: boolean
+          default: false
+          description: |
+            `true` revokes EVERY session of the identity in the realm, including
+            sessions anchored on a sibling org's membership (the same scope as
+            `DELETE /auth/sessions`; ADR-109 D11 amendment, 2026-10-02), and
+            the response's `revoked_sids` names exactly those sessions. If the
+            identity's memberships cannot be resolved the call fails and
+            nothing is revoked.
+
+    LogoutResponse:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, example: ok }
+        revoked_sids:
+          type: array
+          items: { type: string }
+          description: |
+            ADR-109 D11 (Q5). Present only when the request had `all: true`:
+            every session id revoked by the call, the presenting session
+            included.
+        sid:
+          type: string
+          description: |
+            ADR-109 D11 (from Issuer A; DESIGNED, NOT BUILT). The revoked
+            session's id (`sessions.jti`), equal to the `sid` claim of its
+            access tokens. Absent from an issuer older than Issuer A; a client
+            then falls back to a non-expired access token's `sid`/`jti`.
+          example: 0199a6c2-5f1e-7c3a-9b0e-1f2d3c4b5a69
 
     StatusOK:
       type: object
@@ -1595,7 +1640,8 @@ components:
             nothing ever put it in the list.
 
             **Advertised only when COMPLETABLE.** `password` appears only when
-            the deployment has a credential store wired (without one,
+            the deployment has a credential store wired AND the realm's
+            `password_login_enabled` is set (missing either,
             `grant_type=password` answers `400 unknown_method`); `otp` only when
             the realm's `otp_login_enabled` is set. Offering a method the
             deployment cannot finish is the "coming soon" failure — a user picks
@@ -2136,11 +2182,18 @@ components:
             Allowlist of partner-supplied claim keys honoured by
             POST /auth/token's `custom_claims` (SDK SPEC §4.2). Reserved
             JWT claim names (iss, sub, aud, iat, nbf, exp, jti, azp,
-            tenant_id, role, mfa_at, amr, scope, token_class) always win,
+            tenant_id, role, mfa_at, amr, scope, token_class, product_roles;
+            `sid` and `events` join this set with ADR-109 Issuer A — `events`
+            because the access-token verifiers refuse any token carrying it)
+            always win,
             and a request naming one is now REFUSED with 400
             `reserved_claim_key` rather than dropped (ADR-097 D3 — the list
             this sentence used to carry was hand-maintained and had already
-            drifted, omitting `mfa_at` and `amr`). Any request key not in
+            drifted, omitting `mfa_at` and `amr`). Writing a reserved name
+            INTO this allowlist is refused too: the config PATCH answers 400
+            `reserved_claim_key` naming the key(s), from the same list the
+            mint uses (before, it stored the name and every mint using it
+            then failed). Any request key not in
             this allowlist returns 400 `bad_request`. Empty / unset = no
             custom claims accepted.
         service_refresh_rotates:
@@ -2270,6 +2323,14 @@ components:
             requires the user to be enrolled in `otp` — see
             `users.mfa_methods`. (The per-role `required_mfa_methods` that used
             to be unioned in here was retired by ADR-101.)
+        password_login_enabled:
+          type: boolean
+          description: |
+            Gates `POST /auth/token` with `grant_type=password` (ADR-104
+            native username/password). Default **false** — a realm opts IN
+            rather than opts out, since no realm holds any
+            `user_credentials` rows as of this knob's introduction (A-M11,
+            2026-09-21).
 
         # ---- ADR-094 D4: per-org domain SSO -------------------------------
         domain_sso:
@@ -2316,6 +2377,37 @@ components:
               type: string
               enum: [exclusive, shared]
 
+        # ---- ADR-109 D10: org-session mode ---------------------------------
+        org_sessions:
+          type: object
+          description: |
+            ADR-109 D10 (from Issuer A; DESIGNED, NOT BUILT). Whether one
+            login session may be active in several of the realm's orgs at
+            once. A tenant switch rotates the refresh token, and a rotation
+            invalidates the session's older access tokens — this decides
+            WHICH older tokens.
+
+            - `concurrent` (the default, which is what a realm with no
+              `org_sessions.mode` key reads as): only older tokens for the
+              SAME membership (same `sub`) die. Alice refreshing her Globex
+              tab leaves her Acme tab working.
+            - `exclusive`: every older token of the session dies, whichever
+              org it was for. Switching to Globex logs her Acme tab out.
+
+            Only those two values are accepted. Any other value, INCLUDING an
+            explicit empty string, is refused `400 invalid_org_sessions_mode`;
+            to return to the default, set `concurrent`. An unknown key inside
+            the object is `400 unknown_config_key`.
+
+            Moot under `single_tenant_membership: true` (one membership, so
+            both modes behave the same). No re-login is needed after a change:
+            SDK v0.63.0 applies it in partner apps once its discovery cache
+            refreshes (from Issuer A); the issuer applies it on its own
+            routes within 5 s (from Issuer B). Advertised anonymously as
+            `realmid_org_sessions` in the realm's discovery document. Nested
+            like `user_api_keys`; a PATCH deep-merges it.
+          properties:
+            mode: { type: string, enum: [concurrent, exclusive] }
         # ---- ADR-084 §10: user API keys (end-user keys) -------------------
         user_api_keys:
           type: object
@@ -2547,6 +2639,7 @@ components:
         otp_ttl_seconds: { type: integer }
         otp_login_enabled: { type: boolean }
         otp_mfa_enabled: { type: boolean }
+        password_login_enabled: { type: boolean }
         service_refresh_rotates: { type: boolean }
         service_refresh_ttl_seconds: { type: integer }
         service_refresh_ttl_max_seconds: { type: integer }
@@ -2557,6 +2650,14 @@ components:
         mfa_policy: { type: string }
         accept_provider_mfa: { type: boolean }
         provider_mfa_ttl_seconds: { type: integer }
+        org_sessions:
+          type: object
+          description: |
+            ADR-109 D10. See `RealmConfigPatch.org_sessions`. The view always
+            carries the RESOLVED mode, never an empty string, so an unset
+            realm reads `concurrent`.
+          properties:
+            mode: { type: string, enum: [concurrent, exclusive] }
         # ADR-084 §10. Always the full object with every sub-key present, same
         # "no key is ever omitted" rule the top level follows. The two nullable
         # booleans default to TRUE, so `null` means "never configured" and
@@ -2712,7 +2813,11 @@ components:
       type: object
       description: >-
         A platform app/source (ADR-072 §1). `allowed_methods` is mapping-2 —
-        the login methods this app surfaces.
+        the login methods this app surfaces. It holds PER-APP tier mechanisms
+        only (ADR-108): those the issuer can bind to this app from a signal the
+        client cannot forge. Credential mechanisms are per-realm knobs and do
+        not appear here; the `otp` on a `bot` row is a legacy marker, not a
+        grant.
       properties:
         id: { type: string, format: uuid }
         platform_id: { type: string, format: uuid }
@@ -2768,8 +2873,12 @@ components:
           type: array
           items: { type: string, enum: [google, microsoft, apple, facebook, firebase, otp] }
           description: >-
-            A `bot` source may list only `otp`; a human source may never list
-            `otp` (mapping-1 invariant, ADR-072 §0).
+            A human source may list only PER-APP tier methods
+            (google/microsoft/apple/facebook/firebase) — those whose app the
+            issuer can bind from a provider-signed `aud`. A `bot` source may
+            list only `otp`, a legacy marker rather than a gate. Credential
+            mechanisms (`otp`, `password`) are configured per realm, not here
+            (ADR-108).
 
     PatchSourceRequest:
       type: object
@@ -4242,6 +4351,18 @@ paths:
     post:
       tags: [Auth]
       summary: Revoke the current session (or all sessions)
+      description: |
+        Resolves the session from the refresh token (body `refresh_token`, or
+        the bearer when the body has none) and revokes it; with `all: true`,
+        every session of that session's user. An unknown or already-spent
+        refresh token is `401`.
+
+        From ADR-109 Issuer A (DESIGNED, NOT BUILT) the `200` body also carries
+        `sid`: the id of the session the presented refresh token belonged to,
+        the same value as the `sid` claim on that session's access tokens. An
+        SDK revokes that `sid` in its own session store, so logout is keyed by
+        the refresh-token holder rather than by any access token. With
+        `all: true` it is still only the presenting session's id.
       security:
         - BearerRefresh: []
       requestBody:
@@ -4251,10 +4372,10 @@ paths:
             schema: { $ref: '#/components/schemas/LogoutRequest' }
       responses:
         '200':
-          description: OK
+          description: OK — the session is revoked
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/StatusOK' }
+              schema: { $ref: '#/components/schemas/LogoutResponse' }
 
   /auth/mfa/enroll:
     post:
@@ -4481,8 +4602,10 @@ paths:
         SPEC §10.4 — SDK middleware calls this when a protected route
         requires fresh MFA but the caller's `mfa_at` is missing or stale.
         Auth: bearer of the user's current access token (NOT a platform
-        token). The minted challenge is bound to (sub, tenant_id, jti) of
-        the access token and is consumed by POST /auth/mfa/verify.
+        token). The minted challenge is bound to (sub, tenant_id, session)
+        of the access token — the session is the token's `jti` today, and
+        its `sid` (falling back to `jti`) from ADR-109 Issuer A — and is
+        consumed by POST /auth/mfa/verify.
       security:
         - BearerAccess: []
       responses:
@@ -4786,6 +4909,19 @@ paths:
                   jwks_uri: { type: string, format: uri }
                   token_endpoint: { type: string, format: uri }
                   revocation_endpoint: { type: string, format: uri }
+                  realmid_org_sessions:
+                    type: string
+                    enum: [concurrent, exclusive]
+                    description: |
+                      ADR-109 D10 (from Issuer A; DESIGNED, NOT BUILT). The
+                      realm's resolved `org_sessions.mode`, always present
+                      from Issuer A on. An SDK uses it to decide whether its
+                      "reject tokens issued before T" mark is kept per session
+                      (`exclusive`) or per (session, `sub`) (`concurrent`). An
+                      ABSENT field (an issuer older than Issuer A) means
+                      `concurrent`. An extension field, as OIDC Discovery 1.0
+                      §3 permits; prefixed so it cannot collide with a future
+                      standard name.
                   id_token_signing_alg_values_supported:
                     type: array
                     items: { type: string }
@@ -5764,7 +5900,12 @@ paths:
         '200':
           description: OK
         '400':
-          description: unknown_config_key | invalid_config_value
+          description: |
+            unknown_config_key | invalid_config_value | too_many_custom_claim_keys
+            | custom_claim_key_too_long | reserved_claim_key (an
+            `access_token_custom_claim_keys` entry names a reserved JWT claim
+            such as `sid`, `events`, `scope` or `role`; the message names every
+            offending key)
 
   /platforms/{id}/federation-bindings:
     parameters:
@@ -5823,6 +5964,19 @@ paths:
         realm (`requireRealmPermissionOrBaseStaff`) — see the DELETE on this
         resource for why. Every create notifies the platform owner by email
         (ADR-095).
+
+        **Creating a binding SEATS a role** — every external identity that
+        later matches it authenticates AS `mapped_role` — so ADR-101 D6's one
+        rule on every seating path applies here too: the tenant OWNER (or
+        base-realm staff) may seat any role, and nobody else may seat a role
+        that CONFERS AUTHORITY (any permission whose action is not "read"). A
+        plain `federation:manage` holder who is not the owner may still create
+        a binding, but only at a `mapped_role` that confers no authority. An
+        **omitted `mapped_role` defaults to `platform_api`**, which DOES
+        confer authority (`users:manage`, `tenants:manage`,
+        `federation:manage`, `service_accounts:manage`, `sessions:revoke` and
+        more) — so an omitted field is owner-or-base-staff work exactly like
+        an explicit one.
       security: [{ BearerAccess: [] }]
       requestBody:
         required: true
@@ -5865,7 +6019,14 @@ paths:
             `missing_mandatory_claim` | `invalid_mapped_role` (ADR-091 D2 — the
             role does not resolve in the governing realm)
         '403':
-          description: not_authorized (caller is not a realm admin / owner)
+          description: >-
+            not_authorized (caller is not a realm admin / owner) |
+            role_owner_only — only the tenant OWNER (or base-realm staff) may
+            seat a principal at a role that confers administrative authority,
+            i.e. one holding any permission whose action is not "read"
+            (ADR-101 D6). This includes the default `platform_api` when
+            `mapped_role` is omitted. A non-owner with `federation:manage` may
+            still create a binding at a role that confers no authority.
         '404':
           description: realm_not_found | federation_disabled
         '409':
@@ -6965,14 +7126,34 @@ paths:
       tags: [Platform Admin]
       summary: Register an app/source
       description: |
-        Creates a platform-level source. Validation (ADR-072 §0 — mapping-2 can
-        never weaken the mapping-1 safety invariant):
+        Creates a platform-level source. Validation:
 
         - `type` ∈ {web, android, ios, desktop, bot}
+        - a human source (web/android/ios/desktop) may list only **per-app
+          tier** methods — google/microsoft/apple/facebook/firebase
         - a `bot` source may list only `otp` in `allowed_methods`
-        - a human source (web/android/ios/desktop) may never list `otp`; each
-          method must be a recognised human provider (google/microsoft/apple/
-          facebook/firebase)
+
+        **Why that set, and not a longer one (ADR-108).** `allowed_methods` is
+        mapping-2, and mapping-2 can only gate a mechanism whose APP the issuer
+        can bind from a signal the client cannot forge. For the federated
+        providers it can: the provider signs `aud = client_id`, which resolves
+        to a source. For a credential mechanism — `otp`, `password` — it
+        cannot: nothing in the login body names the end-user app in a way the
+        issuer could verify, and a value a client asserts is a hint, not a
+        control. Those mechanisms are configured **per realm**
+        (`otp_login_enabled`, `password_login_enabled`) and enforced at the
+        lane, not here.
+
+        So `otp` on a human source is refused as `method_violates_kind`
+        (unchanged wire code, unchanged status), and `password` is refused as
+        an unrecognised method. Until spec 0.48.0 this paragraph gave the
+        mapping-1 kind invariant as the reason; ADR-103 D4 had already narrowed
+        that invariant — a human CAN log in by SMS OTP — so the reason was
+        stale while the refusal stayed correct.
+
+        The `otp` in the enum is a **legacy marker** kept for bot rows, which
+        legitimately carry it. It is not a grant: the login front-door refuses
+        the whole credential tier before it consults the row.
 
         The `bot` source is normally auto-provisioned when the first service
         account is created (one per platform); this endpoint lets an owner
