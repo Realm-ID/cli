@@ -120,6 +120,15 @@ func actionVerb(method, seg string) (string, bool) {
 		"leave", "request", "reset-handle", "revoke", "revoke-all",
 		"tenant-choice":
 		return seg, true
+	case "password-reset":
+		// Added 2026-10-13 (owner ruling) with the issuer v0.134.0 re-vendor
+		// (ADR-111): `POST /tenants/{tid}/users/{uid}/password-reset` is
+		// `users password-reset`. Non-destructive: it emails the member a
+		// single-use link (caller needs users:manage), matching the console.
+		// The anonymous token routes `/auth/password/reset[/inspect]` stay out
+		// of the typed tree via skipPath's /auth/ rule: they take the emailed
+		// token, not an admin session.
+		return seg, true
 	case "mine":
 		return "list-mine", true
 	case "pending":

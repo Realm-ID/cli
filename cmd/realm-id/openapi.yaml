@@ -104,7 +104,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.52.0
+  version: 0.53.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -235,6 +235,12 @@ components:
         - `user_not_invited` — known user but not a member of any
           tenant in the resolved realm. (Returned as **403**, not 401 —
           listed here for discoverability.)
+        - `escort_suspended` — **403**, not 401 (listed here for
+          discoverability): the `/auth/*` escort (the platform bearer the
+          partner's BFF presents) is refused because the account it was
+          minted for is suspended or deactivated (ADR-104 R-d). Distinct from
+          `user_suspended`, which names the END USER's row; this one means
+          the partner's own escort credential has to be replaced.
         - `refresh_invalid` — on `POST /auth/token` only: the presented
           refresh token is expired, revoked, or reuse-detected. Terminal
           for the caller — re-authentication is required (no retry helps).
@@ -543,6 +549,37 @@ components:
           description: |
             The presented password. Minimum **12** bytes, maximum **1024**
             (a KDF-cost bound, not a policy opinion). No composition rules.
+            When `new_password` is sent, this is the CURRENT password.
+        new_password:
+          type: string
+          format: password
+          description: |
+            **Change at sign-in (ADR-104 § Amendment 2026-10-09, R14-R21; spec
+            `0.53.0`).** Send it ONLY after a login answered
+            `403 password_must_change` — the credential was set by an
+            administrator and must be replaced before it authenticates. One
+            call then replaces the password and signs in.
+
+            - Validated as input before anything else, and never counted by the
+              per-identifier throttle: `400 password_too_short` (< 12 bytes),
+              `400 password_too_long` (> 1024), `400 password_unchanged` (equal
+              to `presented`). An empty string is treated as absent.
+            - `presented` wrong: `401 invalid_credentials`, as without this
+              field; nothing is stored.
+            - Sent when the credential is NOT must-change:
+              `400 password_change_not_required`, decided only after
+              `presented` verifies. Nothing changes and no session is created;
+              change a self-chosen password with `PUT /me/password`.
+            - Identifier throttled: `429 login_throttled`; nothing changes.
+            - Success: the new password is stored, the obligation is cleared,
+              EVERY other session of this membership is revoked, the holder is
+              notified (ADR-079, no link, no code), and the response is an
+              ordinary `200` login — MFA gates apply unchanged, so
+              `tenants[].mfa_required` may still withhold the access token.
+            - A `5xx` after the password was stored leaves the NEW password in
+              force: retry with `presented=<new>` and no `new_password`.
+
+            Ignored (with a `Warning: 299`) on every other `grant_type`.
         tenant_id:
           type: string
           format: uuid
@@ -779,9 +816,17 @@ components:
         Single-tenant user, no MFA pending — fully resolved on the first
         call. `subject_type` is `service` (not `user`) when the resolved
         subject is a `kind=service` account (`grant_type=otp`, ADR-071).
+
+        `revoked_sids` (ADR-104 R-e) is present ONLY when this sign-in changed a
+        `must_change` password (R15): exactly the session ids that change ended
+        across the person's whole identity in the realm (`[]` when none; only
+        what was actually ended on `anchor_only`). The new session is not listed.
       properties:
         status: { type: string, enum: [ok] }
         subject_type: { type: string, enum: [user, service] }
+        revoked_sids:
+          type: array
+          items: { type: string }
         user:
           type: object
           required: [id]
@@ -1655,6 +1700,18 @@ components:
             Anonymous, like the rest of this response, and deliberately: a login
             screen must say how to log in, and "this realm accepts passwords" is
             the same class of fact as "this realm accepts Google".
+        password_policy:
+          type: object
+          description: |
+            ADR-111 P9 (spec `0.53.0`). Present exactly when `credential_methods`
+            contains `password`; ABSENT means "the server did not say", never
+            "off". It lets a login or account screen state the promise:
+            `require_verified_email: true` → "your password is set by you,
+            through a link sent to your verified email; administrators never
+            see it"; `false` → "an administrator may set your first password,
+            and you must change it the first time you sign in".
+          properties:
+            require_verified_email: { type: boolean }
 
     # ---- platforms ----
 
@@ -2331,6 +2388,32 @@ components:
             rather than opts out, since no realm holds any
             `user_credentials` rows as of this knob's introduction (A-M11,
             2026-09-21).
+        password_policy:
+          type: object
+          description: |
+            ADR-111 (spec `0.53.0`). How a username/password account may come
+            to exist in this realm. A NEW nested parent: `password_login_enabled`
+            stays flat where it has always been, because moving it would break
+            every existing PATCH body.
+
+            **PATCH semantics are MERGE** — send one sub-key and the others are
+            left alone. An unknown sub-key is refused with a `400` naming the
+            dotted path, as for `user_api_keys`.
+          properties:
+            require_verified_email:
+              type: boolean
+              description: |
+                Default **false** (existing realms are unchanged). When `true`:
+                an admin can never hand over a password
+                (`PUT /tenants/{tid}/users/{uid}/credentials` with a `password`
+                answers `409 verified_email_required` on a member with no
+                verified email, and `409 reset_link_required` on one with);
+                giving a `username` to a member with no verified email, or
+                `PUT /me/password` by one, is refused the same way. Credentials
+                that already exist keep working, and an outstanding
+                `must_change` one may still be replaced at sign-in. The knob
+                governs what may be CREATED. Today only a verified EMAIL
+                counts; a phone does not, until SMS delivery ships (ADR-111 D-a).
 
         # ---- ADR-094 D4: per-org domain SSO -------------------------------
         domain_sso:
@@ -2640,6 +2723,11 @@ components:
         otp_login_enabled: { type: boolean }
         otp_mfa_enabled: { type: boolean }
         password_login_enabled: { type: boolean }
+        password_policy:
+          type: object
+          description: ADR-111. Always present; defaults filled in.
+          properties:
+            require_verified_email: { type: boolean }
         service_refresh_rotates: { type: boolean }
         service_refresh_ttl_seconds: { type: integer }
         service_refresh_ttl_max_seconds: { type: integer }
@@ -4109,9 +4197,11 @@ paths:
         Inbound bearer:
         - **User grants** (`provider_token`, `password`,
           `otp`) require `Authorization: Bearer <platform
-          access token>`. NOTE: `password` is **reserved, not
-          implemented** — it unconditionally returns
-          `400 unknown_method` (ADR-042 slot). The realm is resolved from the bearer's
+          access token>`. `password` is implemented (ADR-104) and
+          answers `400 unknown_method` only when the deployment has no
+          credential store or the realm's `password_login_enabled` is off.
+          (This line said "reserved, not implemented" until spec `0.53.0`;
+          that was stale since ADR-104 shipped.) The realm is resolved from the bearer's
           `realm_id` claim; body `realm_id` is ignored. ADR-046
           `aud` validation still applies on `provider_token` /
           `google`.
@@ -4160,8 +4250,14 @@ paths:
             | missing_provider (`grant_type=provider_token` without
             `provider`)
             | unknown_method (provider/method not enabled for the realm;
-            ALSO the unconditional response to `grant_type=password` —
-            reserved, not implemented, ADR-042)
+            for `grant_type=password`: no credential store, or the realm's
+            `password_login_enabled` is off)
+            | tenant_required (`grant_type=password` with a username and no
+            tenant from `tenant_id` or the request's host; ADR-104 D2)
+            | password_too_short | password_too_long | password_unchanged
+            (`new_password` failed input validation; ADR-104 R14)
+            | password_change_not_required (`new_password` sent for a
+            credential that is not must-change; ADR-104 R17)
             | bad_tenant_id (`tenant_id` not in the resolved realm)
             | missing_api_key (api-key grants without `api_key`)
             | missing_subject_token | bad_subject_token_type
@@ -4190,7 +4286,11 @@ paths:
           description: |
             user_not_invited (known user, no membership in the resolved
             realm) | signup_domain_not_allowed | user_suspended |
-            no_permissions_in_org.
+            no_permissions_in_org | password_must_change.
+
+            `password_must_change` is ADR-104 D7: the password was CORRECT but
+            an administrator set it. Resend the same body with `new_password`
+            (see `LoginRequestPassword`) to replace it and sign in in one call.
 
             `no_permissions_in_org` is ADR-100 D8: on `grant_type=user_api_key`,
             the key's `permissions_cap` and the supplied `role_permissions` have
@@ -4227,6 +4327,15 @@ paths:
                 oneOf:
                   - $ref: '#/components/schemas/PreconditionSessionLimit'
                   - $ref: '#/components/schemas/PreconditionFirstLoginPending'
+        '429':
+          description: |
+            login_throttled — `grant_type=password` only: the per-identifier
+            fail counter (keyed on realm + identifier as supplied, consulted
+            before any lookup) is locked. A correct password, and a valid
+            `new_password`, are refused alike and nothing changes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '501':
           description: |
             federation_disabled (token-exchange grant while workload
@@ -4326,6 +4435,121 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/PreconditionMFA' }
+
+  /auth/password/reset/inspect:
+    post:
+      tags: [Auth]
+      summary: Check a password reset link before asking for a password (ADR-111 P6a)
+      description: |
+        Anonymous. Writes nothing. Lets a reset page show "invalid", "expired"
+        or "already used" before the person types a password. The token is
+        sent in the BODY, never a URL, so no access log holds it.
+
+        Each answer describes the presented token only; the token space is
+        2^256, so this reveals nothing about any account.
+      security:
+        - BearerPlatformToken: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, description: The value from the link. }
+      responses:
+        '200':
+          description: The link can be used.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [expires_at]
+                properties:
+                  expires_at: { type: string, format: date-time }
+        '400':
+          description: |
+            `reset_token_invalid` — unknown or malformed, or the address it was
+            sent to is no longer active and verified on that membership.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: |
+            `reset_token_expired`, `reset_token_used`, or
+            `reset_token_superseded` (a newer link was sent, or the password
+            changed some other way).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Set your password from a reset link (ADR-111 P6)
+      description: |
+        Anonymous: the link IS the credential. A platform bearer, if sent,
+        must belong to the token's realm (otherwise `reset_token_invalid`).
+
+        Order: `new_password` is validated as input first (no lookup); then the
+        token is claimed by a single compare-and-swap, so two concurrent
+        submissions yield exactly one success; then the password is written
+        with no `must_change`, the membership gains the issuer's `password`
+        authority tuple (ADR-104 R1) on the address the link went to, EVERY
+        session of that membership is revoked, `user.password_set` is audited
+        with `via: reset_link`, and the "your password changed" notice is
+        sent (no link).
+
+        **No session is minted.** Sign in next with `POST /auth/login`
+        `grant_type=password`; every MFA and eligibility gate lives there.
+      security:
+        - BearerPlatformToken: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, new_password]
+              properties:
+                token: { type: string }
+                new_password:
+                  type: string
+                  format: password
+                  description: 12..1024 bytes, no composition rules (as `PUT /me/password`).
+      responses:
+        '200':
+          description: The password is set.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [password_set] }
+                  revoked_sids:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      ADR-104 R-e. Exactly the session ids this consume ended across
+                      the person's whole identity in the realm; `[]` when none. When
+                      the revoke degraded to the anchor row (audited `revoke_scope:
+                      anchor_only`) it lists only what was actually ended.
+        '400':
+          description: |
+            `password_too_short`, `password_too_long` (checked before the token
+            is looked up), `reset_token_invalid`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: |
+            `reset_token_expired`, `reset_token_used`, `reset_token_superseded`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /auth/refresh:
     post:
@@ -7690,6 +7914,11 @@ paths:
 
         The ownership check fails CLOSED — if it cannot be evaluated, the
         request is refused rather than allowed through.
+
+        Moving a member to `deactivated` also ends every session anchored at
+        THAT member row (their other organisations are untouched): a refresh
+        answers `401`, and an already-issued access token stops verifying
+        inside the revocation window.
       responses:
         '200':
           description: OK
@@ -8753,6 +8982,12 @@ paths:
         notice, which carries NO link and NO code — it reaches an address that
         may no longer be the holder's, and a "wasn't me?" link in a takeover
         notice is a phishing lure we would have written ourselves.
+
+        **Since spec `0.53.0` (ADR-104 R7e):** a successful set or change
+        revokes every OTHER session of this membership and keeps the one that
+        made the call (on the BFF lane, the `X-User-Token` session). A `must_change`
+        credential may also be replaced at sign-in: `POST /auth/login` with
+        `new_password`.
       security: [{ BearerAccess: [] }]
       requestBody:
         required: true
@@ -8785,6 +9020,15 @@ paths:
                 type: object
                 properties:
                   status: { type: string, example: updated }
+                  revoked_sids:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      ADR-104 R-e. Exactly the session ids this call ended across the
+                      person's whole identity in the realm, never the calling session;
+                      `[]` when none. When the revoke degraded to the anchor row
+                      (audited `revoke_scope: anchor_only`) it lists only what was
+                      actually ended.
         '400':
           description: |
             `password_too_short`, `password_too_long`,
@@ -8801,20 +9045,41 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `verified_email_required` (spec `0.53.0`, ADR-111 P8) — the realm's
+            `password_policy.require_verified_email` is on and the caller's
+            membership has no verified email, so it may not hold a password.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /tenants/{tid}/users/{uid}/credentials:
     put:
       tags: [Users]
-      summary: Assign a member's username and/or an initial password (ADR-104)
+      summary: Assign a member's username and/or a temporary password (ADR-104, ADR-111)
       description: |
         The ADMIN path. Requires `users:manage` in the tenant.
+
+        **Since spec `0.53.0` (ADR-111):** a `password` is accepted ONLY for a
+        member with NO verified email, and only while the realm's
+        `password_policy.require_verified_email` is off — the hand-over case,
+        where there is no address to send a link to. A member with a verified
+        email answers `409 reset_link_required`; send them a link with
+        `POST /tenants/{tid}/users/{uid}/password-reset` instead.
 
         ⚠️ **An admin-set password is an ASSERTION, not a proof** — the same
         distinction ADR-080 makes for an admin-written address. It is stored
         with a `must_change` obligation, and a login with it answers
-        `403 password_must_change` until the holder replaces it through
-        `PUT /me/password`. Without that, an admin could silently mint a working
-        credential for another person and use it.
+        `403 password_must_change` until the holder replaces it — at sign-in,
+        by resending the login with `new_password` (spec `0.53.0`), or through
+        `PUT /me/password` from a session they already hold. Both notify the
+        holder (ADR-079) and audit `user.password_set`.
+
+        **Since spec `0.53.0` (ADR-104 R7):** setting a password also revokes
+        EVERY session anchored at this member's row, whatever method minted it,
+        and revokes the row's issuer-minted `password` authority tuple. A
+        username-only call revokes nothing.
 
         **This is where `contact.KindUsername` gets its first real producer.**
         The kind has been declared, valid and case-folded since ADR-042 and
@@ -8888,7 +9153,87 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            `identifier_collision` — that username is taken in this org.
+            - `identifier_collision` — that username is taken in this org.
+            - `reset_link_required` (spec `0.53.0`, ADR-111 P1) — the body
+              carries a `password` and this member has a verified email. An
+              admin never sets such a member's password; send them a link with
+              `POST /tenants/{tid}/users/{uid}/password-reset`. Nothing in the
+              body is written, the `username` included.
+            - `verified_email_required` (spec `0.53.0`, ADR-111 P7) — the realm's
+              `password_policy.require_verified_email` is on and this member
+              has no verified email, so they may be given neither a password nor
+              a username.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /tenants/{tid}/users/{uid}/password-reset:
+    post:
+      tags: [Users]
+      summary: Send a member a single-use password reset link (ADR-111)
+      description: |
+        The ADMIN path for a member who has a verified email (ADR-111 P2).
+        Requires `users:manage` in the tenant.
+
+        Supersedes the member's outstanding links, creates ONE token (32 random
+        bytes, stored only as a SHA-256 hash, valid 30 minutes, single use) and
+        enqueues ONE `password_reset` email through the notifications outbox
+        to the member's first active verified email. The link is
+        `<console>/reset-password#token=…`, where `<console>` is the realm's
+        domain, else its `<slug>.realmid.dev`, else `https://app.realmid.dev`.
+
+        **It changes no credential and revokes no session**: sending a link
+        cannot lock a member out. The member's password changes only when they
+        open the link and choose one (`POST /auth/password/reset`).
+
+        The address is chosen by the issuer; no field names one. Phones are
+        not used until SMS delivery ships (ADR-111 D-a). Audited as
+        `user.password_reset_sent` (contact id and expiry, never the token).
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - { in: path, name: tid, required: true, schema: { type: string, format: uuid } }
+        - { in: path, name: uid, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '202':
+          description: The link was queued for delivery.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, to, expires_at]
+                properties:
+                  status: { type: string, enum: [sent] }
+                  to:
+                    type: string
+                    description: The masked address (first character + domain).
+                    example: a***@example.com
+                  expires_at: { type: string, format: date-time }
+        '400':
+          description: |
+            `unknown_method` (no credential store, or the realm's
+            `password_login_enabled` is off), `bad_request` (a service account).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `user_not_found` — a missing user and a user in another tenant
+            collapse to this, as on the credentials route.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `no_verified_email` — the member has no verified email to send to.
+            Hand over a temporary password with `PUT …/credentials` instead,
+            unless the realm's `password_policy.require_verified_email` is on.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: |
+            `reset_throttled` — more than 5 links were sent for this member in
+            the last hour.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

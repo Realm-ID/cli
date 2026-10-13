@@ -494,6 +494,8 @@ func TestActionSegmentsDeriveOnTheirParentResource(t *testing.T) {
 		{"POST", "/tenants/{id}/users/{uid}/contacts/{contactId}/delink", "contacts", "delink"},
 		{"POST", "/me/memberships/{tenantId}/leave", "memberships", "leave"},
 		{"POST", "/me/tenant-choice", "me", "tenant-choice"},
+		// ADR-111; owner ruling 2026-10-13: the admin "send a reset link" action is typed.
+		{"POST", "/tenants/{tid}/users/{uid}/password-reset", "users", "password-reset"},
 		{"POST", "/platforms/{pid}/tenants/{tid}/sso-domains/{domain}/request", "sso-domains", "request"},
 	}
 	for _, tc := range cases {
@@ -596,5 +598,16 @@ func TestUnclassifiedTrailingSegmentIsSkippedNotInvented(t *testing.T) {
 	}
 	if _, _, ok := deriveCommand("GET", "/platforms/{id}/roles"); !ok {
 		t.Fatal("a known collection segment stopped deriving — the guard is over-broad")
+	}
+}
+
+// The anonymous password-reset token routes take the emailed token, not an
+// admin session, so they must never become typed commands (owner ruling
+// 2026-10-13); skipPath's /auth/ rule is what excludes them.
+func TestAnonymousPasswordResetRoutesAreNotTyped(t *testing.T) {
+	for _, p := range []string{"/auth/password/reset", "/auth/password/reset/inspect"} {
+		if !skipPath(p) {
+			t.Errorf("%s must be skipped from the typed tree", p)
+		}
 	}
 }

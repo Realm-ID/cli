@@ -5,6 +5,13 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Changed — embedded issuer spec re-pinned `v0.131.0` → `v0.134.0` (spec `0.52.0` → `0.53.0`); new `users password-reset`
+
+Kept in step with the BFF (`scripts/issuer-pin-parity.py`). **One new typed command:**
+`realm-id users password-reset` (`POST /tenants/{tid}/users/{uid}/password-reset`, ADR-111) emails
+a member a single-use reset link; non-destructive, needs `users:manage`. The anonymous
+`/auth/password/reset` token routes are deliberately not typed commands.
+
 ### Changed — embedded issuer spec re-pinned `v0.121.1` → `v0.131.0` (spec `0.46.0` → `0.52.0`)
 
 Kept in step with the BFF (`api` re-pinned the same day; `scripts/issuer-pin-parity.py`

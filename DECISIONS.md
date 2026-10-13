@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-19 entries. Newest first.
+20 entries. Newest first.
 
+- [2026-10-13 — Embedded issuer spec re-pinned to v0.134.0; users password-reset is a typed command](#2026-10-13--embedded-issuer-spec-re-pinned-to-v01340-users-password-reset-is-a-typed-command)
 - [2026-09-06 — the spec is vendored from a release tag, because a wrong vendor here is a wrong program](#2026-09-06--the-spec-is-vendored-from-a-release-tag-because-a-wrong-vendor-here-is-a-wrong-program)
 - [2026-09-05 (latest) — a local `make check` before `git push`, not just a CI verdict after it](#2026-09-05-latest--a-local-make-check-before-git-push-not-just-a-ci-verdict-after-it)
 - [2026-09-05 (later) — the test suite gated nothing, and the release is now gated by the same workflow as a commit](#2026-09-05-later--the-test-suite-gated-nothing-and-the-release-is-now-gated-by-the-same-workflow-as-a-commit)
@@ -28,6 +29,26 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-13 — Embedded issuer spec re-pinned to v0.134.0; users password-reset is a typed command
+
+**What happened.** Re-vendoring the embedded issuer spec to `v0.134.0` (spec `0.53.0`, kept in
+step with the BFF; `scripts/issuer-pin-parity.py`) turned `TestEverySpecSegmentIsClassified` red:
+the new `POST /tenants/{tid}/users/{uid}/password-reset` (ADR-111, admin "send a reset link") ends
+in a segment `actionVerb` does not name.
+
+**Ruling (owner, 2026-10-13, asked in plain words, answered "Yes, add the command").** It becomes
+the typed command `users password-reset`. Exposing a verb is a review decision here, and this one
+is safe: it is non-destructive (it emails the member a single-use link), the caller needs
+`users:manage`, and it matches the console. `skipDestructive` is unchanged.
+
+**What stays out.** The anonymous token routes `POST /auth/password/reset` and
+`/auth/password/reset/inspect` take the emailed token, not an admin session. They never tripped
+the classification test because `skipPath` drops every `/auth/` path before derivation;
+`TestAnonymousPasswordResetRoutesAreNotTyped` now pins that.
+
+**Change.** `actionVerb` gains `password-reset`; the derive test covers the new verb; the vendored
+spec and `ISSUER_CONTRACT` move to `v0.134.0`.
 
 ## 2026-09-06 — the spec is vendored from a release tag, because a wrong vendor here is a wrong program
 
