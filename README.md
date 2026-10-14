@@ -117,7 +117,17 @@ REALM_ID_API_KEY=rk_live_… realm-id doctor --realm <realm-id> [--issuer <url>]
 # Columns: user_id,email,phone,role,display_name,provider,provider_uid,created_at
 # (role required; email or phone required). Exit 0 = no errors, 1 = errors.
 realm-id plan-import users.csv
+
+# Look an error code up in the SDK's error reference (offline, embedded).
+# Exit 0 = found (every row, with its section), 1 = unknown_error_code (with
+# "did you mean" suggestions), 2 = usage.
+realm-id explain missing_tenant_id
 ```
+
+`explain` reads `cmd/realm-id/error-reference.md`, vendored from the sdk repo's
+`docs/error-reference.md` at the commit pinned in `cmd/realm-id/ERROR_REFERENCE_CONTRACT`
+(`source_sha` in the output). Re-vendor with `scripts/revendor-error-reference.sh <sdk sha>`;
+`TestErrorReferenceMatchesItsPin` fails if the file and its pin disagree.
 
 All helper commands print one JSON envelope: `{"command", "ok", "errors":
 [{"code","message"}], ...}`; every failure has a stable snake_case `code`.

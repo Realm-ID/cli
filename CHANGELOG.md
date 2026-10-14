@@ -5,6 +5,13 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Added — `realm-id explain <error_code>`
+
+Offline lookup of an error code in the SDK's error reference (vendored at sdk `4bf71a51`): returns every row for the
+code with its section, `when`/`meaning`, `what_to_do` and `source_sha`. An unknown code exits 1 with
+`unknown_error_code` and "did you mean" suggestions; a usage error exits 2. Same `--output json|text` rule and JSON
+envelope as the other helper commands. Re-vendor with `scripts/revendor-error-reference.sh <sdk sha>`.
+
 ### Changed — helper commands share a JSON envelope; `doctor` exits 3 when incomplete
 
 `verify-token`, `doctor` and `plan-import` print `{"command","ok","errors":[{"code","message"}],…}` (`valid` is now `ok`).

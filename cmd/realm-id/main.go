@@ -61,6 +61,8 @@ func run(args []string) int {
 		return cmdPlanImport(args[1:])
 	case "verify-token":
 		return cmdVerifyToken(args[1:])
+	case "explain":
+		return cmdExplain(args[1:])
 	case "version", "--version", "-v":
 		fmt.Fprintln(os.Stdout, "realm-id", version)
 		return exitOK
@@ -98,6 +100,7 @@ Usage:
   realm-id <resource> <verb>       Typed API command (e.g. realm-id platforms list)
   realm-id <resource>              List a resource's verbs
   realm-id verify-token <jwt>      Verify a token against the realm JWKS and explain each claim
+  realm-id explain <error_code>    Say what an error code means and what to do (offline)
   realm-id doctor                  Check issuer health, discovery, JWKS and (with REALM_ID_API_KEY) the key
   realm-id plan-import <csv>      Validate a bulk user-import file offline (no API calls)
   realm-id schema                  Dump the OpenAPI contract (agent self-orientation)

@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-24 entries. Newest first.
+25 entries. Newest first.
 
+- [2026-10-14 — explain: error codes answered from an embedded, commit-pinned sdk error reference](#2026-10-14--explain-error-codes-answered-from-an-embedded-commit-pinned-sdk-error-reference)
 - [2026-10-14 — helper commands: doctor exit 3 for incomplete, common JSON envelope, critic fixes](#2026-10-14--helper-commands-doctor-exit-3-for-incomplete-common-json-envelope-critic-fixes)
 - [2026-10-14 — doctor: key proven by exchange + verify; health asserts the body; realm is explicit](#2026-10-14--doctor-key-proven-by-exchange--verify-health-asserts-the-body-realm-is-explicit)
 - [2026-10-14 — plan-import: offline bulk-import validation derived from the handler](#2026-10-14--plan-import-offline-bulk-import-validation-derived-from-the-handler)
@@ -33,6 +34,18 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-14 — explain: error codes answered from an embedded, commit-pinned sdk error reference
+
+**Decision.** `realm-id explain <error_code>` answers from the SDK's `docs/error-reference.md`, EMBEDDED in the binary and pinned to an sdk commit (`ERROR_REFERENCE_CONTRACT`: sha + sha256), not fetched at run time and not read from the sibling working tree.
+
+**Why.** An agent that hits `missing_tenant_id` should get the partner-facing "what to do" without a network call or a docs trip. Embedding makes it offline and deterministic; pinning to a commit (same idea as `revendor-spec.sh`, but a commit because the sdk has no tag for docs) means the answer names exactly which reference it came from (`source_sha`), and a hand-edit of either file fails `TestErrorReferenceMatchesItsPin`.
+
+**Parser traps handled.** Two header shapes (`When` / `Meaning`); `|` inside backticks is not a cell break; a code can sit in several sections (all rows returned, each with its section); one cell can name two codes (`a` / `b`) and yields a row per code. `TestErrorReference_ParseIsSane` requires at least 200 rows, so a broken parse cannot pass.
+
+**Exit codes.** 0 found, 1 `unknown_error_code` (with edit-distance/prefix suggestions), 2 usage — matching verify-token and plan-import.
+
+**Cost.** The reference goes stale until someone re-vendors; the binary says which sdk commit it carries. No new dependencies.
 
 ## 2026-10-14 — helper commands: doctor exit 3 for incomplete, common JSON envelope, critic fixes
 
