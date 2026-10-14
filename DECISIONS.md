@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-20 entries. Newest first.
+21 entries. Newest first.
 
+- [2026-10-14 — verify-token: configured issuer picks the JWKS host, never the token](#2026-10-14--verify-token-configured-issuer-picks-the-jwks-host-never-the-token)
 - [2026-10-13 — Embedded issuer spec re-pinned to v0.134.0; users password-reset is a typed command](#2026-10-13--embedded-issuer-spec-re-pinned-to-v01340-users-password-reset-is-a-typed-command)
 - [2026-09-06 — the spec is vendored from a release tag, because a wrong vendor here is a wrong program](#2026-09-06--the-spec-is-vendored-from-a-release-tag-because-a-wrong-vendor-here-is-a-wrong-program)
 - [2026-09-05 (latest) — a local `make check` before `git push`, not just a CI verdict after it](#2026-09-05-latest--a-local-make-check-before-git-push-not-just-a-ci-verdict-after-it)
@@ -29,6 +30,10 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-14 — verify-token: configured issuer picks the JWKS host, never the token
+
+**Why a hand-written command, and why `iss` does not choose the key host.** `verify-token` is one of the helper commands dispatched by name ahead of the generated tree (ADR-062 §1 still governs the tree; these four do not write, so `skipDestructive()` is irrelevant to them). Facts were read from the issuer, not assumed: RS256 is the only signing algorithm (`internal/signer`), `iss` is `<issuer base>/<realm id>` and the JWKS lives at `/{realm}/.well-known/jwks.json` (swagger tag JWKS). The token is untrusted input, so deriving the key URL from its `iss` alone would let a forged token vouch for itself against its own host; the base is therefore the configured issuer and a foreign `iss` is refused before any request (test asserts zero JWKS hits). No clock leeway is applied: the tool reports the precise boundary rather than hiding skew.
 
 ## 2026-10-13 — Embedded issuer spec re-pinned to v0.134.0; users password-reset is a typed command
 

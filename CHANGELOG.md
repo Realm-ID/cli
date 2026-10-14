@@ -5,6 +5,12 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Added — `realm-id verify-token <jwt>`
+
+Verifies an access token's RS256 signature against the realm JWKS, checks `exp`/`nbf` (and `--aud`
+when given), and prints each claim with a one-line plain-words meaning. JSON when piped. The JWKS
+base is the configured issuer, never the token's own `iss` host.
+
 ### Changed — embedded issuer spec re-pinned `v0.131.0` → `v0.134.0` (spec `0.52.0` → `0.53.0`); new `users password-reset`
 
 Kept in step with the BFF (`scripts/issuer-pin-parity.py`). **One new typed command:**

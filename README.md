@@ -96,6 +96,27 @@ realm-id api GET /me             # raw authenticated request through the BFF
 realm-id version
 ```
 
+### Helper commands (hand-written, not generated)
+
+Dispatched by name before the generated tree, so they never collide with a
+resource and never pass through `skipDestructive()` (none of them writes).
+All follow the same output rule as the typed tree: `--output json|text`, JSON
+when stdout is not a terminal.
+
+```bash
+# Verify an access token against the realm's JWKS and explain every claim.
+# Exit 0 = valid, 1 = invalid (errors listed), 2 = usage.
+realm-id verify-token "$JWT"
+realm-id verify-token --issuer http://auth.realmid.local --aud realmid "$JWT"
+```
+
+`verify-token` is RS256-only (the only algorithm the issuer signs with). It
+derives the JWKS URL as `<issuer>/<realm id>/.well-known/jwks.json` where the
+realm id is the tail of the token's `iss`, but **only if `iss` is under the
+configured issuer** (`--issuer` > `$REALM_ID_ISSUER` > config > default); a token
+naming any other host is refused before any request, so a forged `iss` cannot
+steer the key fetch. No leeway is applied to `exp`/`nbf`.
+
 ### Typed command tree
 
 The `<resource> <verb>` tree is **generated at startup from the embedded issuer
