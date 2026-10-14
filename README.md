@@ -119,6 +119,21 @@ REALM_ID_API_KEY=rk_live_… realm-id doctor --realm <realm-id> [--issuer <url>]
 realm-id plan-import users.csv
 ```
 
+All helper commands print one JSON envelope: `{"command", "ok", "errors":
+[{"code","message"}], ...}`; every failure has a stable snake_case `code`.
+
+`doctor` exit codes: **0** every check PASS, **1** any FAIL, **3** no FAIL but at
+least one SKIP (incomplete: skipped checks were not run, so this is not an
+all-clear). With `--realm`, the key's minted token must name that realm in its
+`iss` (`realm_mismatch` otherwise).
+
+`verify-token` accepts access tokens only (mirroring the issuer's `AccessOnly`:
+`typ` JWT/at+jwt, no `events` claim; it also refuses the issuer's internal MFA and
+session-revoke challenge tokens) and answers `not_an_access_token` otherwise. It
+always lists `not_checked`: the audience unless `--aud` is given, and revocation
+(the CLI cannot see session state, so a revoked session still verifies until the
+token expires).
+
 `doctor` runs five checks: issuer health (asserts the `/.well-known/health` BODY
 is `UP`, since it answers 200 even when degraded), the realm's OIDC discovery
 document (its `issuer` must equal `<issuer>/<realm>`), JWKS non-empty with usable

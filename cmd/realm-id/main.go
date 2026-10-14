@@ -691,6 +691,11 @@ var httpClient = &http.Client{Timeout: 30 * time.Second}
 // jsonRequest issues an HTTP request. If out != nil the response body is also
 // decoded into it. Returns the status code and the raw response bytes.
 func jsonRequest(method, url, bearer string, body any, out any) (int, []byte, error) {
+	return jsonRequestWith(httpClient, method, url, bearer, body, out)
+}
+
+// jsonRequestWith is jsonRequest over a caller-supplied client.
+func jsonRequestWith(client *http.Client, method, url, bearer string, body any, out any) (int, []byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -710,7 +715,7 @@ func jsonRequest(method, url, bearer string, body any, out any) (int, []byte, er
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}

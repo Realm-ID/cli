@@ -67,3 +67,27 @@ func writeJSON(v any) {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	fmt.Fprintln(os.Stdout, string(b))
 }
+
+// helperError is one structured failure: a stable snake_case code an agent can
+// branch on, plus a human message. Codes are never embedded in free text.
+type helperError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// helperEnvelope is the common top of every helper command's JSON output:
+// {"command", "ok", "errors": [...], ...command-specific fields}. Embed it.
+type helperEnvelope struct {
+	Command string        `json:"command"`
+	OK      bool          `json:"ok"`
+	Errors  []helperError `json:"errors"`
+}
+
+func newEnvelope(command string) helperEnvelope {
+	return helperEnvelope{Command: command, Errors: []helperError{}}
+}
+
+// exitIncomplete: a helper ran, found no failure, but could not run every
+// check (doctor with a SKIP). Distinct from 0 so an agent never reads "didn't
+// look" as "all clear". Free in the ADR-062 §1 table (4 conflict, 5 not found, 7 forbidden).
+const exitIncomplete = 3

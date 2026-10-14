@@ -5,6 +5,13 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Changed — helper commands share a JSON envelope; `doctor` exits 3 when incomplete
+
+`verify-token`, `doctor` and `plan-import` print `{"command","ok","errors":[{"code","message"}],…}` (`valid` is now `ok`).
+`doctor` exits 3 when nothing failed but a check was skipped. `verify-token` refuses non-access tokens
+(`not_an_access_token`) and lists `not_checked` (aud, revocation). `doctor --realm` rejects a key minted for another realm.
+
+
 ### Added — `realm-id doctor`
 
 Checks a partner backend's RealmID config: issuer health (body, not status code), realm discovery,

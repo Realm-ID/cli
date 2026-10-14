@@ -12,8 +12,10 @@ import (
 )
 
 type planOut struct {
-	OK       bool `json:"ok"`
-	Rows     int  `json:"rows"`
+	Command  string        `json:"command"`
+	Errors   []helperError `json:"errors"`
+	OK       bool          `json:"ok"`
+	Rows     int           `json:"rows"`
 	Problems []struct {
 		Row      int    `json:"row"`
 		FileLine int    `json:"file_line"`
@@ -58,6 +60,9 @@ func TestPlanImport_CleanFile(t *testing.T) {
 	o, code := runPlan(t, "user_id,email,phone,role,display_name,provider,provider_uid,created_at\n"+
 		goodUUID+",a@x.com,+14155550101,member,Ann,google,g-1,2024-01-02T03:04:05Z\n"+
 		",b@x.com,,admin,Bob,,,\n")
+	if o.Command != "plan-import" {
+		t.Fatalf("command field = %q", o.Command)
+	}
 	if code != exitOK || !o.OK || o.Rows != 2 || o.Summary.Errors != 0 {
 		t.Fatalf("clean file must pass: code=%d %+v", code, o)
 	}
@@ -85,6 +90,9 @@ func TestPlanImport_ReportsEveryProblemWithRowNumbers(t *testing.T) {
 		1: "invalid_user_id", 2: "duplicate_in_batch", 3: "invalid_email", 4: "missing_identifier",
 		5: "missing_role", 6: "forbidden_role", 7: "invalid_phone", 8: "incomplete_provider",
 		9: "unknown_provider", 10: "invalid_created_at", 12: "duplicate_in_batch",
+	}
+	if len(o.Errors) != o.Summary.Errors || o.Errors[0].Code == "" {
+		t.Errorf("errors[] must carry one {code,message} per error: %d vs %d", len(o.Errors), o.Summary.Errors)
 	}
 	for row, c := range want {
 		if !o.has(row, c) {

@@ -59,7 +59,7 @@ type planSummary struct {
 }
 
 type planResult struct {
-	OK         bool          `json:"ok"`
+	helperEnvelope
 	Rows       int           `json:"rows"`
 	Problems   []planProblem `json:"problems"`
 	Summary    planSummary   `json:"summary"`
@@ -146,7 +146,7 @@ func printPlanText(r planResult) {
 // planImport reads the CSV and returns the report; the error is for an
 // unreadable/unparseable CSV container (bad quoting), not for bad content.
 func planImport(in io.Reader) (planResult, error) {
-	res := planResult{Problems: []planProblem{}, NotChecked: planNotChecked}
+	res := planResult{helperEnvelope: newEnvelope("plan-import"), Problems: []planProblem{}, NotChecked: planNotChecked}
 	badRows := map[int]bool{}
 	add := func(row, line int, field, code, sev, msg string) {
 		res.Problems = append(res.Problems, planProblem{Row: row, FileLine: line, Field: field, Code: code, Severity: sev, Message: msg})
@@ -296,6 +296,16 @@ func planImport(in io.Reader) (planResult, error) {
 
 func finishPlan(res planResult, badRows map[int]bool) planResult {
 	res.Summary.BadRows = len(badRows)
+	for _, p := range res.Problems {
+		if p.Severity != "error" {
+			continue
+		}
+		msg := p.Message
+		if p.Row > 0 {
+			msg = fmt.Sprintf("row %d: %s", p.Row, msg)
+		}
+		res.Errors = append(res.Errors, helperError{Code: p.Code, Message: msg})
+	}
 	res.OK = res.Summary.Errors == 0
 	return res
 }

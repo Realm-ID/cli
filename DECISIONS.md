@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-23 entries. Newest first.
+24 entries. Newest first.
 
+- [2026-10-14 — helper commands: doctor exit 3 for incomplete, common JSON envelope, critic fixes](#2026-10-14--helper-commands-doctor-exit-3-for-incomplete-common-json-envelope-critic-fixes)
 - [2026-10-14 — doctor: key proven by exchange + verify; health asserts the body; realm is explicit](#2026-10-14--doctor-key-proven-by-exchange--verify-health-asserts-the-body-realm-is-explicit)
 - [2026-10-14 — plan-import: offline bulk-import validation derived from the handler](#2026-10-14--plan-import-offline-bulk-import-validation-derived-from-the-handler)
 - [2026-10-14 — verify-token: configured issuer picks the JWKS host, never the token](#2026-10-14--verify-token-configured-issuer-picks-the-jwks-host-never-the-token)
@@ -32,6 +33,16 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-14 — helper commands: doctor exit 3 for incomplete, common JSON envelope, critic fixes
+
+**Critic fixes to verify-token, doctor and plan-import, and two rulings (dispatcher, 2026-10-14).**
+
+R1 — doctor exit codes: 0 = every check PASS, 1 = any FAIL, 3 = no FAIL but at least one SKIP ("incomplete"). A run that skipped checks is not an all-clear; before this, a doctor with no key and no realm exited 0 having checked only health. 3 is free in the ADR-062 §1 table (4 conflict, 5 not found, 7 forbidden). Documented in the README and in the usage text.
+
+R2 — one JSON envelope for every helper command: `{"command", "ok", "errors":[{"code","message"}], ...command fields}`, one shared type in `helpers.go`. verify-token's `valid` became `ok`; doctor gained `ok`; plan-import's `errors` mirrors its error-severity problems; every failure carries a structured snake_case `code` (via a `codedError`), never a code embedded in free text.
+
+Fixes: (1) the "never fetch from the token's own iss" test now points `iss` at a SECOND server that serves the signing key and asserts it gets zero hits, with the specific codes `wrong_issuer` / `wrong_algorithm`; mutation-checked (a verifier that follows `iss` goes red: ok=true and one hit on the foreign host). (2) verify-token refuses non-access tokens with `not_an_access_token`: a `typ` outside {JWT, at+jwt, application/at+jwt} (absent refused) or an `events` claim, mirroring the issuer's `AccessOnly`; plus the issuer's internal challenge tokens (sub `authsvc`, scope `auth:*`), which AccessOnly does NOT catch (same key, typ JWT), so that part is the CLI's own rule, read from `authsvc/service.go` mintBaseJWT. The output also lists `not_checked`: `aud` unless `--aud` is given, and `revocation` always, since the CLI cannot see session state. (3) doctor with `--realm` requires the minted token's `iss` to name that realm (`realm_mismatch`), so a key for realm A cannot pass a run configured for realm B. (4) doctor's key checks use the injected client, not the global one (test counts requests through a transport). (5) Claim wording: `domain` is set by the issuer (ADR-064); `role` is the lookup key on the direct-bearer path while the permissions come from the database; `jti` is a fresh per-token id, distinct from `sid` (ADR-109 D3), and the test fixture now models that.
 
 ## 2026-10-14 — doctor: key proven by exchange + verify; health asserts the body; realm is explicit
 
