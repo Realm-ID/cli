@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-22 entries. Newest first.
+23 entries. Newest first.
 
+- [2026-10-14 — doctor: key proven by exchange + verify; health asserts the body; realm is explicit](#2026-10-14--doctor-key-proven-by-exchange--verify-health-asserts-the-body-realm-is-explicit)
 - [2026-10-14 — plan-import: offline bulk-import validation derived from the handler](#2026-10-14--plan-import-offline-bulk-import-validation-derived-from-the-handler)
 - [2026-10-14 — verify-token: configured issuer picks the JWKS host, never the token](#2026-10-14--verify-token-configured-issuer-picks-the-jwks-host-never-the-token)
 - [2026-10-13 — Embedded issuer spec re-pinned to v0.134.0; users password-reset is a typed command](#2026-10-13--embedded-issuer-spec-re-pinned-to-v01340-users-password-reset-is-a-typed-command)
@@ -31,6 +32,10 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-14 — doctor: key proven by exchange + verify; health asserts the body; realm is explicit
+
+**`doctor` proves an API key by the exchange plus a signature check, not by a GET, and needs the realm id passed in.** The brief asked for the cheapest real read; the spec has no read open to every platform key regardless of its permissions, and a 403 from a permission-gated read would be reported as a bad key. The `platform_api_key` login exchange is the issuer's own accept/refuse decision (and what the typed tree already does), and verifying the token it mints against the JWKS shows the key leads to something a partner's verifier will accept. Health asserts the `/.well-known/health` BODY (`status == UP`): it answers 200 while degraded, and `/.well-known/alive` proves nothing about the datastore (the 27-hour 2026-09-21 outage). The realm id is never guessed from the configured platform: `--realm`/`$REALM_ID_REALM` or the discovery and JWKS checks SKIP with the reason. A SKIP is not a PASS, and the report states `ran N of 5`.
 
 ## 2026-10-14 — plan-import: offline bulk-import validation derived from the handler
 

@@ -5,6 +5,12 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Added — `realm-id doctor`
+
+Checks a partner backend's RealmID config: issuer health (body, not status code), realm discovery,
+JWKS, and with `REALM_ID_API_KEY` that the key is accepted and its minted token verifies. One line per
+check, PASS/FAIL/SKIP, the count of checks run, non-zero exit on any FAIL.
+
 ### Added — `realm-id plan-import <csv>`
 
 Offline validation of a bulk user-import file before any write: required columns, UUID `user_id`,

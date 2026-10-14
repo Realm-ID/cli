@@ -108,14 +108,26 @@ when stdout is not a terminal.
 # Exit 0 = valid, 1 = invalid (errors listed), 2 = usage.
 realm-id verify-token "$JWT"
 realm-id verify-token --issuer http://auth.realmid.local --aud realmid "$JWT"
-```
 
-```bash
+# Check a partner backend's RealmID config: one PASS/FAIL/SKIP line per check,
+# the count of checks run, non-zero exit on any FAIL.
+REALM_ID_API_KEY=rk_live_… realm-id doctor --realm <realm-id> [--issuer <url>]
+
 # Validate a bulk user-import CSV offline, BEFORE any write (never calls the API).
 # Columns: user_id,email,phone,role,display_name,provider,provider_uid,created_at
 # (role required; email or phone required). Exit 0 = no errors, 1 = errors.
 realm-id plan-import users.csv
 ```
+
+`doctor` runs five checks: issuer health (asserts the `/.well-known/health` BODY
+is `UP`, since it answers 200 even when degraded), the realm's OIDC discovery
+document (its `issuer` must equal `<issuer>/<realm>`), JWKS non-empty with usable
+RSA keys, `REALM_ID_API_KEY` accepted (the `platform_api_key` exchange), and the
+minted token verifying against the JWKS. Without `--realm` (or
+`$REALM_ID_REALM`) the discovery/JWKS checks SKIP; without a key the key checks
+SKIP, each saying what to supply. The key is proven by the exchange rather than
+a GET because no read endpoint is open to every platform key; a 403 from a
+permission-gated read would be misreported as a bad key.
 
 `plan-import` reports every problem with the issuer's own 1-based row number
 (header excluded) plus the physical `file_line`, and a summary count. Rules come

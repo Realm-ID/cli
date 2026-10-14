@@ -55,6 +55,8 @@ func run(args []string) int {
 		return cmdAPI(args[1:])
 	case "schema":
 		return cmdSchema(args[1:])
+	case "doctor":
+		return cmdDoctor(args[1:])
 	case "plan-import":
 		return cmdPlanImport(args[1:])
 	case "verify-token":
@@ -96,7 +98,8 @@ Usage:
   realm-id <resource> <verb>       Typed API command (e.g. realm-id platforms list)
   realm-id <resource>              List a resource's verbs
   realm-id verify-token <jwt>      Verify a token against the realm JWKS and explain each claim
-  realm-id plan-import <csv>       Validate a bulk user-import file offline (no API calls)
+  realm-id doctor                  Check issuer health, discovery, JWKS and (with REALM_ID_API_KEY) the key
+  realm-id plan-import <csv>      Validate a bulk user-import file offline (no API calls)
   realm-id schema                  Dump the OpenAPI contract (agent self-orientation)
   realm-id api <method> <path>     Raw authenticated request through the BFF (JSON)
   realm-id version                 Print the CLI version
