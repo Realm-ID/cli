@@ -110,6 +110,19 @@ realm-id verify-token "$JWT"
 realm-id verify-token --issuer http://auth.realmid.local --aud realmid "$JWT"
 ```
 
+```bash
+# Validate a bulk user-import CSV offline, BEFORE any write (never calls the API).
+# Columns: user_id,email,phone,role,display_name,provider,provider_uid,created_at
+# (role required; email or phone required). Exit 0 = no errors, 1 = errors.
+realm-id plan-import users.csv
+```
+
+`plan-import` reports every problem with the issuer's own 1-based row number
+(header excluded) plus the physical `file_line`, and a summary count. Rules come
+from the issuer's import handler, not the spec text (phone is strict E.164). It
+lists what it cannot check offline (role exists in the realm, seating authority,
+collisions with existing users, single-tenant membership).
+
 `verify-token` is RS256-only (the only algorithm the issuer signs with). It
 derives the JWKS URL as `<issuer>/<realm id>/.well-known/jwks.json` where the
 realm id is the tail of the token's `iss`, but **only if `iss` is under the

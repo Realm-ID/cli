@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-21 entries. Newest first.
+22 entries. Newest first.
 
+- [2026-10-14 — plan-import: offline bulk-import validation derived from the handler](#2026-10-14--plan-import-offline-bulk-import-validation-derived-from-the-handler)
 - [2026-10-14 — verify-token: configured issuer picks the JWKS host, never the token](#2026-10-14--verify-token-configured-issuer-picks-the-jwks-host-never-the-token)
 - [2026-10-13 — Embedded issuer spec re-pinned to v0.134.0; users password-reset is a typed command](#2026-10-13--embedded-issuer-spec-re-pinned-to-v01340-users-password-reset-is-a-typed-command)
 - [2026-09-06 — the spec is vendored from a release tag, because a wrong vendor here is a wrong program](#2026-09-06--the-spec-is-vendored-from-a-release-tag-because-a-wrong-vendor-here-is-a-wrong-program)
@@ -30,6 +31,10 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-14 — plan-import: offline bulk-import validation derived from the handler
+
+**`plan-import` follows the handler, not the spec text, and says what it cannot know.** The CSV columns are the `ImportUserRow` fields of `POST /tenants/{id}/users/import` (ADR-073 Release B). Where the spec and `issuer/internal/httpapi/user_import.go` disagree, the handler decides: the spec describes `phone` as "E.164 (leading '+')" but the handler enforces strict E.164 (`contact.IsE164`, ADR-103 D5), so `+1 (555) 010-9999` is an error here; the handler's email check is only "contains '@'", so anything stricter is a WARNING (the issuer would accept it), never an error. Row numbers are the issuer's own `line` (1-based data row, header excluded) so a problem here matches the issuer's phase-1 report, with `file_line` beside it for the editor. Role existence, seating authority, collisions with existing data and `single_tenant_membership` are NOT checkable offline and the output lists them as not checked, rather than implying a clean plan means the import will commit. The command never makes a network call (test points the BFF/issuer env at a server and asserts zero hits). Not run through the generated tree: it writes nothing, so `skipDestructive()` has nothing to filter.
 
 ## 2026-10-14 — verify-token: configured issuer picks the JWKS host, never the token
 

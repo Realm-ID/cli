@@ -5,6 +5,12 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Added — `realm-id plan-import <csv>`
+
+Offline validation of a bulk user-import file before any write: required columns, UUID `user_id`,
+duplicates, malformed emails/phones, provider pairs, `created_at`, the 1000-row cap. Every problem
+carries a row number; a summary and a "not checked offline" list close the report. Never calls the API.
+
 ### Added — `realm-id verify-token <jwt>`
 
 Verifies an access token's RS256 signature against the realm JWKS, checks `exp`/`nbf` (and `--aud`
