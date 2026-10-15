@@ -104,7 +104,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.53.1
+  version: 0.53.2
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -414,6 +414,11 @@ components:
         grant_type:
           type: string
           enum: [provider_token, password, otp, api_key, platform_api_key, user_api_key, 'urn:ietf:params:oauth:grant-type:token-exchange']
+        custom_claims:
+          type: object
+          additionalProperties: true
+          deprecated: true
+          description: Ignored. Accepted for compatibility and never read; pass custom claims on `POST /auth/token`.
         role_permissions:
           type: array
           nullable: true
@@ -493,6 +498,11 @@ components:
             origin it is absent — realm-scoped client_ids gate sign-in
             (v0.27.2; ADR-046). When set, the response is single-tenant and
             an access token is minted on the first call.
+        custom_claims:
+          type: object
+          additionalProperties: true
+          deprecated: true
+          description: Ignored (see LoginRequest.custom_claims).
       example:
         grant_type: provider_token
         provider: google
@@ -599,6 +609,11 @@ components:
             failure, because it is a caller-integration mistake rather than a
             wrong password and the two must not look alike in your logs. It
             leaks nothing: it is answerable before any identifier lookup runs.
+        custom_claims:
+          type: object
+          additionalProperties: true
+          deprecated: true
+          description: Ignored (see LoginRequest.custom_claims).
       example:
         grant_type: password
         identifier: alice
@@ -2800,7 +2815,7 @@ components:
         stays reversible (ADR-087 §4). Mutually exclusive with `leave_entirely`.
       properties:
         owner_user_id: { type: string, format: uuid, description: Active member of this tenant to make owner. }
-        outgoing_owner_role: { type: string, enum: [admin, member], description: 'Base role the outgoing owner keeps (default member). Never owner; viewer no longer exists (ADR-101).' }
+        outgoing_owner_role: { type: string, enum: [admin, member, viewer], description: 'Base role the outgoing owner keeps (default member). Never owner. `viewer` is listed for compatibility only: the role no longer exists (ADR-101) and is refused.' }
         leave_entirely: { type: boolean, description: Deactivate the outgoing owner instead of demoting them. }
         new_owner_email: { type: string, description: 'Recipient by email. Canonical for the G-014 parent path, which cannot read the roster; provisioned into the tenant when absent. Used only when owner_user_id is absent.' }
         suspend_outgoing_owner: { type: boolean, description: 'Suspend the outgoing owner (recoverable) instead of demoting them. Mutually exclusive with leave_entirely.' }

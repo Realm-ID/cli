@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-25 entries. Newest first.
+26 entries. Newest first.
 
+- [2026-10-15 — Embedded issuer spec re-pinned to v0.135.2 (v0.135.1 was burned); the command tree does not move](#2026-10-15--embedded-issuer-spec-re-pinned-to-v01352-v01351-was-burned-the-command-tree-does-not-move)
 - [2026-10-14 — explain: error codes answered from an embedded, commit-pinned sdk error reference](#2026-10-14--explain-error-codes-answered-from-an-embedded-commit-pinned-sdk-error-reference)
 - [2026-10-14 — helper commands: doctor exit 3 for incomplete, common JSON envelope, critic fixes](#2026-10-14--helper-commands-doctor-exit-3-for-incomplete-common-json-envelope-critic-fixes)
 - [2026-10-14 — doctor: key proven by exchange + verify; health asserts the body; realm is explicit](#2026-10-14--doctor-key-proven-by-exchange--verify-health-asserts-the-body-realm-is-explicit)
@@ -34,6 +35,25 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-15 — Embedded issuer spec re-pinned to v0.135.2 (v0.135.1 was burned); the command tree does not move
+
+**What.** `cmd/realm-id/openapi.yaml` was re-vendored from issuer `v0.135.2` (spec `0.53.2`) with
+`scripts/revendor-spec.sh`, replacing the pin to `v0.135.1`. That version was BURNED and never
+deployed: its root release run stopped before any draft, because `spec-compat` refused its spec
+removals. `v0.135.2` is the issuer prod runs. It lists login `custom_claims` (deprecated, ignored)
+and `viewer` on `outgoing_owner_role` (refused) again; nothing else differs (19 spec lines).
+
+**Why.** The pin must name a deployment that exists. The api pin moved to the same tag at
+api `7ccd3dc`, and the root `scripts/issuer-pin-parity.py` reports "all 2 vendored issuer pins
+agree on `v0.135.2`".
+
+**The command tree does not move.** Both binaries were built (HEAD before and after), and every
+resource's verb list plus every verb's `--help` was dumped. That is 16 resources and 59 verbs, and
+the two dumps are byte-identical. This is expected, not a blind spot: neither changed field reaches
+a generated command. Login is hand-written, and there is no owner-transfer verb. A first attempt
+used `--json help`, which is not a command. It printed the same error from both binaries and so
+"matched": a zero diff that proved nothing. `TestVendoredSpec`/contract tests pass.
 
 ## 2026-10-14 — explain: error codes answered from an embedded, commit-pinned sdk error reference
 
