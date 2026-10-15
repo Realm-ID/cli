@@ -5,13 +5,13 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
-### Changed — issuer contract re-pinned to `v0.135.2` (spec `0.53.2`)
+### Changed — issuer contract re-pinned to `v0.136.0` (spec `0.54.0`)
 
-Moves from `v0.134.0` to the issuer prod runs. An interim pin to `v0.135.1` was replaced before any
-cli release, because that issuer was burned and never deployed. The embedded spec lists login
-`custom_claims` (deprecated, ignored) and `viewer` as an `outgoing_owner_role` (refused) exactly as
-the live issuer serves them. The command tree is unchanged: 16 resources and 59 verbs, identical
-`--help`. This keeps the pin in step with the BFF (api `main`), which the umbrella
+Moves from `v0.134.0` to the issuer prod runs. Interim pins to `v0.135.1` (burned) and `v0.135.2`
+were replaced before any cli release. The embedded spec no longer lists login `custom_claims` or
+`viewer` as an `outgoing_owner_role`. The issuer removed both in `v0.136.0` as a flagged,
+owner-approved breaking change. The command tree is unchanged: 16 resources and 59 verbs, identical
+`--help` before and after. This keeps the pin in step with the BFF (api `main`), which the umbrella
 `issuer-pin-parity` check requires.
 
 ### Added — `realm-id explain <error_code>`
