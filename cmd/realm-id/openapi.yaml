@@ -104,7 +104,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.53.0
+  version: 0.53.1
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -367,7 +367,7 @@ components:
           token>` (the realm's BFF / partner-backend gate, ADR-041 +
           ADR-047). Realm is resolved from the bearer's `realm_id`
           claim; body `realm_id` is ignored.
-        - `api_key`, `platform_api_key` — **api-key grants**.
+        - `api_key`, `platform_api_key`, `user_api_key` — **api-key grants**.
           Unauthenticated; the raw API key travels in the body. Any
           inbound bearer is rejected. The api-key's class must match
           the declared `grant_type`; mismatch → 401
@@ -381,13 +381,18 @@ components:
         longer 400s `unknown_method`.
 
         ADR-046 (still applies under `provider_token`/`google`):
-        `tenant_id` is required on tenant-scoped origins so the
-        verifier can pick the tenant's per-tenant `client_id`s (plus
-        the platform-default list) to validate `aud`. On realm-root
-        origins (e.g. `app.realmid.dev` or a platform's admin
-        console apex) discovery returns `tenant_id: null` and the
-        field is OPTIONAL — realm-scoped `identity_providers`
-        client_ids gate the sign-in instead (issuer v0.27.2).
+        `tenant_id` is OPTIONAL on every provider login; the issuer never
+        refuses a login for lacking it. It decides which `client_id`s the
+        token's `aud` is checked against: realm-scoped `identity_providers`
+        client_ids are always accepted, and a client_id registered at
+        TENANT scope is accepted only when that tenant's `tenant_id` is
+        sent (otherwise `401 invalid_audience`). A named `tenant_id` that is
+        not in the realm is `400 bad_tenant_id`. On realm-root origins
+        (e.g. `app.realmid.dev` or a platform's admin console apex)
+        discovery returns `tenant_id: null` and realm-scoped client_ids gate
+        the sign-in (issuer v0.27.2). A user who belongs to several orgs
+        picks one afterwards at `POST /auth/token`, where a missing
+        `tenant_id` is `400 missing_tenant_id`.
       oneOf:
         - $ref: '#/components/schemas/LoginRequestProviderToken'
         - $ref: '#/components/schemas/LoginRequestPassword'
@@ -409,16 +414,6 @@ components:
         grant_type:
           type: string
           enum: [provider_token, password, otp, api_key, platform_api_key, user_api_key, 'urn:ietf:params:oauth:grant-type:token-exchange']
-        custom_claims:
-          type: object
-          additionalProperties: true
-          description: |
-            Optional partner-supplied claims, gated by
-            `realms.config.access_token_custom_claim_keys`
-            (SDK SPEC §4.2). Only meaningful on user grants when an
-            access token is minted on the first call (single-tenant,
-            no MFA). Otherwise pass on `POST /auth/token`.
-
         role_permissions:
           type: array
           nullable: true
@@ -498,9 +493,6 @@ components:
             origin it is absent — realm-scoped client_ids gate sign-in
             (v0.27.2; ADR-046). When set, the response is single-tenant and
             an access token is minted on the first call.
-        custom_claims:
-          type: object
-          additionalProperties: true
       example:
         grant_type: provider_token
         provider: google
@@ -607,9 +599,6 @@ components:
             failure, because it is a caller-integration mistake rather than a
             wrong password and the two must not look alike in your logs. It
             leaks nothing: it is answerable before any identifier lookup runs.
-        custom_claims:
-          type: object
-          additionalProperties: true
       example:
         grant_type: password
         identifier: alice
@@ -2811,7 +2800,7 @@ components:
         stays reversible (ADR-087 §4). Mutually exclusive with `leave_entirely`.
       properties:
         owner_user_id: { type: string, format: uuid, description: Active member of this tenant to make owner. }
-        outgoing_owner_role: { type: string, enum: [admin, member, viewer], description: 'Base role the outgoing owner keeps (default member).' }
+        outgoing_owner_role: { type: string, enum: [admin, member], description: 'Base role the outgoing owner keeps (default member). Never owner; viewer no longer exists (ADR-101).' }
         leave_entirely: { type: boolean, description: Deactivate the outgoing owner instead of demoting them. }
         new_owner_email: { type: string, description: 'Recipient by email. Canonical for the G-014 parent path, which cannot read the roster; provisioned into the tenant when absent. Used only when owner_user_id is absent.' }
         suspend_outgoing_owner: { type: boolean, description: 'Suspend the outgoing owner (recoverable) instead of demoting them. Mutually exclusive with leave_entirely.' }
@@ -8610,7 +8599,12 @@ paths:
   /tenants/{tenantId}/users/{uid}/mfa/enroll:
     post:
       tags: [MFA Admin]
-      summary: Admin-initiated TOTP enrollment — returns QR/secret
+      summary: Start the caller's own TOTP enrollment — returns QR/secret
+      description: |
+        SELF-ONLY (ADR-061 amendment 2026-10-14): `uid` must be the caller. Any
+        other `uid` answers `403 forbidden`. Nobody enrolls MFA for another
+        user; an admin unblocks a user with `DELETE .../mfa` (reset), after which
+        the user enrolls themselves.
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -8624,11 +8618,16 @@ paths:
       responses:
         '200':
           description: OK
+        '403':
+          description: "`forbidden` — `uid` is not the caller."
 
   /tenants/{tenantId}/users/{uid}/mfa/confirm:
     post:
       tags: [MFA Admin]
-      summary: Confirm TOTP code and activate enrollment
+      summary: Confirm TOTP code and activate the caller's own enrollment
+      description: |
+        SELF-ONLY (ADR-061 amendment 2026-10-14): `uid` must be the caller. Any
+        other `uid` answers `403 forbidden`.
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -8642,6 +8641,8 @@ paths:
       responses:
         '200':
           description: OK
+        '403':
+          description: "`forbidden` — `uid` is not the caller."
 
   /tenants/{tenantId}/users/{uid}/mfa:
     delete:

@@ -5,6 +5,12 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Changed — issuer contract re-pinned to `v0.135.1` (spec `0.53.1`)
+
+The embedded spec no longer lists login `custom_claims`, which the issuer ignored, or `viewer` as an
+`outgoing_owner_role` (a role deleted by ADR-101). The command tree is unchanged. This keeps the pin
+in step with the BFF (`api v0.39.3`), which the umbrella `issuer-pin-parity` check requires.
+
 ### Added — `realm-id explain <error_code>`
 
 Offline lookup of an error code in the SDK's error reference (vendored at sdk `4bf71a51`): returns every row for the
