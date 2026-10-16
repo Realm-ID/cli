@@ -39,6 +39,35 @@ info:
     free-form object such as `custom_claims` would flag every key it exists to
     carry). At most 10 names are listed, then `...`.
 
+    **`503 store_unavailable` (any authenticated route, spec 0.55.0).** When the
+    database a request depends on is unreachable, the answer is `503`
+    `store_unavailable` — retry it. (A database error that retrying cannot fix
+    is a `500 internal`, from 0.56.0.) It is never a `401`: the token was not
+    judged, so a client must NOT sign the user out on a `503`. Before 0.55.0 a
+    bearer route answered `401 invalid bearer` (and the X-User-Token lane
+    `401 x_user_token_invalid`) when the realm could not be read. The session
+    routes (`GET /auth/sessions`, `DELETE /auth/sessions`,
+    `DELETE /auth/sessions/{id}`) answer it for any failed lookup, where they
+    used to return a shorter list or a false `403`/`404`.
+    From 0.56.0 the refresh-token routes do the same: `POST /auth/token`
+    (refresh, and its deprecated alias `POST /auth/refresh`), `POST /auth/logout`
+    and `POST /auth/mfa/enroll` answer `503` when the session read by refresh
+    token fails, where they answered `401 refresh_invalid` / `401`. An unknown,
+    expired or revoked refresh token is still `401`. Keep the refresh token on
+    a `503`.
+    From 0.57.0 the rule covers **every route, authenticated or not**: any
+    request whose database call fails answers `503 store_unavailable` when the
+    database is unreachable and `500 internal` otherwise. In particular
+    `POST /auth/login` no longer answers `401 invalid_credentials` (or count a
+    failed attempt toward `429 login_throttled`) when the lookup behind a
+    password, OTP or user-API-key sign-in fails; a user-key holder whose user
+    row cannot be read gets `503`, not `401`. A refresh mint whose MFA-proof
+    read fails answers `503` rather than minting a token without `mfa_at`.
+    Revokes that end a principal's sessions (deactivate, service-account
+    deactivate/suspend/revoke) answer `503`/`500` when the revoke fails, after
+    the status change has landed; a retry re-runs the revoke. Leaving an org
+    and the tenant-choice suspend end no sessions (see those operations).
+
     It exists because the opposite failure has now happened twice in one
     handler: `signup_mode` was documented, sent by all three SDKs, and bound by
     nothing for months; `allowed_domains` was removed by ADR-094 R3 and went on
@@ -104,7 +133,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.54.0
+  version: 0.59.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -147,7 +176,13 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: User access JWT minted by POST /auth/token.
+      description: |
+        User access JWT minted by POST /auth/token.
+
+        Every route behind this scheme can answer `403 tenant_disabled` when
+        the organisation the token is for is suspended or deactivated (see the
+        `Error` schema). The session is NOT ended; the token works again once
+        the organisation is reactivated.
     BearerRefresh:
       type: http
       scheme: bearer
@@ -241,6 +276,13 @@ components:
           minted for is suspended or deactivated (ADR-104 R-d). Distinct from
           `user_suspended`, which names the END USER's row; this one means
           the partner's own escort credential has to be replaced.
+        - `tenant_disabled` — **403** (listed here for discoverability): the
+          organisation the token is for (or, on login and refresh, the
+          organisation explicitly requested) is suspended or deactivated. The
+          session is NOT ended: pick another organisation, or wait for this
+          one to be reactivated. Distinct from `user_suspended`, which names
+          the end user's own row, and from the `410 tenant_suspended` the two
+          integration routes answer (unchanged).
         - `refresh_invalid` — on `POST /auth/token` only: the presented
           refresh token is expired, revoked, or reuse-detected. Terminal
           for the caller — re-authentication is required (no retry helps).
@@ -2993,6 +3035,19 @@ components:
         display_name: { type: string }
         role: { type: string, enum: [owner, admin, member, viewer] }
         status: { type: string, enum: [active, suspended, invited, deactivated] }
+        joined_via:
+          type: string
+          enum: [invitation, sso_domain, open_signup, import, admin, owner, service, unknown]
+          description: |
+            How this membership was created (ADR-049 § Amendment Q4), recorded
+            once at creation. `unknown` for rows that predate the record and
+            were not created by an invite; `sso_domain` is never inferred for
+            an existing row.
+        joined_via_domain:
+          type: string
+          description: |
+            The verified domain whose SSO grant provisioned the row. Present
+            only when `joined_via` is `sso_domain`.
         mfa_methods:
           type: array
           items: { type: string, enum: [totp, otp] }
@@ -4155,6 +4210,13 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    StoreUnavailable:
+      description: |
+        `store_unavailable` — the database this request needs is unreachable.
+        Safe to retry; never a reason to sign the user out. New in spec 0.55.0.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     InvalidPageParams:
       description: |
         `invalid_cursor` (not a cursor this server issued — omit it for the
@@ -4275,7 +4337,11 @@ paths:
           description: |
             user_not_invited (known user, no membership in the resolved
             realm) | signup_domain_not_allowed | user_suspended |
-            no_permissions_in_org | password_must_change.
+            no_permissions_in_org | password_must_change | tenant_disabled.
+
+            `tenant_disabled` is returned when an explicit `tenant_id` names an
+            organisation that is suspended or deactivated. Nothing is ended:
+            the caller's other organisations are unaffected.
 
             `password_must_change` is ADR-104 D7: the password was CORRECT but
             an administrator set it. Resend the same body with `new_password`
@@ -4332,6 +4398,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /auth/token:
     post:
@@ -4404,7 +4471,11 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            not_a_member | user_suspended | no_permissions_in_org. The last is
+            not_a_member | user_suspended | tenant_disabled |
+            no_permissions_in_org. `tenant_disabled`: the organisation the
+            refresh would mint for is suspended or deactivated; the session is
+            NOT ended and the same refresh token works again once the
+            organisation is reactivated. `no_permissions_in_org` is
             ADR-100 D8, identical to `/auth/login`'s: it exists on BOTH routes
             or the narrowing is only enforced at login, since a session
             bootstrapped from a user API key is refreshable and a token that
@@ -4424,6 +4495,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/PreconditionMFA' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /auth/password/reset/inspect:
     post:
@@ -4559,6 +4631,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TokenResponse' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /auth/logout:
     post:
@@ -4589,6 +4662,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/LogoutResponse' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /auth/mfa/enroll:
     post:
@@ -4655,6 +4729,7 @@ paths:
           description: not_a_member / user_suspended
         '409':
           description: already_enrolled — reset before re-enrolling
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /auth/mfa:
     delete:
@@ -4980,6 +5055,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SessionListPage' }
         '400': { $ref: '#/components/responses/InvalidPageParams' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
     delete:
       tags: [Sessions]
       summary: Revoke every session for this user
@@ -4992,6 +5068,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StatusOK' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /auth/sessions/{id}:
     delete:
@@ -5013,6 +5090,7 @@ paths:
               schema: { $ref: '#/components/schemas/StatusOK' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /tenants/{id}/users/{uid}/sessions/revoke:
     post:
@@ -7659,6 +7737,19 @@ paths:
           schema: { type: string }
           description: Case-insensitive substring match on email.
         - in: query
+          name: joined_via
+          schema:
+            type: string
+            enum: [invitation, sso_domain, open_signup, import, admin, owner, service, unknown]
+          description: Exact match on how the membership was created. An invalid value returns 400 `invalid_config_value`.
+        - in: query
+          name: email_domain
+          schema: { type: string }
+          description: |
+            Matches members whose email address ends in `@<domain>`. This is
+            the email address ONLY and says nothing about how the member
+            joined; use `joined_via` for that.
+        - in: query
           name: cursor
           schema: { type: string }
         - in: query
@@ -7904,10 +7995,12 @@ paths:
         The ownership check fails CLOSED — if it cannot be evaluated, the
         request is refused rather than allowed through.
 
-        Moving a member to `deactivated` also ends every session anchored at
-        THAT member row (their other organisations are untouched): a refresh
-        answers `401`, and an already-issued access token stops verifying
-        inside the revocation window.
+        Changing a member's status is a status write only: **no session is
+        ended**, including on `deactivated` (amended ADR-049, 2026-10-16;
+        before this a deactivate ended every session anchored at the member
+        row). The member's tokens for THIS organisation are refused at once
+        (`403 user_suspended`); their other organisations are unaffected. To
+        sign someone out, use `POST /tenants/{id}/users/{uid}/sessions/revoke`.
       responses:
         '200':
           description: OK
@@ -7915,6 +8008,82 @@ paths:
           description: |
             last_owner — cannot deactivate the owner; transfer ownership first.
             Only raised for `status: deactivated`.
+
+  /tenants/{id}/users/bulk-status:
+    post:
+      tags: [Tenants]
+      summary: Suspend or deactivate several members at once
+      security: [{ BearerAccess: [] }]
+      description: |
+        Sets `status` on up to 500 members of the tenant in one call. Gate:
+        `users:manage` (the tenant owner, or members who can manage members).
+
+        Tokens for this organisation are refused at once for every affected
+        member. **No session is ended**, so the members' other organisations
+        are unaffected. `suspended` is reversible (an admin can restore the
+        member); `deactivated` is final from the organisation's side, as if the
+        member had left. There is no default: both fields are required.
+
+        Each id gets its own outcome in `results`; one refused id does not fail
+        the call. The tenant owner cannot be bulk-suspended or deactivated and
+        is reported as `refused_owner`.
+
+        A store error part-way through aborts the call with a 5xx. Rows already
+        processed stay applied, and a retry reports them as `unchanged`.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_ids, status]
+              properties:
+                user_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { type: string, format: uuid }
+                status:
+                  type: string
+                  enum: [suspended, deactivated]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user_id: { type: string, format: uuid }
+                        outcome:
+                          type: string
+                          enum: [updated, unchanged, not_found, refused_owner]
+        '400':
+          description: invalid_status (status is not suspended or deactivated) | invalid_config_value (user_ids holds fewer than 1 or more than 500 ids) | bad_json
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: users:manage required | user_suspended | tenant_disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: tenant_not_found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /tenants/{id}/integration-installations:
     parameters:
@@ -8919,9 +9088,14 @@ paths:
 
         Reuses ADR-076's `leave_entirely` disposition — the membership is
         deactivated — rather than introducing a third verb for the same idea.
-        Live sessions for that membership are revoked, otherwise the caller
-        would keep working there on an already-minted token until it expired
-        and leaving would be cosmetic for up to a TTL.
+        No session is ended (owner, 2026-10-16): the caller's session and
+        refresh token keep working for their other organizations. Tokens for
+        the left membership stop working at once — a refresh for it is refused,
+        and every issuer route refuses an already-minted access token for it
+        (ADR-104 R-d status check, whose cached verdict this call evicts). A
+        partner backend verifying tokens locally accepts such a token until it
+        expires. A failed status write answers `503`/`500` with nothing
+        changed, so a retry starts clean.
 
         The tenant's OWNER is refused. `tenants.owner_user_id` is NOT NULL
         (ADR-073 Amendment C), so an owner leaving would strand the tenant and
@@ -9253,9 +9427,13 @@ paths:
         product; `POST /me/memberships/{tenantId}/leave` remains the deliberate
         way out, and an admin can restore a suspended member.
 
-        Their sessions are **revoked**. Otherwise the person keeps working in an
-        organization they just gave up, on an already-minted access token, until
-        it expires — the change would be cosmetic for up to a token TTL.
+        **No session is ended** (owner, 2026-10-16): the person keeps their
+        session and refresh token for the chosen organization. Tokens for each
+        suspended membership stop working at once — a refresh for it is
+        refused, and every issuer route refuses an already-minted access token
+        for it (ADR-104 R-d status check, whose cached verdict this call
+        evicts). A failed status write answers `503`/`500`; a retry walks the
+        memberships still active and finishes the job.
 
         An **owned** organization cannot be given up: `tenants.owner_user_id` is
         NOT NULL, so revoking the owner's membership would leave it ownerless.
@@ -9818,8 +9996,20 @@ paths:
         schema: { type: string }
     delete:
       tags: [Platform Admin]
-      summary: Detach a tenant custom domain (revokes tenant sessions)
+      summary: Detach a tenant custom domain (signs nobody out unless sign_out=true)
+      description: |
+        Amended 2026-10-16 (ADR-049 amendment): detaching signs nobody out by
+        default. Use `sign_out=true` to also end every session of the tenant.
       security: [{ BearerPlatformToken: [] }]
+      parameters:
+        - in: query
+          name: sign_out
+          schema: { type: boolean, default: false }
+          description: |
+            Default false: no session is ended. Pass exactly `true` to ALSO
+            end every session of the TENANT, for the lost or compromised address case
+            (the address may now be in someone else's hands). Anything other
+            than `true` is treated as absent.
       responses:
         '200': { description: OK }
         '404': { description: tenant_not_found | domain_not_found }
@@ -9979,11 +10169,24 @@ paths:
         schema: { type: string, format: uuid }
     delete:
       tags: [Platform Admin]
-      summary: Detach a realm SPA origin (revokes realm sessions)
+      summary: Detach a realm SPA origin (signs nobody out unless sign_out=true)
       description: |
+        Amended 2026-10-16 (ADR-049 amendment): removing an origin signs
+        nobody out by default. Use `sign_out=true` to also end every session
+        of the REALM.
+
         ADR-049 §4.1 last-origin guard: returns 409 `last_origin` when
         the row is the only live realm-bound origin.
       security: [{ BearerPlatformToken: [] }]
+      parameters:
+        - in: query
+          name: sign_out
+          schema: { type: boolean, default: false }
+          description: |
+            Default false: no session is ended. Pass exactly `true` to ALSO
+            end every session of the REALM, for the lost or compromised address case
+            (the address may now be in someone else's hands). Anything other
+            than `true` is treated as absent.
       responses:
         '200': { description: OK }
         '404': { description: origin_not_found }

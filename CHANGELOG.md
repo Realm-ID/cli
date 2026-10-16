@@ -5,6 +5,13 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Changed — issuer contract re-pinned to `v0.137.0` (spec `0.59.0`); new verb `users bulk-status`
+
+Supersedes the `v0.136.0` pin below, keeping step with the BFF (api `main`). The issuer added
+`POST /tenants/{id}/users/bulk-status`, exposed as `realm-id users bulk-status --tenant T
+--field status=suspended --json ...` (body fields `user_ids`, `status`; owner ruling 2026-10-16). It suspends or deactivates up to 500
+members in one call; `--status` is required with no default, as on the console.
+
 ### Changed — issuer contract re-pinned to `v0.136.0` (spec `0.54.0`)
 
 Moves from `v0.134.0` to the issuer prod runs. Interim pins to `v0.135.1` (burned) and `v0.135.2`

@@ -129,6 +129,12 @@ func actionVerb(method, seg string) (string, bool) {
 		// of the typed tree via skipPath's /auth/ rule: they take the emailed
 		// token, not an admin session.
 		return seg, true
+	case "bulk-status":
+		// Added 2026-10-16 (owner ruling) with the issuer v0.137.0 re-vendor:
+		// `POST /tenants/{id}/users/bulk-status` is `users bulk-status`. It
+		// suspends or deactivates up to 500 members in one call, so `--status`
+		// is required with no default, as on the console.
+		return seg, true
 	case "mine":
 		return "list-mine", true
 	case "pending":
