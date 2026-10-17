@@ -102,7 +102,7 @@ type parsedFlags struct {
 }
 
 // boolFlags never take a value.
-var boolFlags = map[string]bool{"help": true, "h": true}
+var boolFlags = map[string]bool{"help": true, "h": true, "secret-stdin": true}
 
 func parseFlags(args []string) (*parsedFlags, error) {
 	pf := &parsedFlags{vals: map[string]string{}}
@@ -241,6 +241,17 @@ func resolveParam(cfg *Config, p pathParam, pf *parsedFlags) (string, error) {
 // buildBody assembles the request body from --json, repeated --field k=v, or
 // piped stdin. Returns nil when the operation takes no body.
 func buildBody(cmd command, pf *parsedFlags) (any, error) {
+	if isMessagingPut(cmd) {
+		return buildMessagingBody(cmd, pf)
+	}
+	if _, ok := pf.vals["secret-stdin"]; ok {
+		return nil, fmt.Errorf("--secret-stdin is only for `realm-id messaging update`")
+	}
+	return buildPlainBody(cmd, pf)
+}
+
+// buildPlainBody is the generic --json / --field / piped-stdin assembly.
+func buildPlainBody(cmd command, pf *parsedFlags) (any, error) {
 	if raw, ok := pf.vals["json"]; ok {
 		var v any
 		if err := json.Unmarshal([]byte(raw), &v); err != nil {

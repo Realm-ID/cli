@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-27 entries. Newest first.
+28 entries. Newest first.
 
+- [2026-10-17 — 2026-10-17 — messaging exposed in the CLI; secrets by stdin or hidden prompt, never a flag](#2026-10-17--2026-10-17--messaging-exposed-in-the-cli-secrets-by-stdin-or-hidden-prompt-never-a-flag)
 - [2026-10-15 — Embedded issuer spec re-pinned to v0.136.0 (custom_claims and viewer removed); the command tree does not move](#2026-10-15--embedded-issuer-spec-re-pinned-to-v01360-custom_claims-and-viewer-removed-the-command-tree-does-not-move)
 - [2026-10-15 — Embedded issuer spec re-pinned to v0.135.2 (v0.135.1 was burned); the command tree does not move](#2026-10-15--embedded-issuer-spec-re-pinned-to-v01352-v01351-was-burned-the-command-tree-does-not-move)
 - [2026-10-14 — explain: error codes answered from an embedded, commit-pinned sdk error reference](#2026-10-14--explain-error-codes-answered-from-an-embedded-commit-pinned-sdk-error-reference)
@@ -36,6 +37,30 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-17 — 2026-10-17 — messaging exposed in the CLI; secrets by stdin or hidden prompt, never a flag
+
+The `messaging` group (ADR-115, in the embedded `v0.138.0` spec) was hidden by an early return in
+`skipBFFOnly` while the owner decided how the CLI takes its write-only provider secrets. Ruling
+2026-10-17: build it, and the secret is read from stdin or a no-echo prompt, never a flag.
+
+- **Exposed** as `messaging describe|update|revoke --channel sms|whatsapp` (the generator
+  derives the group from the nearest static segment, and `{channel}` becomes a required
+  `--channel`). `isRevocable` now admits `/platforms/*/messaging/*`: a revoke is undone by a PUT,
+  and without it a partner cannot remove a leaked provider secret from the CLI.
+- **Secret rule lives in `buildBody`** for `PUT .../messaging/...` only (`messaging.go`): the three
+  secret keys are refused via `--field` (incl. `k:=`) and `--json`, with an error naming the key and
+  stdin, never the value. Accepted: JSON on stdin; `--secret-stdin` (one line -> `auth_token` for
+  sms, `access_token` for whatsapp); a hidden prompt when stdin is a TTY and the body carries no
+  secret. The prompt reader is the package var `secretPrompt` (nil in prod).
+- **`--secret-stdin` fills one field per channel.** The sms `api_key_sid` + `api_key_secret` pair
+  is sent as JSON on stdin; adding a second flag for it was not asked for.
+- **`--secret-stdin` elsewhere is an error**, not ignored: a flag that silently does nothing would
+  let an operator believe a secret went somewhere.
+- **Dependency:** `golang.org/x/term v0.27.0` (+ `x/sys v0.28.0`). Chosen as the newest term whose
+  `go` line is 1.23, because CI and goreleaser deliberately build with Go 1.23; a newer term would
+  have forced the `go` directive up.
+- `explain` also answers the topic `messaging` (not an error code) with the guide.
 
 ## 2026-10-15 — Embedded issuer spec re-pinned to v0.136.0 (custom_claims and viewer removed); the command tree does not move
 

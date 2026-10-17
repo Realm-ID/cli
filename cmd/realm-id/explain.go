@@ -236,6 +236,9 @@ func cmdExplain(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: realm-id explain [--output json|text] <error_code>")
 		return exitUsage
 	}
+	if strings.TrimSpace(h.pos[0]) == "messaging" {
+		return explainMessaging(wantJSON(h.flags["output"]))
+	}
 	res := explainCode(strings.TrimSpace(h.pos[0]), parseErrorReference(errorReferenceMD))
 	if wantJSON(h.flags["output"]) {
 		writeJSON(res)

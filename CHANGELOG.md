@@ -3,6 +3,19 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## Unreleased
+
+### Added — `realm-id messaging describe|update|revoke --channel sms|whatsapp` (ADR-115)
+
+Your realm's own SMS (Twilio) or WhatsApp (Meta) credentials, from the issuer `v0.138.0` spec
+already embedded (no re-vendor). The write-only secrets (`auth_token`, `api_key_secret`,
+`access_token`) are REFUSED as `--field` or `--json`, because a flag value lands in shell history
+and in `ps`. Give the secret on stdin: `--secret-stdin` (one line becomes `auth_token` for sms,
+`access_token` for whatsapp), a JSON body piped on stdin, or a hidden prompt when stdin is a
+terminal. Example: `realm-id messaging update --channel sms --field account_sid=AC... --field
+from_number=+1555... --secret-stdin < token.txt`. `realm-id explain messaging` prints the guide.
+`messaging revoke` joins the two key revokes as the third DELETE the binary carries.
+
 ## v0.4.0 — helper commands (`doctor`, `explain`, `verify-token`, `plan-import`) and the issuer `v0.137.0` contract (2026-10-17)
 
 ### Changed — issuer contract re-pinned to `v0.137.0` (spec `0.59.0`); new verb `users bulk-status`

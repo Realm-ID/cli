@@ -85,6 +85,8 @@ func TestBuildCommandsTree(t *testing.T) {
 		{"roles", "rename"}, {"audit-events", "list"},
 		// ADR-085 §8 — the only two DELETEs the binary carries.
 		{"api-keys", "revoke"}, {"user-api-keys", "revoke"},
+		// ADR-115 messaging: describe/update/revoke --channel sms|whatsapp.
+		{"messaging", "describe"}, {"messaging", "update"}, {"messaging", "revoke"},
 	} {
 		find(t, tr, want.group, want.verb)
 	}
@@ -92,7 +94,7 @@ func TestBuildCommandsTree(t *testing.T) {
 	// exempts. Pinned as an exact allowlist rather than a `revoke`-name skip:
 	// a future DELETE that happened to derive the verb `revoke` would otherwise
 	// walk into the binary unnoticed.
-	softRevokes := map[string]bool{"api-keys revoke": true, "user-api-keys revoke": true}
+	softRevokes := map[string]bool{"api-keys revoke": true, "user-api-keys revoke": true, "messaging revoke": true}
 	for g, verbs := range tr.byGroup {
 		for v, c := range verbs {
 			if c.Method == "DELETE" && !softRevokes[g+" "+v] {
@@ -427,7 +429,12 @@ func TestTopLevelResourceGroupsAreReviewed(t *testing.T) {
 		// base-realm-GATED, not deleted, and `GET /roles` plus disable/enable
 		// stay open to every realm owner — so the resource keeps four verbs and
 		// the CLI keeps offering them.
-		"stats": true, "tenants": true,
+		// "messaging" ADDED by ADR-115 (issuer v0.138.0), REVIEWED and EXPOSED
+		// 2026-10-17 (owner ruling): describe/update/revoke --channel sms|whatsapp.
+		// The write-only secrets are refused as flags and read from stdin or a
+		// hidden prompt (messaging.go).
+		"messaging": true,
+		"stats":     true, "tenants": true,
 		"user-api-keys": true, "users": true,
 
 		// Parents of a trailing action segment, reached only that way. They are

@@ -335,7 +335,11 @@ func skipPath(path string) bool {
 // Everything else stays filtered. The test in spec_test.go pins both halves.
 func isRevocable(path string) bool {
 	return strings.HasPrefix(path, "/platforms/") && strings.Contains(path, "/api-keys/") ||
-		strings.Contains(path, "/user-api-keys/")
+		strings.Contains(path, "/user-api-keys/") ||
+		// ADR-115: removing a realm's own phone-delivery credentials is reversible
+		// the way a key revoke is (a PUT saves them again), and a partner who cannot
+		// remove a leaked provider secret from the CLI has no other lever.
+		strings.HasPrefix(path, "/platforms/") && strings.Contains(path, "/messaging/")
 }
 
 // skipBFFOnly drops surfaces that require a PLATFORM bearer escorting a user
@@ -369,12 +373,6 @@ func isRevocable(path string) bool {
 // the CLI to obtain a base-realm platform token — separate work, not smuggled in
 // through this list.
 func skipBFFOnly(method, path string) bool {
-	// ADR-115 messaging credentials hidden from the CLI 2026-10-17: the PUT carries
-	// write-only provider secrets; whether the CLI takes them (flag vs stdin) is an
-	// open owner question. All three methods are hidden so the group is absent.
-	if strings.Contains(path, "/messaging/") {
-		return true
-	}
 	if method == "POST" && strings.HasSuffix(path, "/user-api-keys") {
 		return true
 	}

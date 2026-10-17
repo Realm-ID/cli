@@ -94,6 +94,19 @@ realm-id <resource>              # list a resource's verbs
 realm-id schema                  # dump the OpenAPI contract (agent self-orientation)
 realm-id api GET /me             # raw authenticated request through the BFF
 realm-id version
+
+# ADR-115 bring-your-own phone delivery (SMS via Twilio, WhatsApp via Meta).
+# The provider secret (auth_token / api_key_secret / access_token) is write-only
+# and is REFUSED as --field or --json (shell history, `ps`). Pipe it on stdin:
+realm-id messaging update --channel sms --field account_sid=AC... \
+  --field from_number=+1555... --secret-stdin < token.txt
+# (--secret-stdin: sms -> auth_token, whatsapp -> access_token. The sms API-key
+# pair goes as a JSON body on stdin. On a terminal with no secret given, a hidden
+# prompt asks for it.) The provider checks the credentials before anything is
+# stored; a refusal is 422 channel_validation_failed.
+realm-id messaging describe --channel sms     # config + status, never a secret
+realm-id messaging revoke   --channel sms     # remove (idempotent)
+realm-id explain messaging                    # this guide
 ```
 
 ### Helper commands (hand-written, not generated)
