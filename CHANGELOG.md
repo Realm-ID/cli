@@ -3,7 +3,7 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
-## Unreleased
+## v0.4.0 — helper commands (`doctor`, `explain`, `verify-token`, `plan-import`) and the issuer `v0.137.0` contract (2026-10-17)
 
 ### Changed — issuer contract re-pinned to `v0.137.0` (spec `0.59.0`); new verb `users bulk-status`
 
