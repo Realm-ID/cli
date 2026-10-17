@@ -98,3 +98,4 @@ warning against concurrent `auth login`); these are the code fixes.
       ⚠️ **Note the shipped binary predates all of this**: `cli` is tagged
       `v0.3.7` and `main` is 8 commits ahead, so the revendor machinery is
       FIXED-ON-MAIN-BUT-UNRELEASED. Do not read it as live.
+- [ ] `cmd/realm-id/spec.go` — Expose `realm-id messaging` (ADR-115)? Needs an owner decision on secret input (stdin, never a flag); hidden via skipBFFOnly meanwhile

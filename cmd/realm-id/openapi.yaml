@@ -133,7 +133,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.59.0
+  version: 0.60.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -1344,7 +1344,7 @@ components:
             behavior of the partner OTP primitive.
         delivery_mode:
           type: string
-          enum: [view_bff, email, sms]
+          enum: [view_bff, email, sms, whatsapp]
           default: view_bff
           description: |
             Mint transport (ADR-071 §4, threaded by ADR-095 D7).
@@ -1377,6 +1377,7 @@ components:
             |---|---|---|
             | `view_bff` | **allowed**, `kind=service` subjects ONLY | the PARTNER reads the plaintext, so a human must not be authenticable this way |
             | `sms` | **allowed**, any kind | the SUBJECT reads the plaintext, on a channel only they hold |
+            | `whatsapp` | **allowed**, any kind | same reason as `sms` (ADR-115) |
             | `email` | **refused** | a login code mailed to an address turns mailbox access into account access with no second factor. That is a distinct security decision (ADR-077's territory), not a delivery-mode enum value |
 
             The `kind=service` restriction on a login OTP is therefore re-keyed
@@ -1387,11 +1388,25 @@ components:
             on a login OTP); `400 no_delivery_address` (the subject has no
             address of the requested kind — the issue FAILS rather than
             returning an id for a code nobody will receive);
-            `503 delivery_unavailable` (the mode is legal but this deployment
-            has no transport wired — for `sms`, `TWILIO_*` unset).
+            `503 delivery_unavailable` (the mode is legal but the realm has no
+            working channel for it).
 
-            `whatsapp` remains out of scope and returns
-            `400 unsupported_delivery_mode`.
+            `sms` and `whatsapp` (**ADR-115**, spec `0.60.0`) send ONLY through the
+            realm's OWN saved credentials (`PUT /platforms/{id}/messaging/{channel}`);
+            there is no deployment-wide sender. Both are sent inline. For these two
+            modes: no saved row, or a row marked `failing`, answers `503
+            delivery_unavailable` with a `channel` field naming it; so does a
+            transient provider fault (with `Retry-After` when the provider gave
+            one). A configuration-class provider failure also marks the channel
+            `failing` (it leaves the `phone_channels` discovery list until the realm
+            re-saves it or the re-check passes). A number the provider says cannot
+            receive on that channel is `400 no_delivery_address` (the message names
+            the channel) and changes nothing. Every `purpose` is limited per (realm,
+            phone number), with ONE counter shared by `sms` and `whatsapp`, to
+            `phone_otp.max_per_window` per `phone_otp.window_seconds` (default 5 per
+            900s, ceiling 20 per 3600s): over it is `429 phone_otp_rate_limited` with
+            `Retry-After`. A request with no usable channel is not counted; an attempt
+            that reaches the provider is.
 
     OTPIssueResponse:
       type: object
@@ -1411,7 +1426,7 @@ components:
             does not get it. Check `delivered` to tell that apart from a fault.
         delivered:
           type: string
-          enum: [view_bff, email, sms]
+          enum: [view_bff, email, sms, whatsapp]
           description: |
             The transport actually used (ADR-095 D7). Lets a caller
             distinguish "no `value` because it was emailed" from "no `value`
@@ -1743,6 +1758,63 @@ components:
             and you must change it the first time you sign in".
           properties:
             require_verified_email: { type: boolean }
+        phone_channels:
+          type: array
+          items: { type: string, enum: [whatsapp, sms] }
+          description: |
+            ADR-115 B3a (spec `0.60.0`). The phone channels this realm has
+            configured AND that are `operational` right now, in the fixed order
+            `whatsapp`, `sms`. `[]` means "this realm has no working phone
+            channel"; ABSENT means an older issuer ("the server did not say").
+            A login screen offers a phone option only when `credential_methods`
+            contains `otp` AND this list is non-empty. Anonymous like the rest of
+            this response: it reveals which channels exist, never a credential.
+
+    # ---- ADR-115: bring-your-own phone delivery ----
+
+    MessagingChannelPut:
+      type: object
+      description: |
+        PUT body. `sms` uses the Twilio fields, `whatsapp` the Meta fields; a
+        field of the other provider is `400 invalid_channel_config`. The fields
+        marked write-only are never returned.
+      properties:
+        provider: { type: string, enum: [twilio, meta], description: Optional; if given it must match the channel. }
+        account_sid: { type: string, description: Twilio account SID (`AC...`). }
+        auth_token: { type: string, writeOnly: true, minLength: 20, description: Twilio auth token. At least 20 characters (shorter is `400 invalid_channel_config`). Give this OR the API-key pair. }
+        api_key_sid: { type: string, description: Twilio API key SID (`SK...`). }
+        api_key_secret: { type: string, writeOnly: true, minLength: 20, description: Twilio API key secret. At least 20 characters (shorter is `400 invalid_channel_config`). }
+        from_number: { type: string, description: Strict E.164. Give this OR `messaging_service_sid`. }
+        messaging_service_sid: { type: string, description: Twilio Messaging Service SID (`MG...`). }
+        phone_number_id: { type: string, description: Meta WhatsApp phone number id. }
+        waba_id: { type: string, description: Meta WhatsApp Business Account id. }
+        access_token: { type: string, writeOnly: true, minLength: 20, description: Meta System User access token. At least 20 characters (shorter is `400 invalid_channel_config`). }
+        template_name: { type: string, description: Name of the approved authentication template. }
+        template_language: { type: string, description: 'Template language code, e.g. `en` or `en_US`.' }
+
+    MessagingChannel:
+      type: object
+      description: |
+        A saved channel as read back. The non-secret provider fields appear
+        beside the status fields; NO secret field ever appears.
+      required: [channel, provider, secret_hint, status]
+      properties:
+        channel: { type: string, enum: [sms, whatsapp] }
+        provider: { type: string, enum: [twilio, meta] }
+        secret_hint: { type: string, description: The last 4 characters of the primary secret. }
+        status: { type: string, enum: [operational, failing] }
+        status_reason: { type: string, nullable: true }
+        status_changed_at: { type: string, format: date-time }
+        validated_at: { type: string, format: date-time, nullable: true }
+        updated_at: { type: string, format: date-time }
+        account_sid: { type: string }
+        api_key_sid: { type: string }
+        from_number: { type: string }
+        messaging_service_sid: { type: string }
+        phone_number_id: { type: string }
+        waba_id: { type: string }
+        template_name: { type: string }
+        template_language: { type: string }
 
     # ---- platforms ----
 
@@ -2445,6 +2517,22 @@ components:
                 `must_change` one may still be replaced at sign-in. The knob
                 governs what may be CREATED. Today only a verified EMAIL
                 counts; a phone does not, until SMS delivery ships (ADR-111 D-a).
+        phone_otp:
+          type: object
+          description: |
+            ADR-115 B4 (spec `0.60.0`). How many phone codes (SMS or WhatsApp)
+            one phone number may be sent in this realm per window. Default
+            **5 per 900s**. **PATCH semantics are MERGE**, as for `password_policy`.
+            The RealmID ceiling is a RATE of **20 codes per 3600s**, and `window_seconds`
+            may not exceed **3600** (a longer window would allow a burst above the
+            ceiling inside one hour). Both are checked on the
+            merged pair: a patch that would exceed it is refused `400
+            invalid_config_value` naming the ceiling, never clamped. An unknown
+            sub-key is `400 unknown_config_key`. This release stores and validates
+            the knob; the counter that enforces it ships later.
+          properties:
+            max_per_window: { type: integer, minimum: 1, maximum: 1000 }
+            window_seconds: { type: integer, minimum: 1, maximum: 3600 }
 
         # ---- ADR-094 D4: per-org domain SSO -------------------------------
         domain_sso:
@@ -2759,6 +2847,12 @@ components:
           description: ADR-111. Always present; defaults filled in.
           properties:
             require_verified_email: { type: boolean }
+        phone_otp:
+          type: object
+          description: ADR-115 B4. Always present; defaults (5 per 900s) filled in.
+          properties:
+            max_per_window: { type: integer }
+            window_seconds: { type: integer }
         service_refresh_rotates: { type: boolean }
         service_refresh_ttl_seconds: { type: integer }
         service_refresh_ttl_max_seconds: { type: integer }
@@ -4918,8 +5012,9 @@ paths:
         `realms.config.otp_length` / `otp_ttl_seconds`. Multiple
         issuers can mint codes concurrently for the same
         `(subject_ref, purpose)` — codes stack; verify consumes the
-        first hash-match. Plaintext is cached in Redis under the
-        OTP id and re-displayable via `GET /auth/otp/{id}` until TTL.
+        first hash-match. For `view_bff` (the default) the plaintext is cached in Redis under the
+        OTP id and re-displayable via `GET /auth/otp/{id}` until TTL; for `email`, `sms`
+        and `whatsapp` no plaintext is cached or re-displayable (that GET is 404).
         Emits `auth.otp.issued`.
       security: [{ BearerAccess: [] }]
       requestBody:
@@ -4936,9 +5031,12 @@ paths:
         '400':
           description: |
             invalid_purpose | invalid_subject_ref | invalid_scope |
-            unsupported_delivery_mode (`delivery_mode` other than
-            `view_bff` — the RI-delivered modes are not yet available;
-            ADR-071 §4).
+            unsupported_delivery_mode (a `delivery_mode` outside
+            view_bff | email | sms | whatsapp, or `email` on a login OTP) |
+            no_delivery_address (the subject has no address of the requested
+            kind, or the provider says the phone number cannot receive on the
+            channel).
+            ADR-071 §4, ADR-103, ADR-115.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -4957,13 +5055,42 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: |
+            phone_otp_rate_limited — the realm's per-phone code limit
+            (`phone_otp`, ADR-115 B4) is spent for this phone number, shared by
+            `sms` and `whatsapp`. `Retry-After` is the seconds until the oldest
+            counted send leaves the window.
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds to wait }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            delivery_unavailable — the requested `delivery_mode` has no working
+            transport. For `sms` and `whatsapp` the body carries `channel`
+            (`sms` | `whatsapp`): the realm has no operational channel of its own
+            for it, or the provider could not give a clear answer (`Retry-After`
+            when known). No `id` is returned. ADR-115.
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds to wait }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      channel: { type: string, enum: [sms, whatsapp] }
 
   /auth/otp/{id}:
     get:
       tags: [Auth]
       summary: Re-fetch the plaintext for an OTP minted by this user
       description: |
-        Returns the plaintext OTP from Redis. Issuer-scoped — the
+        Returns the plaintext OTP from Redis, for `view_bff` OTPs ONLY (any other
+        delivery mode is 404, as is any row the caller did not mint). Issuer-scoped — the
         bearer's `(tenant_id, user_id)` must match the row's. After
         the OTP TTL the plaintext cache expires and this returns 404
         (the underlying row may still be verifiable). Emits
@@ -6197,6 +6324,118 @@ paths:
             `access_token_custom_claim_keys` entry names a reserved JWT claim
             such as `sid`, `events`, `scope` or `role`; the message names every
             offending key)
+
+  /platforms/{id}/messaging/{channel}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: path
+        name: channel
+        required: true
+        schema: { type: string, enum: [sms, whatsapp] }
+    put:
+      tags: [Platform Admin]
+      summary: Save the realm's own SMS (Twilio) or WhatsApp (Meta) credentials (ADR-115)
+      description: |
+        Bring-your-own phone-code delivery. The realm saves its OWN provider
+        account for `sms` (Twilio) or `whatsapp` (Meta Cloud API).
+
+        **Auth (ADR-115 B2):** any principal holding `platform:config` in the
+        realm (admins and bots included), or RealmID base-realm staff, the same
+        gate as `PATCH /platforms/{id}/config`.
+
+        **The secret is WRITE-ONLY.** Responses carry `secret_hint` (the last 4
+        characters) and timestamps, never a secret. Every save and delete is
+        audited (`messaging_channel.save` / `messaging_channel.delete`, no secret
+        in the row).
+
+        The provider is asked, WITHOUT sending a message, whether the credentials
+        work BEFORE anything is stored. A refusal is `422
+        channel_validation_failed` with the provider's reason, and nothing is
+        stored. A PUT replaces the row whole (it is not a merge) and answers with
+        the GET shape; `status` is `operational`.
+
+        `sms` (provider `twilio`) takes `account_sid`, EITHER `auth_token` OR
+        `api_key_sid` + `api_key_secret`, and EITHER `from_number` (strict E.164)
+        OR `messaging_service_sid`. `whatsapp` (provider `meta`) takes
+        `phone_number_id`, `waba_id`, `access_token`, `template_name` and
+        `template_language`. Exactly-one-of rules and a field belonging to the
+        other provider are `400 invalid_channel_config` naming the field.
+
+        This release stores the secret UNENCRYPTED (it is still kept only in its
+        own column and never returned); sealing under Cloud KMS ships later.
+      security: [{ BearerAccess: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MessagingChannelPut' }
+      responses:
+        '200':
+          description: Saved. The GET shape.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagingChannel' }
+        '400':
+          description: invalid_channel_config (names the field) | bad_json | invalid_channel_config naming `channel` (`{channel}` is not `sms` or `whatsapp`)
+        '401':
+          description: missing or invalid bearer
+        '403':
+          description: forbidden - missing permission `platform:config`
+        '422':
+          description: channel_validation_failed - the provider refused the credentials; the message is the provider's reason
+        '503':
+          description: |
+            delivery_unavailable (with `channel`; `Retry-After` when known) - the provider
+            could not give a clear answer (transient fault, network error, an auth error
+            with no code). A save that did not pass validation is refused, never stored.
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds to wait }
+    get:
+      tags: [Platform Admin]
+      summary: Read a messaging channel's non-secret config and status (ADR-115)
+      description: |
+        Same gate as PUT. Never returns a secret: `secret_hint` is the last 4
+        characters. An unset channel is `404 channel_not_configured`.
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagingChannel' }
+        '400':
+          description: invalid_channel_config naming `channel` - `{channel}` is not `sms` or `whatsapp`
+        '401':
+          description: missing or invalid bearer
+        '403':
+          description: forbidden - missing permission `platform:config`
+        '404':
+          description: channel_not_configured
+    delete:
+      tags: [Platform Admin]
+      summary: Delete a messaging channel's credentials (ADR-115)
+      description: |
+        Same gate as PUT. Idempotent: deleting a channel that is not configured
+        succeeds the same way. Answers `200` with a `{status}` body (ADR-069).
+      security: [{ BearerAccess: [] }]
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [deleted] }
+        '400':
+          description: invalid_channel_config naming `channel` - `{channel}` is not `sms` or `whatsapp`
+        '401':
+          description: missing or invalid bearer
+        '403':
+          description: forbidden - missing permission `platform:config`
 
   /platforms/{id}/federation-bindings:
     parameters:

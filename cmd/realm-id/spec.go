@@ -369,6 +369,12 @@ func isRevocable(path string) bool {
 // the CLI to obtain a base-realm platform token — separate work, not smuggled in
 // through this list.
 func skipBFFOnly(method, path string) bool {
+	// ADR-115 messaging credentials hidden from the CLI 2026-10-17: the PUT carries
+	// write-only provider secrets; whether the CLI takes them (flag vs stdin) is an
+	// open owner question. All three methods are hidden so the group is absent.
+	if strings.Contains(path, "/messaging/") {
+		return true
+	}
 	if method == "POST" && strings.HasSuffix(path, "/user-api-keys") {
 		return true
 	}
