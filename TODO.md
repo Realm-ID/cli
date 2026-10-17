@@ -23,9 +23,9 @@ Open work only; shipped items live in `CHANGELOG.md` / git tags.
 >   worth remembering: the old `TestResolveCredential` asserted
 >   `bearer == "rk_live_1"`, so it restated the implementation and would have
 >   failed the moment anyone fixed the bug it was protecting.
-> - **STILL OPEN — `authWhoami` (`cmd/realm-id/main.go:534`) prints `/me`
+> - **STILL OPEN (re-checked 2026-10-17) — `authWhoami` (`cmd/realm-id/main.go`) prints `/me`
 >   verbatim with no `exp` decode.** The CLI decodes `exp` NOWHERE. Note the
->   partial mitigation, so it is not re-derived: `sessionHint` (`:523`) prints
+>   partial mitigation, so it is not re-derived: `sessionHint` prints
 >   a re-login hint, but only on a **401** carrying `session_expired`,
 >   `session_missing` or `session_revoked` — reactive, after expiry has
 >   already bitten, and it never says when a live session will expire.
@@ -88,9 +88,11 @@ warning against concurrent `auth login`); these are the code fixes.
       is now pinned to an issuer RELEASE TAG with an `ISSUER_CONTRACT` pin and a
       contract test — no more `//go:generate cp` out of a sibling working tree.
       **What is still missing is the FRESHNESS check**, and it is not hypothetical:
-      `scripts/issuer-pin-parity.py` verifies the pin is real and self-consistent
-      but has no notion of *newest*, and today the pin is **`v0.121.1`** against an
-      issuer at **`v0.125.0`** — four releases behind, reported by nothing.
+      the root `scripts/issuer-pin-parity.py` verifies the pin is real and
+      self-consistent but has no notion of *newest* (re-checked 2026-10-17: no
+      newest/behind/WARN logic in it). The pin drifted to `v0.121.1` against an
+      issuer at `v0.125.0` once with nothing reporting it; as of 2026-10-17 it was
+      re-pinned by hand to `v0.137.0` (`129f7e1`), current — by hand, not by a check.
       Add a WARN (not a hard fail — a lagging pin is a decision, a silent one is
       not) when the pinned tag is behind the issuer's newest.
       ⚠️ **Note the shipped binary predates all of this**: `cli` is tagged
