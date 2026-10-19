@@ -3,7 +3,7 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
-## Unreleased
+## v0.5.0 — `messaging` commands (ADR-115) and the issuer `v0.139.0` contract (R7 + R9) (2026-10-19)
 
 ### Added — `realm-id messaging describe|update|revoke --channel sms|whatsapp` (ADR-115)
 
