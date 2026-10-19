@@ -316,6 +316,16 @@ func skipPath(path string) bool {
 		return true
 	case strings.Contains(path, "/.well-known/"):
 		return true
+	// Added 2026-10-19 with the issuer v0.139.0 re-vendor (R7 + R9), PENDING an owner ruling on
+	// exposure (ADR-062 §5; every earlier new group or verb went in by ruling). Until then both stay
+	// out of the typed tree exactly as before the re-vendor, reachable only via `realm-id api`:
+	// a holder's proof of their own phone (`/me/contacts/{contact_id}/proof[/confirm]`) and an
+	// invitation resend (`/tenants/{id}/invitations/{inviteId}/resend`).
+	case strings.HasPrefix(path, "/me/contacts/") && (strings.HasSuffix(path, "/proof") ||
+		strings.HasSuffix(path, "/proof/confirm")):
+		return true
+	case strings.HasPrefix(path, "/tenants/") && strings.HasSuffix(path, "/invitations/{inviteId}/resend"):
+		return true
 	}
 	return false
 }

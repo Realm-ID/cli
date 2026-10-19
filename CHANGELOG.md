@@ -16,6 +16,14 @@ terminal. Example: `realm-id messaging update --channel sms --field account_sid=
 from_number=+1555... --secret-stdin < token.txt`. `realm-id explain messaging` prints the guide.
 `messaging revoke` joins the two key revokes as the third DELETE the binary carries.
 
+### Changed — embedded issuer contract `v0.139.0` (spec 0.63.0, R7 + R9)
+
+Re-vendored from the issuer `v0.139.0` release tag; the cli and the BFF pin the same issuer release
+again. The new `config.contacts.unique_kinds` field, `GET /me/contacts` and the invitation token
+fields arrive through the existing commands. Two new routes stay OUT of the typed tree, as before
+the re-vendor, until exposure is ruled on (ADR-062 §5): the holder's phone proof
+(`/me/contacts/{id}/proof[/confirm]`) and invitation resend. Both are reachable via `realm-id api`.
+
 ## v0.4.0 — helper commands (`doctor`, `explain`, `verify-token`, `plan-import`) and the issuer `v0.137.0` contract (2026-10-17)
 
 ### Changed — issuer contract re-pinned to `v0.137.0` (spec `0.59.0`); new verb `users bulk-status`

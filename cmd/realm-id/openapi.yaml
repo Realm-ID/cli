@@ -133,7 +133,7 @@ info:
     deferred past v1: HTTP rate limiting, cross-platform authorization
     endpoints, OTP internal login (`method: "otp"`), and per-realm
     invitation TTL overrides.
-  version: 0.60.0
+  version: 0.63.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -1316,6 +1316,30 @@ components:
 
     # ---- partner OTP primitive (v0.6.0, proposal partner-otp-primitive.md) ----
 
+    SendLoginCodeRequest:
+      type: object
+      required: [identifier, delivery_mode]
+      properties:
+        identifier:
+          type: string
+          description: The phone number, strict E.164 (e.g. `+919999000011`).
+        delivery_mode:
+          type: string
+          enum: [sms, whatsapp]
+        tenant_id:
+          type: string
+          format: uuid
+          description: |
+            Optional hint about which org to look in. The same hint should be
+            sent on the `grant_type=otp` login, so both halves bind the same user.
+    SendLoginCodeResponse:
+      type: object
+      required: [sent_if_registered]
+      properties:
+        sent_if_registered:
+          type: boolean
+          enum: [true]
+          description: Always true. A code was sent if, and only if, the number belongs to a user in the realm.
     OTPIssueRequest:
       type: object
       required: [subject_ref, purpose]
@@ -2517,6 +2541,54 @@ components:
                 `must_change` one may still be replaced at sign-in. The knob
                 governs what may be CREATED. Today only a verified EMAIL
                 counts; a phone does not, until SMS delivery ships (ADR-111 D-a).
+        contacts:
+          type: object
+          description: |
+            ADR-117 D1. Which contact kinds the platform declares UNIQUE. A
+            unique ("identifying") kind is an identity key: a proven value of it
+            signs a person in, and no two live contacts of it may share a value
+            inside one org. A kind NOT listed is a mailing contact only: never a
+            sign-in key, never an MFA channel, never a reset-code channel, with
+            no uniqueness rule. A `username` is always unique per org and is not
+            a choice. **PATCH semantics are MERGE.** An unknown sub-key is `400
+            unknown_config_key`.
+
+            Changing the list is checked and written in ONE transaction with the
+            platform's realm row locked (ADR-117 D8):
+            - removing a kind that would leave members unable to sign in, or
+              unable to pass a required MFA because their only factor is a code
+              to a contact of that kind (an SMS-only member counts), is `409
+              unique_kind_lockout` with `{kind, locked_out, mfa_locked_out}`,
+              unless the request carries the query parameter
+              `?confirm_lockout=true` (exactly `true`; never a header). A count
+              that could not be taken is `503 unique_kind_lockout_check_failed`
+              WHATEVER the flag says. An accepted override is audited
+              (`realm.unique_kinds_lockout_override`, with the exact counts) and
+              every change of the list is audited (`realm.unique_kinds_changed`,
+              with the old and new lists);
+            - removing `email` while an email-keyed identity provider (google,
+              microsoft, facebook, apple, firebase) or a domain SSO grant is
+              enabled is `409 email_keyed_signin_enabled` with
+              `{identity_providers, sso_domains}`; no override;
+            - `require_verified_email` needs `email` in the list, in either
+              order: `409 require_verified_email_conflict`;
+            - adding a kind while an org holds two live contacts of it with the
+              same value is `409 unique_kind_duplicates` with
+              `{kind, conflicting_values}`, a count and never the values;
+            - an empty list is allowed only while `password_login_enabled` is
+              on (`400 unique_kinds_requires_password`), and password sign-in
+              cannot be turned off while the list is empty (`409
+              password_login_required`).
+            Sessions already issued are not revoked by a flip.
+          properties:
+            unique_kinds:
+              type: array
+              nullable: true
+              description: |
+                Any of `email`, `phone`, each at most once. Absent or `null`
+                resolves to `["email","phone"]`, which is what every platform
+                reads as today; `[]` declares no identifying kind.
+              items: { type: string, enum: [email, phone] }
         phone_otp:
           type: object
           description: |
@@ -2530,9 +2602,14 @@ components:
             invalid_config_value` naming the ceiling, never clamped. An unknown
             sub-key is `400 unknown_config_key`. This release stores and validates
             the knob; the counter that enforces it ships later.
+            `sign_in_per_ip_per_hour` (ADR-116, spec `0.61.0`) limits sign-in
+            code sends per end-user IP per hour; default 10, range 1-60, it
+            cannot be turned off; outside the range is `400
+            invalid_config_value`.
           properties:
             max_per_window: { type: integer, minimum: 1, maximum: 1000 }
             window_seconds: { type: integer, minimum: 1, maximum: 3600 }
+            sign_in_per_ip_per_hour: { type: integer, minimum: 1, maximum: 60 }
 
         # ---- ADR-094 D4: per-org domain SSO -------------------------------
         domain_sso:
@@ -2847,12 +2924,20 @@ components:
           description: ADR-111. Always present; defaults filled in.
           properties:
             require_verified_email: { type: boolean }
+        contacts:
+          type: object
+          description: ADR-117 D1. See `RealmConfigPatch.contacts`. Always present; `unique_kinds` is the RESOLVED list (an unset platform reads `["email","phone"]`, an explicit `[]` reads `[]`).
+          properties:
+            unique_kinds:
+              type: array
+              items: { type: string, enum: [email, phone] }
         phone_otp:
           type: object
-          description: ADR-115 B4. Always present; defaults (5 per 900s) filled in.
+          description: ADR-115 B4, ADR-116. Always present; defaults (5 per 900s; 10 sign-in sends per IP per hour) filled in.
           properties:
             max_per_window: { type: integer }
             window_seconds: { type: integer }
+            sign_in_per_ip_per_hour: { type: integer }
         service_refresh_rotates: { type: boolean }
         service_refresh_ttl_seconds: { type: integer }
         service_refresh_ttl_max_seconds: { type: integer }
@@ -4640,6 +4725,116 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /auth/invitations/inspect:
+    post:
+      tags: [Auth]
+      summary: Check an invitation sign-up link before asking for a username (ADR-117 D6)
+      description: |
+        Anonymous: the token is the credential. A platform bearer, if sent,
+        must belong to the token's realm (otherwise `invalid_invitation_token`).
+        Writes nothing and consumes nothing. The token is sent in the BODY,
+        never a URL.
+
+        Only a platform with password sign-in on mails a sign-up link, and the
+        link is bound to ONE invited membership, never to the address.
+      security:
+        - BearerPlatformToken: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, description: The value from the link. }
+      responses:
+        '200':
+          description: The link can be used.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant_id, tenant_display_name, expires_at]
+                properties:
+                  tenant_id: { type: string, format: uuid }
+                  tenant_display_name: { type: string }
+                  expires_at: { type: string, format: date-time }
+        '400':
+          description: |
+            `invalid_invitation_token` - unknown, malformed, used, expired,
+            superseded (a newer link was sent), withdrawn, or the membership is
+            no longer invited. ONE code for all of them: no oracle.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/invitations/accept:
+    post:
+      tags: [Auth]
+      summary: Accept an invitation from its sign-up link and sign in (ADR-117 D6)
+      description: |
+        Anonymous: the link IS the credential. Creates the username and the
+        password, activates the invited membership and SIGNS THE PERSON IN.
+
+        Order: the body is validated as input first (no lookup, the token is
+        not touched); then, in one transaction in the global lock order (realm
+        row, users row, token, contacts), the token is claimed by a single
+        compare-and-swap, the username contact and credential are written, the
+        `(password, <membership id>)` authority tuple is asserted and the row
+        flips to `active` (owner-seed invitations seat the owner pointer;
+        `user.invite_accept` is audited). A failure anywhere leaves the token
+        unused. The ADR-095 consent gate is not consulted: accepting the link IS
+        the acceptance, in either acceptance mode.
+
+        **Accepting never proves the email.** The address the link went to stays
+        unproven.
+
+        The response is EXACTLY the success (or MFA challenge / first-login
+        enrolment) response of `POST /auth/login` `grant_type=password`, from
+        the same completion code: every MFA floor and session limit applies.
+      security:
+        - BearerPlatformToken: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, username, password]
+              properties:
+                token: { type: string }
+                username:
+                  type: string
+                  description: 3-32 characters, case-folded, per-org unique.
+                password:
+                  type: string
+                  format: password
+                  description: 12..1024 bytes, no composition rules.
+      responses:
+        '200':
+          description: Signed in (or the MFA challenge).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400':
+          description: |
+            `invalid_username`, `password_too_short`, `password_too_long`
+            (checked before the token is looked up; the token is not burned),
+            `invalid_invitation_token` (as on inspect).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `identifier_collision` - the username is taken in that org. The
+            token is NOT burned; retry with another username.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /auth/password/reset:
     post:
       tags: [Auth]
@@ -5057,7 +5252,8 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '429':
           description: |
-            phone_otp_rate_limited — the realm's per-phone code limit
+            phone_otp_rate_limited — the realm's per-phone limit for codes sent to
+            signed-in users (ADR-116: separate from the sign-in counter)
             (`phone_otp`, ADR-115 B4) is spent for this phone number, shared by
             `sms` and `whatsapp`. `Retry-After` is the seconds until the oldest
             counted send leaves the window.
@@ -5084,6 +5280,105 @@ paths:
                     properties:
                       channel: { type: string, enum: [sms, whatsapp] }
 
+  /auth/otp/send-login:
+    post:
+      tags: [Auth]
+      summary: Send a sign-in code to a phone number (caller need not be signed in)
+      description: |
+        ADR-116. Asks RealmID to send a `purpose=login` code by SMS or WhatsApp
+        to `identifier`, for a person who is NOT signed in. The code is then
+        presented to `POST /auth/login` with `grant_type=otp`.
+        Platform token only; the realm is the token's realm. The caller passes
+        the END USER's IP in `X-On-Behalf-Of-IP` (honoured only from a verified
+        platform-class bearer); without it only the per-phone limit applies,
+        and the caller's own server IP is never counted.
+        **Enumeration-safe:** success is ALWAYS `202 {"sent_if_registered": true}`,
+        whether or not the number belongs to anyone. The send happens after the
+        response, so a failed send is not reported to the caller; a channel whose
+        provider rejects the realm's credentials turns `failing` and the next
+        request answers `503 delivery_unavailable`.
+        Limits: per end-user IP, `phone_otp.sign_in_per_ip_per_hour` per hour;
+        per phone number, `phone_otp.max_per_window` per
+        `phone_otp.window_seconds`. Both are charged before the person is looked
+        up, and both are separate from the counters for codes sent to signed-in
+        users (`POST /auth/otp/issue`, MFA, contact verification).
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: header
+          name: X-On-Behalf-Of-IP
+          required: false
+          schema: { type: string }
+          description: |
+            The end user's IP address, as seen by the caller. Optional; when
+            absent only the per-phone limit applies. When present it must be a
+            parseable IPv4 or IPv6 address (`400 invalid_on_behalf_of_ip`
+            otherwise). IPv4 is counted per address, IPv6 per `/64` prefix.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendLoginCodeRequest' }
+      responses:
+        '202':
+          description: Accepted. Says nothing about whether the number is registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendLoginCodeResponse' }
+        '400':
+          description: |
+            invalid_identifier (missing, or not strict E.164 — refused, never
+            rewritten, ADR-103 D5) | unsupported_delivery_mode (missing, or not
+            `sms` | `whatsapp`) | invalid_on_behalf_of_ip (`X-On-Behalf-Of-IP`
+            is present but is not a parseable IPv4 or IPv6 address; nothing is
+            counted or sent).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            unauthorized (missing or invalid bearer) | wrong_scope (the bearer
+            is not a platform-class token).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: method_not_enabled — the realm has `otp_login_enabled = false`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: |
+            sign_in_ip_rate_limited — this end-user IP has used the realm's
+            `phone_otp.sign_in_per_ip_per_hour` | phone_otp_rate_limited — this
+            phone number has used the realm's sign-in per-phone allowance |
+            rate_limited — the per-replica burst limiter on `/auth/otp/*`.
+            `Retry-After` is the seconds until a send is allowed again.
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds to wait }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: internal — a store or limiter call failed in a way retrying cannot fix. Nothing was sent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            delivery_unavailable — the realm has no `operational` channel for
+            `delivery_mode`; the body carries `channel` (`sms` | `whatsapp`) |
+            store_unavailable — a datastore needed for the limits is
+            unreachable; nothing was sent (fails closed).
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds to wait }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      channel: { type: string, enum: [sms, whatsapp] }
   /auth/otp/{id}:
     get:
       tags: [Auth]
@@ -6296,6 +6591,18 @@ paths:
                       non-compliant — and a user who never logs in never
                       resolves — so "is this realm actually single-tenant yet?"
                       could only be guessed at.
+                  unique_kinds_report:
+                    type: object
+                    description: >
+                      ADR-117. Per contact kind (`email`, `phone`), how many
+                      values are proven on more than one membership of this
+                      platform. Counts only, never the values. It sits BESIDE
+                      `config` because it is derived, not settable. Omitted
+                      when the count could not be taken.
+                    additionalProperties:
+                      type: object
+                      properties:
+                        values_on_multiple_memberships: { type: integer }
         '403':
           description: forbidden — missing permission `platform:config`
         '404':
@@ -6309,6 +6616,14 @@ paths:
           name: id
           required: true
           schema: { type: string, format: uuid }
+        - in: query
+          name: confirm_lockout
+          required: false
+          description: >
+            ADR-117 D8. Exactly `true` proceeds past `409 unique_kind_lockout`
+            (and is audited with the exact counts). Any other value is no
+            confirmation. It never escapes a `503` or any other refusal.
+          schema: { type: string, enum: ['true'] }
       requestBody:
         required: true
         content:
@@ -6323,7 +6638,24 @@ paths:
             | custom_claim_key_too_long | reserved_claim_key (an
             `access_token_custom_claim_keys` entry names a reserved JWT claim
             such as `sid`, `events`, `scope` or `role`; the message names every
-            offending key)
+            offending key) | unique_kinds_requires_password (ADR-117 D8: an
+            empty `contacts.unique_kinds` while password sign-in is off)
+        '409':
+          description: |
+            ADR-117 D8, all from a change to `contacts.unique_kinds`
+            (see `RealmConfigPatch.contacts`): unique_kind_lockout
+            (`{kind, locked_out, mfa_locked_out}`; escaped by
+            `?confirm_lockout=true`) | unique_kind_duplicates
+            (`{kind, conflicting_values}`) | email_keyed_signin_enabled
+            (`{identity_providers, sso_domains}`) |
+            require_verified_email_conflict | password_login_required.
+            Also active_api_keys_exist (existing).
+        '501':
+          description: contact_policy_unavailable (the contact-policy store is not configured)
+        '503':
+          description: |
+            unique_kind_lockout_check_failed (a count could not be taken;
+            refused whatever `confirm_lockout` says)
 
   /platforms/{id}/messaging/{channel}:
     parameters:
@@ -7535,7 +7867,12 @@ paths:
         '404':
           description: realm_not_found | tenant_not_found
         '409':
-          description: provider_exists
+          description: |
+            provider_exists | idp_requires_identifying_email (ADR-117:
+            google, microsoft, facebook or apple while `email` is not in the
+            platform's `contacts.unique_kinds`; the provider keys a sign-in
+            by email) | idp_requires_identifying_phone (firebase while
+            neither `email` nor `phone` is an identifying kind)
 
   /identity-providers/{id}:
     parameters:
@@ -7568,6 +7905,11 @@ paths:
             `app_id`; ADR-072 § Amendment)
         '404':
           description: provider_not_found
+        '409':
+          description: |
+            idp_requires_identifying_email | idp_requires_identifying_phone
+            (only when the patch sets `enabled=true`; same rules as the
+            create, ADR-117)
     delete:
       tags: [Platform Admin]
       summary: Remove an identity-provider row
@@ -7877,6 +8219,9 @@ paths:
           description: |
             recipient_not_member | recipient_not_active | already_owner |
             conflicting_outgoing_disposition | invalid_identifier |
+            recipient_email_not_identifying - `new_owner_email` names an email on a
+            platform that does not identify people by email (ADR-117 D5): an
+            address there is a mailing contact and resolves nobody |
             recipient_contact_unproven — `new_owner_email` matched a contact in
             the tenant that its holder has NOT verified (spec `0.26.0`). An
             address written by an admin is an assertion, and the ownership
@@ -8051,6 +8396,15 @@ paths:
             Import report. `committed:true` = all rows written;
             `committed:false` = validation rejected the file, nothing written.
 
+            ADR-117: per-row `error` codes also include
+            `invite_contact_not_identifying` (a row whose every contact is of a
+            kind outside the platform's `contacts.unique_kinds`) and
+            `identifier_check_failed` (the collision lookup itself errored;
+            nothing is known about the row). `duplicate_in_batch`,
+            `identifier_collision` and `single_tenant_membership` apply to
+            IDENTIFYING kinds only, and `single_tenant_membership` correlates
+            by every proven identifying contact (email or phone).
+
             Per-row `error` codes include `forbidden_role` — the caller may not
             seat a principal at that row's role. Emitted when the row names a
             role that confers administrative authority and the caller is not the
@@ -8144,6 +8498,11 @@ paths:
             bad_json | missing_fields (neither email nor phone supplied) |
             invitation_address_immutable (the user's status is `invited`;
             revoke the invitation and invite the corrected address)
+        '403':
+          description: |
+            forbidden — the caller lacks `users:manage`, or the target is the
+            tenant owner and the caller is not (only the owner may change or
+            release the owner's contacts; ADR-116 second amendment)
         '404':
           description: user_not_found
         '409':
@@ -8472,7 +8831,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Invitation' }
         '400':
-          description: owner_not_invitable — ownership moves via transfer, not invitation
+          description: |
+            owner_not_invitable - ownership moves via transfer, not invitation |
+            invite_contact_not_identifying - the contact is a mailing contact
+            the invitee could not accept (ADR-117 D-c): a phone the platform does
+            not identify people by, or an email on a platform that does not
+            identify by email AND has no password sign-in (no sign-up link
+            exists to accept through)
         '403':
           description: >-
             role_owner_only — only the tenant OWNER may seat a principal at a
@@ -8498,6 +8863,41 @@ paths:
       responses:
         '200':
           description: OK
+
+  /tenants/{id}/invitations/{inviteId}/resend:
+    post:
+      tags: [Invitations]
+      summary: Re-send an outstanding invitation (ADR-117 D6)
+      description: |
+        Same gate as revoke: `invitations:manage`, or having created the invite.
+        Bumps the invitation's expiry and mails it again. On a platform with
+        password sign-in the mail carries a FRESH 7-day sign-up link and the
+        earlier link is superseded (dead). Any other platform's mail is the
+        plain invitation notice.
+      security: [{ BearerAccess: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: inviteId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The invitation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invitation' }
+        '403':
+          description: caller lacks `invitations:manage` and did not create this invite
+        '404':
+          description: invite_not_found
+        '409':
+          description: |
+            `not_pending` - already accepted or revoked; `no_email_to_resend` -
+            the invitation has no email address to send to.
 
   # ------------------------------------------------ Service accounts (ADR-071)
 
@@ -8981,6 +9381,12 @@ paths:
       responses:
         '200':
           description: OK
+        '403':
+          description: |
+            forbidden — the caller lacks `users:manage`, or the pending row
+            belongs to the tenant owner and the caller is not (only the owner
+            may approve a provider link on the owner's account; ADR-116 second
+            amendment)
         '409':
           description: verification already resolved / active slot taken
 
@@ -9061,7 +9467,9 @@ paths:
         direct parent** (ADR-077 §4 tier-2 break-glass, G-014 gate — never a
         grandparent; a reset never grants login). Emails the affected user for
         tamper-evidence (ADR-079), labelled by who reset it (self / admin /
-        parent).
+        parent). The OWNER's MFA is reset only by the owner, the direct
+        parent's break-glass, or a realm M2M principal; an in-tenant
+        `users:manage` holder still resets everyone else (ADR-077 §4 amendment).
       security: [{ BearerAccess: [] }]
       parameters:
         - in: path
@@ -9075,6 +9483,11 @@ paths:
       responses:
         '200':
           description: OK
+        '403':
+          description: |
+            forbidden — the caller lacks `users:manage` and is not the direct
+            parent, or the target is the tenant owner and the caller is an
+            in-tenant admin rather than the owner
 
   # ---- ADR-047 §3: GET /me ----
   /me:
@@ -9558,6 +9971,16 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `forbidden` when the target is the tenant's OWNER and the caller is
+            not: only the owner may set the username or password through which
+            the owner signs in (ADR-116 second amendment). A `users:manage`
+            holder inside the tenant is refused; the owner acting on themselves
+            and a realm M2M principal are not. Nothing is written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: |
             `user_not_found`. A missing user and a user in another tenant
@@ -9569,7 +9992,8 @@ paths:
           description: |
             - `identifier_collision` — that username is taken in this org.
             - `reset_link_required` (spec `0.53.0`, ADR-111 P1) — the body
-              carries a `password` and this member has a verified email. An
+              carries a `password` and this member has a verified email, and
+              email is an identifying kind for the platform (ADR-117). An
               admin never sets such a member's password; send them a link with
               `POST /tenants/{tid}/users/{uid}/password-reset`. Nothing in the
               body is written, the `username` included.
@@ -9641,6 +10065,9 @@ paths:
             `no_verified_email` — the member has no verified email to send to.
             Hand over a temporary password with `PUT …/credentials` instead,
             unless the realm's `password_policy.require_verified_email` is on.
+            `reset_email_not_identifying` (ADR-117) — `email` is not in the
+            platform's `contacts.unique_kinds`, so a mailed link is not a
+            recovery channel; set the password with `PUT …/credentials`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -9713,6 +10140,147 @@ paths:
             this realm and must transfer it first; or
             `single_tenant_not_required` — this realm does not require
             single-tenant membership, so there is nothing to settle.
+      security:
+        - BearerAccess: []
+  /me/contacts:
+    get:
+      tags: [Auth]
+      summary: List the caller's own active contacts (build spec Revision 8)
+      description: |
+        The caller's own ACTIVE contacts across exactly the memberships the
+        proof routes accept (same realm, correlated by a proven identifying
+        contact), so every `id` listed here is one
+        `POST /me/contacts/{contact_id}/proof` takes. Same refusals as the
+        proof routes: a signed-in person only; an API-key session and a bare
+        platform bearer are `403 permission_cap_exceeded`. A released
+        contact is not listed. Each item carries exactly `id`, `kind`, `value`,
+        `verified` and `tenant_id`; nothing else is on the wire.
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, kind, value, verified, tenant_id]
+                      properties:
+                        id: { type: string }
+                        kind: { type: string, enum: [email, phone] }
+                        value: { type: string }
+                        verified: { type: boolean }
+                        tenant_id: { type: string }
+                  next_cursor: { type: string, nullable: true }
+                  total: { type: integer, nullable: true }
+        '400': { $ref: '#/components/responses/InvalidPageParams' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: '`permission_cap_exceeded` — refused for a credential that is not a signed-in person: any API-key session (capped or not), and a platform bearer acting as itself with no `X-User-Token`.' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+      security:
+        - BearerAccess: []
+  /me/contacts/{contact_id}/proof:
+    post:
+      tags: [Auth]
+      summary: Send a code to one of the caller's own phones to prove it (ADR-116 third amendment)
+      description: |
+        A SIGNED-IN person proves a phone they own. The code goes to exactly
+        that contact's number, through the realm's own SMS or WhatsApp channel,
+        and is charged to the signed-in per-phone and per-user limits.
+
+        Only the holder may prove: the caller is the user token's subject (a
+        partner bearer escorts it with `X-User-Token`; a bare
+        `X-On-Behalf-Of-User` id is refused, `401 x_user_token_required`). An
+        admin acting for the person cannot prove their phone: the contact is
+        not the admin's own, so the answer is `404 contact_not_found`.
+
+        The code is bound to this one contact and uses the RealmID-reserved
+        purpose `realmid_contact_proof`, which `/auth/otp/issue` and
+        `/auth/otp/verify` refuse with `400 invalid_purpose`. The answer is
+        `200` because the send is inline: the `200` proves the provider
+        accepted it.
+      parameters:
+        - { name: contact_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [delivery_mode]
+              properties:
+                delivery_mode: { type: string, enum: [sms, whatsapp], description: No fallback between channels. }
+      responses:
+        '200':
+          description: Code sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delivered: { type: string, enum: [sms, whatsapp] }
+        '400': { description: '`bad_json`; `unsupported_delivery_mode`; or `no_delivery_address` when the number cannot receive on that channel.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: '`permission_cap_exceeded` — refused for a credential that is not a signed-in person: any API-key session (capped or not), and a platform bearer acting as itself with no `X-User-Token`.' }
+        '404': { description: '`contact_not_found` — not an active phone of the caller''s own membership.' }
+        '409': { description: '`contact_already_verified` — nothing was sent.' }
+        '429': { description: '`phone_otp_rate_limited`; `Retry-After` names the wait.' }
+        '503': { description: '`delivery_unavailable` — the realm has no working channel for that mode; or the datastore was unreachable (the generic store-error envelope).' }
+      security:
+        - BearerAccess: []
+  /me/contacts/{contact_id}/proof/confirm:
+    post:
+      tags: [Auth]
+      summary: Redeem a contact-proof code (ADR-116 third amendment)
+      description: |
+        Redeeming the code sets `verified_at` on the contact, settles a pending
+        `supersedes` swap (releasing the replaced contact and revoking its
+        bindings) and emits `contact.verified` with no number in clear. A code
+        minted for another contact is `401 invalid_otp`. If the contact was
+        released or replaced between the send and now, the code is spent and the
+        answer is `409 contact_changed`.
+      parameters:
+        - { name: contact_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        '200':
+          description: Contact proven
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  kind: { type: string, enum: [phone] }
+                  value: { type: string }
+                  verified: { type: boolean }
+                  verified_at: { type: string, format: date-time, nullable: true }
+        '400': { description: '`bad_json`.' }
+        '401': { description: '`invalid_otp`, or the standard Unauthorized.' }
+        '403': { description: '`permission_cap_exceeded` — refused for a credential that is not a signed-in person: any API-key session (capped or not), and a platform bearer acting as itself with no `X-User-Token`.' }
+        '404': { description: '`contact_not_found` — not an active phone of the caller''s own membership (a foreign or unknown contact id is indistinguishable). Returned only when no code matched: a locked or expired subject answers `429` / `410` on this branch too.' }
+        '409': { description: '`contact_changed` — the contact was released or replaced after the send.' }
+        '410': { description: '`otp_expired`.' }
+        '429': { description: '`otp_locked` — too many wrong codes.' }
+        '503': { description: 'The datastore was unreachable (the generic store-error envelope).' }
       security:
         - BearerAccess: []
   # ---- ADR-094: per-org domain SSO grants -------------------------------
@@ -9812,7 +10380,7 @@ paths:
         '401': { description: unauthorized }
         '403': { description: forbidden }
         '404': { description: tenant_not_found }
-        '409': { description: grant_exists | domain_owned_elsewhere | dns_proof_supersedes }
+        '409': { description: grant_exists | domain_owned_elsewhere | dns_proof_supersedes | domain_sso_requires_unique_email (ADR-117 - email is not in the platform's contacts.unique_kinds) }
         '429': { description: too_many_pending_claims | domain_request_cooldown }
 
   /platforms/{pid}/tenants/{tid}/sso-domains/{domain}/verify:
@@ -9863,7 +10431,7 @@ paths:
         '401': { description: unauthorized }
         '403': { description: forbidden }
         '404': { description: tenant_not_found | grant_not_found }
-        '409': { description: domain_owned_elsewhere }
+        '409': { description: domain_owned_elsewhere | domain_sso_requires_unique_email (ADR-117 - email is not in the platform's contacts.unique_kinds) }
 
   /platforms/{pid}/tenants/{tid}/sso-domains/{domain}/request:
     parameters:
@@ -9903,7 +10471,7 @@ paths:
         '401': { description: unauthorized }
         '403': { description: forbidden }
         '404': { description: tenant_not_found }
-        '409': { description: dns_proof_supersedes | domain_owned_elsewhere }
+        '409': { description: dns_proof_supersedes | domain_owned_elsewhere | domain_sso_requires_unique_email (ADR-117 - email is not in the platform's contacts.unique_kinds) }
         '429': { description: too_many_pending_claims | domain_request_cooldown }
 
   /platforms/{pid}/tenants/{tid}/sso-domains/{domain}:
@@ -10050,7 +10618,7 @@ paths:
         '401': { description: unauthorized }
         '403': { description: forbidden }
         '404': { description: grant_not_found }
-        '409': { description: dns_proof_supersedes | domain_owned_elsewhere }
+        '409': { description: dns_proof_supersedes | domain_owned_elsewhere | domain_sso_requires_unique_email (ADR-117 - email is not in the platform's contacts.unique_kinds) }
 
   /platforms/{pid}/sso-domains/{id}/reject:
     parameters:
