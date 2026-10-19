@@ -135,6 +135,17 @@ func actionVerb(method, seg string) (string, bool) {
 		// suspends or deactivates up to 500 members in one call, so `--status`
 		// is required with no default, as on the console.
 		return seg, true
+	case "proof":
+		// Added 2026-10-19 (owner ruling; ADR-062 §5) with the issuer v0.139.0 re-vendor:
+		// `POST /me/contacts/{contact_id}/proof` is `contacts proof`. Not irreversible: it
+		// sends a code to the caller's OWN phone. Its second step, `…/proof/confirm`,
+		// derives on its nearest static parent, so it is `proof confirm` (a reviewed
+		// group), not `contacts confirm`.
+		return seg, true
+	case "resend":
+		// Added 2026-10-19 (owner ruling; ADR-062 §5): `POST /tenants/{id}/invitations/
+		// {inviteId}/resend` is `invitations resend`. It re-sends an existing invitation.
+		return seg, true
 	case "mine":
 		return "list-mine", true
 	case "pending":
@@ -315,16 +326,6 @@ func skipPath(path string) bool {
 	case path == "/me":
 		return true
 	case strings.Contains(path, "/.well-known/"):
-		return true
-	// Added 2026-10-19 with the issuer v0.139.0 re-vendor (R7 + R9), PENDING an owner ruling on
-	// exposure (ADR-062 §5; every earlier new group or verb went in by ruling). Until then both stay
-	// out of the typed tree exactly as before the re-vendor, reachable only via `realm-id api`:
-	// a holder's proof of their own phone (`/me/contacts/{contact_id}/proof[/confirm]`) and an
-	// invitation resend (`/tenants/{id}/invitations/{inviteId}/resend`).
-	case strings.HasPrefix(path, "/me/contacts/") && (strings.HasSuffix(path, "/proof") ||
-		strings.HasSuffix(path, "/proof/confirm")):
-		return true
-	case strings.HasPrefix(path, "/tenants/") && strings.HasSuffix(path, "/invitations/{inviteId}/resend"):
 		return true
 	}
 	return false

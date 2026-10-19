@@ -434,7 +434,11 @@ func TestTopLevelResourceGroupsAreReviewed(t *testing.T) {
 		// The write-only secrets are refused as flags and read from stdin or a
 		// hidden prompt (messaging.go).
 		"messaging": true,
-		"stats":     true, "tenants": true,
+		// "proof" ADDED 2026-10-19 (owner ruling): `POST /me/contacts/{contact_id}/proof/confirm`
+		// derives as `proof confirm` because `confirm` acts on its nearest static parent. Its
+		// sibling `contacts proof` sends the code; neither is irreversible (ADR-062 §5).
+		"proof": true,
+		"stats": true, "tenants": true,
 		"user-api-keys": true, "users": true,
 
 		// Parents of a trailing action segment, reached only that way. They are
@@ -504,6 +508,12 @@ func TestActionSegmentsDeriveOnTheirParentResource(t *testing.T) {
 		// ADR-111; owner ruling 2026-10-13: the admin "send a reset link" action is typed.
 		{"POST", "/tenants/{tid}/users/{uid}/password-reset", "users", "password-reset"},
 		{"POST", "/platforms/{pid}/tenants/{tid}/sso-domains/{domain}/request", "sso-domains", "request"},
+		// Owner ruling 2026-10-19: the holder's phone proof and invitation resend are typed.
+		// `confirm` derives on the nearest static segment, which is `proof`, so the second
+		// step is `proof confirm` (a reviewed group), not `contacts confirm`.
+		{"POST", "/me/contacts/{contact_id}/proof", "contacts", "proof"},
+		{"POST", "/me/contacts/{contact_id}/proof/confirm", "proof", "confirm"},
+		{"POST", "/tenants/{id}/invitations/{inviteId}/resend", "invitations", "resend"},
 	}
 	for _, tc := range cases {
 		g, v, ok := deriveCommand(tc.method, tc.path)

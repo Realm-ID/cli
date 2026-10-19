@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-28 entries. Newest first.
+29 entries. Newest first.
 
+- [2026-10-19 — proof and invitation resend exposed in the CLI (owner ruling)](#2026-10-19--proof-and-invitation-resend-exposed-in-the-cli-owner-ruling)
 - [2026-10-17 — 2026-10-17 — messaging exposed in the CLI; secrets by stdin or hidden prompt, never a flag](#2026-10-17--2026-10-17--messaging-exposed-in-the-cli-secrets-by-stdin-or-hidden-prompt-never-a-flag)
 - [2026-10-15 — Embedded issuer spec re-pinned to v0.136.0 (custom_claims and viewer removed); the command tree does not move](#2026-10-15--embedded-issuer-spec-re-pinned-to-v01360-custom_claims-and-viewer-removed-the-command-tree-does-not-move)
 - [2026-10-15 — Embedded issuer spec re-pinned to v0.135.2 (v0.135.1 was burned); the command tree does not move](#2026-10-15--embedded-issuer-spec-re-pinned-to-v01352-v01351-was-burned-the-command-tree-does-not-move)
@@ -37,6 +38,10 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-19 — proof and invitation resend exposed in the CLI (owner ruling)
+
+The cli exposes the holder's phone proof (`POST /me/contacts/{contact_id}/proof` and `/proof/confirm`) and invitation resend (`POST /tenants/{id}/invitations/{inviteId}/resend`) as typed commands (owner, 2026-10-19). ADR-062 section 5 keeps irreversible acts out of a machine-driven binary, and neither is one: proof sends a code to the caller's own contact and confirm proves it, and resend re-sends an existing invitation. They had been held out by two `skipPath` cases (added with the v0.139.0 re-vendor, pending this ruling); those are removed and `proof` and `resend` join `actionVerb`. Shapes: `realm-id contacts proof --contact_id ID --field delivery_mode=sms`, `realm-id proof confirm --contact_id ID --field code=...`, `realm-id invitations resend --tenant T --inviteId ID`. The confirm step derives on its nearest static parent, so it lands in a new reviewed group `proof` rather than `contacts confirm`; `TestTopLevelResourceGroupsAreReviewed` lists it with this ruling.
 
 ## 2026-10-17 — 2026-10-17 — messaging exposed in the CLI; secrets by stdin or hidden prompt, never a flag
 

@@ -3,6 +3,16 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## Unreleased
+
+### Added — `realm-id contacts proof`, `realm-id proof confirm`, `realm-id invitations resend`
+
+The holder's phone proof and invitation resend are typed commands now (owner ruling 2026-10-19;
+no re-vendor, the routes were already in the embedded spec). Example: `realm-id contacts proof
+--contact_id ID --field delivery_mode=sms` sends a code to your own phone, then `realm-id proof
+confirm --contact_id ID --field code=123456` proves it; `realm-id invitations resend --tenant T
+--inviteId ID` re-sends an outstanding invitation.
+
 ## v0.5.0 — `messaging` commands (ADR-115) and the issuer `v0.139.0` contract (R7 + R9) (2026-10-19)
 
 ### Added — `realm-id messaging describe|update|revoke --channel sms|whatsapp` (ADR-115)
