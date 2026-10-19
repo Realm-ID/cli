@@ -3,7 +3,7 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
-## Unreleased
+## v0.5.1 — phone proof and invitation resend commands (owner ruling) (2026-10-19)
 
 ### Added — `realm-id contacts proof`, `realm-id proof confirm`, `realm-id invitations resend`
 
