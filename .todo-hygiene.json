@@ -1,0 +1,9 @@
+{
+  "todo": "TODO.md",
+  "ranking": null,
+  "closed_marker": "strike",
+  "checked_boxes": {"forbid": true, "scope": "any", "remedy": "move it to TODO-ARCHIVE.md"},
+  "flag_struck_open": true,
+  "line_refs_into_todo_from": ["DECISIONS.md", "README.md"],
+  "fragile_line_refs": "warn"
+}

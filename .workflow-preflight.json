@@ -1,0 +1,15 @@
+{
+  "tools": {"actionlint": "1.7.12", "shellcheck": "0.11.0"},
+  "toolchain": {"go": "1.27.2"},
+  "local_gate": "make check",
+  "adopted": "2026-10-20",
+  "jobs": {
+    "tests.yml:test": {"local": "go test -race ./...", "marker": "go-test"},
+    "changelog-hygiene.yml:order": {"local": "./scripts/changelog-hygiene.sh order", "marker": "changelog-order"},
+    "workflow-hygiene.yml:lint": {"local": "make workflow-lint"},
+    "workflow-hygiene.yml:pinned": {"local": "make workflow-parity", "marker": "workflow-parity"},
+    "release.yml:changelog": {"waiver": "release-only", "reason": "runs on a pushed tag only; make release-check VERSION=x.y.z is the pre-tag equivalent, not part of the pre-push gate"},
+    "release.yml:test": {"waiver": "release-only", "reason": "workflow_call of tests.yml on the tagged tree; tests.yml:test is the mapped job and make check runs the same suite"},
+    "release.yml:goreleaser": {"waiver": "release-only", "reason": "builds and publishes release artefacts from a pushed tag; needs GITHUB_TOKEN and network, cannot run in a pre-push gate"}
+  }
+}

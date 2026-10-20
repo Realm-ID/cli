@@ -53,29 +53,23 @@ jobs:
           "$RUNNER_TEMP/shellcheck-${SC_VERSION}/shellcheck" --version | grep -qx "version: ${SC_VERSION#v}"
           echo "$RUNNER_TEMP/shellcheck-${SC_VERSION}" >> "$GITHUB_PATH"
 
-      # Pinned, not `curl … | bash`: installing the linter from a moving branch
-      # is the exact supply-chain shape the `pinned` job below rejects.
-      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
-        with:
-          version: 1.7.12
-          # explicit path: actionlint must not fall back to the runner image's shellcheck
-          flags: -shellcheck=${{ runner.temp }}/shellcheck-v0.11.0/shellcheck
-          fail-on-error: true
-
-      # Positive control. A wrong -shellcheck path makes actionlint print 'Rule "shellcheck" was
-      # disabled' and exit 0, so the step above can be green with no shellcheck at all. The same
-      # actionlint binary and path must find a known SC2086 in a canary workflow.
-      - name: shellcheck is live inside actionlint (canary)
+      # actionlint is installed from its release tarball and verified against a SHA-256, then run
+      # through the same make target the laptop gate runs (scripts/workflow_preflight.py lint,
+      # which also runs the shellcheck-is-live canary and the SHA-pin check). No install-and-run
+      # action: it cannot be proven to be the version the laptop runs.
+      - name: Install pinned actionlint
         shell: bash
+        env:
+          AL_VERSION: 1.7.12
+          AL_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
-          mkdir -p "$RUNNER_TEMP/canary/.github/workflows"
-          # shellcheck disable=SC2016  # the canary's $(ls) and $f are literal text, on purpose
-          printf 'on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          f=$(ls)\n          rm $f\n' \
-            > "$RUNNER_TEMP/canary/.github/workflows/canary.yml"
-          cd "$RUNNER_TEMP/canary"
-          out=$("$RUNNER_TEMP/actionlint-1.7.12/actionlint" -shellcheck="$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" .github/workflows/canary.yml 2>&1 || true)
-          grep -q SC2086 <<<"$out" || { echo "::error::canary SC2086 not reported; shellcheck is not running inside actionlint"; echo "$out"; exit 1; }
-          echo "canary: SC2086 reported (examined 1 canary workflow)"
+          curl -sSfLo "$RUNNER_TEMP/al.tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${AL_VERSION}/actionlint_${AL_VERSION}_linux_amd64.tar.gz"
+          echo "${AL_SHA256}  $RUNNER_TEMP/al.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/actionlint-bin"
+          tar -xzf "$RUNNER_TEMP/al.tgz" -C "$RUNNER_TEMP/actionlint-bin" actionlint
+          echo "$RUNNER_TEMP/actionlint-bin" >> "$GITHUB_PATH"
+      - run: make workflow-lint
 
   pinned:
     name: third-party actions are SHA-pinned
@@ -83,6 +77,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Parity (every CI job maps to a step the laptop gate runs) compares the pinned Go
+      # toolchain with `go env GOVERSION`, so it runs here with the same Go the config pins.
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.27.2'
+      - run: make workflow-parity
       - name: Reject mutable action refs
         run: |
           # Matches `uses: owner/repo@ref` where ref is not a 40-char hex SHA.

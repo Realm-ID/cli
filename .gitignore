@@ -7,3 +7,4 @@
 /cmd/realm-id/realm-id
 /dist/
 *.out
+__pycache__/

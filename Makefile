@@ -4,7 +4,7 @@ SHELL := /bin/sh
 # Local preflight gates. See .scratch/preflight/SPEC.md (workspace root) for
 # the contract this Makefile implements, and DECISIONS.md for why.
 
-.PHONY: help check release-check install-hooks self-test
+.PHONY: help check release-check install-hooks self-test workflow-lint workflow-parity todo-hygiene
 
 help: ## List available targets
 	@echo "Targets:"
@@ -13,7 +13,10 @@ help: ## List available targets
 	@echo "  release-check  VERSION=x.y.z — the release-time changelog gate,"
 	@echo "                 runnable before the tag exists."
 	@echo "  install-hooks  git config core.hooksPath .githooks"
-	@echo "  self-test      run this repo's checker-script tests"
+	@echo "  workflow-lint  actionlint + shellcheck (pinned) over .github/workflows"
+	@echo "  workflow-parity every CI job maps to a local step or a waiver"
+	@echo "  todo-hygiene   fleet TODO.md checker"
+	@echo "  self-test     run this repo's checker-script tests"
 
 # Mirrors .github/workflows/tests.yml (gofmt, build, vet, go test -race) and
 # .github/workflows/changelog-hygiene.yml's push gate (order), invoked with
@@ -43,14 +46,36 @@ check:
 	echo "==> vet (mirrors tests.yml: go vet ./...)"; \
 	go vet ./... && echo ok || { echo "FAILED: vet (go vet ./...)"; fail=1; }; \
 	echo "==> test -race (mirrors tests.yml: go test -race ./...; measured ~22s, 2026-09-05, one package)"; \
+	echo "::preflight-step::go-test"; \
 	go test -race ./... || { echo "FAILED: test (go test -race ./...)"; fail=1; }; \
 	echo "==> changelog order (mirrors changelog-hygiene.yml: ./scripts/changelog-hygiene.sh order)"; \
+	echo "::preflight-step::changelog-order"; \
 	./scripts/changelog-hygiene.sh order || { echo "FAILED: changelog order (./scripts/changelog-hygiene.sh order)"; fail=1; }; \
+	echo "==> workflow lint (mirrors workflow-hygiene.yml: make workflow-lint)"; \
+	$(MAKE) --no-print-directory workflow-lint || { echo "FAILED: workflow lint (make workflow-lint)"; fail=1; }; \
+	echo "==> workflow parity (mirrors workflow-hygiene.yml: make workflow-parity)"; \
+	$(MAKE) --no-print-directory workflow-parity || { echo "FAILED: workflow parity (make workflow-parity)"; fail=1; }; \
+	echo "==> todo hygiene (make todo-hygiene)"; \
+	$(MAKE) --no-print-directory todo-hygiene || { echo "FAILED: todo hygiene (make todo-hygiene)"; fail=1; }; \
 	if [ "$$fail" != "0" ]; then \
 		echo ""; echo "make check: one or more gates FAILED — re-run the exact command printed above"; \
 		exit 1; \
 	fi; \
 	echo ""; echo "make check: all gates passed"
+
+# Fleet workflow-preflight (.workflow-preflight.json): actionlint + shellcheck at the
+# pinned versions with a canary and the SHA-pin check; parity proves every CI job is
+# mapped to a step this gate runs. Parity needs the pinned Go toolchain, so CI runs it
+# in the job that sets that Go up.
+workflow-lint:
+	python3 scripts/workflow_preflight.py lint
+
+workflow-parity:
+	@echo "::preflight-step::workflow-parity"
+	python3 scripts/workflow_preflight.py parity
+
+todo-hygiene:
+	python3 scripts/todo_hygiene.py
 
 # Mirrors release.yml's `changelog` job — the tag about to be pushed must
 # already have its own CHANGELOG.md entry. release.yml only learns this AFTER
@@ -81,3 +106,5 @@ install-hooks:
 self-test:
 	./scripts/preflight-parity_test.sh
 	./scripts/revendor-spec.sh selftest
+	python3 scripts/test_workflow_preflight.py
+	python3 scripts/test_todo_hygiene.py

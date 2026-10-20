@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-29 entries. Newest first.
+30 entries. Newest first.
 
+- [2026-10-20 — Fleet par: todo-hygiene and workflow-preflight vendored; actionlint installed from a checksummed tarball](#2026-10-20--fleet-par-todo-hygiene-and-workflow-preflight-vendored-actionlint-installed-from-a-checksummed-tarball)
 - [2026-10-19 — proof and invitation resend exposed in the CLI (owner ruling)](#2026-10-19--proof-and-invitation-resend-exposed-in-the-cli-owner-ruling)
 - [2026-10-17 — 2026-10-17 — messaging exposed in the CLI; secrets by stdin or hidden prompt, never a flag](#2026-10-17--2026-10-17--messaging-exposed-in-the-cli-secrets-by-stdin-or-hidden-prompt-never-a-flag)
 - [2026-10-15 — Embedded issuer spec re-pinned to v0.136.0 (custom_claims and viewer removed); the command tree does not move](#2026-10-15--embedded-issuer-spec-re-pinned-to-v01360-custom_claims-and-viewer-removed-the-command-tree-does-not-move)
@@ -38,6 +39,30 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-20 — Fleet par: todo-hygiene and workflow-preflight vendored; actionlint installed from a checksummed tarball
+
+Fleet par pass (2026-10-20, devops brief). Vendored the fleet `todo-hygiene` and `workflow-preflight`
+checkers with `.todo-hygiene.json` and `.workflow-preflight.json`, and wired both into `make check`
+(so the pre-push hook) and the existing `workflow-hygiene.yml` jobs (no new workflow).
+
+Why: CI had checks the laptop gate skipped, and `workflow-hygiene.yml` linted through
+`raven-actions/actionlint`, which cannot be proven to be the actionlint the laptop runs (parity
+reports it as DIVERGED). It now installs actionlint 1.7.12 from its release tarball (SHA-256
+checked) and runs `make workflow-lint`, the same target `make check` runs; the preflight `lint`
+carries its own shellcheck canary, so the hand-written canary step was dropped. `make
+workflow-parity` runs in the `pinned` job under setup-go 1.27.2 because parity compares the pinned
+toolchain with `go env GOVERSION`.
+
+Not applicable here, with the reason: docker-hygiene (no Dockerfile or compose file),
+claude-md-hygiene (no CLAUDE.md; README is the cold-start doc), api-contract-check (a JS/Babel
+checker for api-client source; this repo is Go and generates its command tree from the vendored
+issuer spec), doc-nav (vendored only into a repo whose CI runs it; this CI does not). Reusable
+workflows: none called, so the tag-pin check is vacuously met.
+
+Open: `release.yml` builds with Go 1.23 on purpose (go.mod minimum, what goreleaser ships) while
+the config pins the fleet Go 1.27.2, so parity prints PIN_DRIFT as a warning that becomes a
+failure on 2026-11-03. Needs an owner call; not guessed here.
 
 ## 2026-10-19 — proof and invitation resend exposed in the CLI (owner ruling)
 
