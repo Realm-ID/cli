@@ -1,6 +1,9 @@
 {
   "tools": {"actionlint": "1.7.12", "shellcheck": "0.11.0"},
   "toolchain": {"go": "1.27.2"},
+  "toolchain_overrides": {
+    "release.yml:goreleaser": {"go": "1.23", "reason": "builds the release at the go.mod minimum (go 1.23), which is what goreleaser ships; DECISIONS.md 2026-10-21"}
+  },
   "local_gate": "make check",
   "adopted": "2026-10-20",
   "jobs": {

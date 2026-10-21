@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VENDORED from claude-config skills/workflow-preflight @ 09dab2c7b5b2 — edit canonical, not this copy
+# VENDORED from claude-config skills/workflow-preflight @ 6a157daeda00 — edit canonical, not this copy
 """workflow-preflight: stop GitHub Actions failures before push (W1: `lint` and `parity`).
 
 Canonical copy lives in claude-config `skills/workflow-preflight/scripts/`; repos carry a stamped
@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - exercised only where PyYAML is absent
     yaml = None
 
 CONFIG_NAME = ".workflow-preflight.json"
-TOP_KEYS = {"tools", "toolchain", "local_gate", "parity_mode", "jobs", "refs", "network", "adopted"}
+TOP_KEYS = {"tools", "toolchain", "toolchain_overrides", "local_gate", "parity_mode", "jobs", "refs", "network", "adopted"}
 ENTRY_KEYS_LOCAL = {"local", "marker", "paths"}
 ENTRY_KEYS_WAIVER = {"waiver", "reason"}
 WAIVER_KINDS = {"ci-only", "opt-in-slow", "release-only"}
@@ -44,7 +44,12 @@ INSTALL_AND_RUN = ("raven-actions/actionlint",)
 SETUP_ACTIONS = {"actions/setup-go": ("go", "go-version"),
                  "actions/setup-node": ("node", "node-version"),
                  "actions/setup-python": ("python", "python-version")}
+TOOLCHAIN_LANGS = ("go", "node", "python")
 GRACE_DAYS = 14
+ORG_REPO = "just-git-dev/reusable-workflows"  # compared lowercase; GitHub names are case-insensitive
+ORG_URL = "https://github.com/Just-Git-Dev/reusable-workflows"
+TAG_RE = re.compile(r"v\d+\.\d+\.\d+")
+TAG_COMMENT_RE = re.compile(r"#\s*(v\d+\.\d+\.\d+)(?![\w.])")
 CANARY = "on: push\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $FOO\n"
 USES_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*['\"]?([^\s'\"#]+)")
 KNOWN_TOOLS = {"actionlint", "shellcheck", "golangci-lint"}  # tools whose names can sit beside another's version
@@ -54,6 +59,27 @@ MARKER_PREFIX = "::preflight-step::"
 
 class Fatal(Exception):
     """Usage / config / parse / cannot-verify: exit 2."""
+
+
+class NetworkUnavailable(Exception):
+    """The tag lookup could not reach the remote: lint warns loudly, never fails or passes silently."""
+
+
+def remote_tag_sha(tag):
+    """Commit SHA that `tag` of the org repo peels to, or None when the tag does not exist.
+    Raises NetworkUnavailable when ls-remote cannot answer. Tests replace this function."""
+    try:
+        p = subprocess.run(["git", "ls-remote", ORG_URL, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise NetworkUnavailable(str(e))
+    if p.returncode != 0:
+        raise NetworkUnavailable((p.stderr.strip().splitlines() or [f"rc={p.returncode}"])[0])
+    shas = {}
+    for ln in p.stdout.splitlines():
+        sha, _, ref = ln.partition("\t")
+        shas[ref.strip()] = sha.strip()
+    return shas.get(f"refs/tags/{tag}^{{}}") or shas.get(f"refs/tags/{tag}")
 
 
 def today():
@@ -89,7 +115,7 @@ def load_config(path):
     unknown = sorted(set(cfg) - TOP_KEYS)
     if unknown:
         raise Fatal(f"{path}: unknown key(s) {unknown}; allowed {sorted(TOP_KEYS)}")
-    for k in ("tools", "toolchain", "jobs"):
+    for k in ("tools", "toolchain", "toolchain_overrides", "jobs"):
         if k in cfg and not isinstance(cfg[k], dict):
             raise Fatal(f"{path}: '{k}' must be an object")
     if cfg.get("parity_mode", "by-construction") not in ("by-construction", "markers"):
@@ -131,6 +157,29 @@ def validate_jobs(jobs):
                 errors.append(f"jobs['{key}'].waiver must be one of {sorted(WAIVER_KINDS)}")
             elif len(str(e.get("reason", "")).strip()) < MIN_REASON:
                 no_reason.append(f"NO_REASON {key}: a waiver needs a reason of at least {MIN_REASON} characters")
+    return errors, no_reason
+
+
+def validate_overrides(ov):
+    """Return (errors, no_reason) for toolchain_overrides: {"<wf>:<job>": {"go"|"node"|"python": v, "reason": r}}."""
+    errors, no_reason = [], []
+    for key, e in ov.items():
+        if not re.fullmatch(r"[^:\s]+:[^:\s]+", key):
+            errors.append(f"toolchain_overrides['{key}'] must be keyed '<workflow file>:<job id>'")
+            continue
+        if not isinstance(e, dict):
+            errors.append(f"toolchain_overrides['{key}'] must be an object")
+            continue
+        langs = sorted(set(e) & set(TOOLCHAIN_LANGS))
+        bad = sorted(set(e) - set(TOOLCHAIN_LANGS) - {"reason"})
+        if bad or len(langs) != 1:
+            errors.append(f"toolchain_overrides['{key}'] needs exactly one of {list(TOOLCHAIN_LANGS)} plus 'reason'"
+                          + (f"; unknown key(s) {bad}" if bad else ""))
+            continue
+        if not str(e[langs[0]]).strip():
+            errors.append(f"toolchain_overrides['{key}'].{langs[0]} must be a non-empty version")
+        elif len(str(e.get("reason", "")).strip()) < MIN_REASON:
+            no_reason.append(f"NO_REASON {key}: a toolchain override needs a reason of at least {MIN_REASON} characters")
     return errors, no_reason
 
 
@@ -244,6 +293,7 @@ def cmd_lint(root, cfg, args):
         findings += [f"ACTIONLINT {ln}" for ln in p.stdout.splitlines() if re.match(r"^\S+:\d+:\d+: ", ln)]
 
     uses = checked = 0
+    to_verify = []
     for f in files:
         for n, line in enumerate(f.read_text().splitlines(), 1):
             m = USES_RE.match(line)
@@ -252,13 +302,46 @@ def cmd_lint(root, cfg, args):
             uses += 1
             target = m.group(1)
             path, _, ref = target.partition("@")
+            where = f"{f.relative_to(root)}:{n}"
+            if (path.lower() + "/").startswith(ORG_REPO + "/"):
+                checked += 1
+                if TAG_RE.fullmatch(ref):
+                    continue
+                if not re.fullmatch(r"[0-9a-f]{40}", ref):
+                    findings.append(f"UNPINNED {where}: {target} must be an exact tag vX.Y.Z or a 40-hex SHA with a # vX.Y.Z comment")
+                    continue
+                c = TAG_COMMENT_RE.search(line)
+                if not c:
+                    findings.append(f"NO_TAG_COMMENT {where}: {target} is a SHA pin without a `# vX.Y.Z` comment naming its tag")
+                else:
+                    to_verify.append((where, target, ref, c.group(1)))
+                continue
             if path.startswith(("./", "docker://")) or "/.github/workflows/" in path:
                 continue
             checked += 1
             if not re.fullmatch(r"[0-9a-f]{40}", ref):
                 findings.append(f"UNPINNED {f.relative_to(root)}:{n}: {target} is not pinned to a full commit SHA")
+    notes, resolved, offline_why = [], {}, None
+    for where, target, sha, tag in to_verify:
+        if tag not in resolved and offline_why is None and not args.offline:
+            try:
+                resolved[tag] = remote_tag_sha(tag)
+            except NetworkUnavailable as e:
+                offline_why = str(e)
+        if args.offline or offline_why is not None:
+            continue
+        if resolved[tag] != sha:
+            findings.append(f"TAG_SHA_MISMATCH {where}: {tag} "
+                            + (f"points at {resolved[tag]}" if resolved[tag] else "does not exist")
+                            + f", but the pin is {sha}")
+    if to_verify and (args.offline or offline_why is not None):
+        print(f"WARNING: tag/SHA NOT verified (offline): {len(to_verify)} SHA pin(s) into {ORG_REPO} "
+              f"were not checked against their # vX.Y.Z tag"
+              + ("" if args.offline else f" ({offline_why})"))
+    elif to_verify:
+        notes.append(f"{len(to_verify)} tag/SHA pin(s) into {ORG_REPO} verified against the remote")
     summary = f"examined: {len(files)} workflows, {uses} uses: lines ({checked} third-party checked)"
-    return finish(findings, [], summary, examined=len(files) and uses)
+    return finish(findings, [], summary, notes=notes, examined=len(files) and uses)
 
 
 # ---------------------------------------------------------------- parity
@@ -267,6 +350,7 @@ def pin_findings(wfs, cfg):
     """(key, message) for every tool / toolchain version in a workflow that differs from config."""
     out, seen = [], set()
     tools, chain = cfg.get("tools", {}), cfg.get("toolchain", {})
+    overrides = cfg.get("toolchain_overrides", {})
 
     def drift(wf, what, have, want):
         if norm(have) != norm(want) and (wf, what, have) not in seen:
@@ -275,13 +359,15 @@ def pin_findings(wfs, cfg):
 
     for w in wfs:
         for jid, job in w["jobs"].items():
+            ov = overrides.get(f"{w['name']}:{jid}") or {}  # per-job override: this job only
             for st in steps_of(job):
                 use = str(st.get("uses", "")).split("@")[0]
                 if use in SETUP_ACTIONS:
                     key, field = SETUP_ACTIONS[use]
                     v = (st.get("with") or {}).get(field)
-                    if key in chain and v is not None and "${{" not in str(v):
-                        drift(w["name"], f"{field}", v, chain[key])
+                    want = ov.get(key, chain.get(key))
+                    if want is not None and v is not None and "${{" not in str(v):
+                        drift(f"{w['name']}:{jid}" if key in ov else w["name"], f"{field}", v, want)
                 if use == "golangci/golangci-lint-action" and "golangci-lint" in tools:
                     v = (st.get("with") or {}).get("version")
                     if v is not None and "${{" not in str(v):
@@ -310,6 +396,9 @@ def pin_findings(wfs, cfg):
 def cmd_parity(root, cfg, args):
     jobs_cfg = cfg.get("jobs", {})
     errors, no_reason = validate_jobs(jobs_cfg)
+    overrides = cfg.get("toolchain_overrides", {})
+    e2, n2 = validate_overrides(overrides)
+    errors, no_reason = errors + e2, no_reason + n2
     if no_reason:
         print("\n".join(no_reason))
         raise Fatal(f"{len(no_reason)} waiver(s) without a reason")
@@ -369,6 +458,15 @@ def cmd_parity(root, cfg, args):
     for k in sorted(set(jobs_cfg) - keys):
         findings.append(f"STALE {k}: no such in-scope job (deleted, renamed, or its workflow is not push/PR-triggered)")
 
+    all_jobs = {f"{w['name']}:{jid}" for w in wfs for jid in w["jobs"]}
+    for k, e in sorted(overrides.items()):
+        if k not in all_jobs:
+            findings.append(f"STALE {k}: toolchain_overrides names a job that does not exist")
+            continue
+        for lang in TOOLCHAIN_LANGS:
+            if lang in e and lang in cfg.get("toolchain", {}) and norm(e[lang]) == norm(cfg["toolchain"][lang]):
+                findings.append(f"REDUNDANT_OVERRIDE {k}: {lang} {e[lang]} equals toolchain.{lang}; delete the override")
+
     want_go = cfg.get("toolchain", {}).get("go")
     if want_go:
         have = local_go_version()
@@ -421,6 +519,7 @@ def main(argv=None):
     ap.add_argument("--actionlint")
     ap.add_argument("--shellcheck")
     ap.add_argument("--gate-log")
+    ap.add_argument("--offline", action="store_true", help="lint: skip the tag/SHA network check (prints a warning)")
     args, extra = ap.parse_known_args(argv)
     if args.subcommand in ("refs", "calls", "dispatch-check"):
         print(f"workflow-preflight {args.subcommand}: not built yet (W2)", file=sys.stderr)

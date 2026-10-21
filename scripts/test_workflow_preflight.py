@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VENDORED from claude-config skills/workflow-preflight @ 2b27cabf1455 — edit canonical, not this copy
+# VENDORED from claude-config skills/workflow-preflight @ 6fe86373a0ed — edit canonical, not this copy
 """Tests for workflow_preflight.py (W1: lint + parity) — stdlib + PyYAML, no runner to install.
 
 Fixtures are synthetic repos built in temp dirs (no checked-in tree, so the vendored copy of
@@ -451,6 +451,213 @@ class ParityTests(Base):
         self.cfg(jobs={})
         rc, out = self.run_cli("parity")
         self.assertEqual(rc, 2, out)
+
+
+ORG = "Just-Git-Dev/reusable-workflows"
+TAGSHA = "c" * 40
+
+
+def job_yaml(jid, setup, version, extra=""):
+    return (f"  {jid}:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@{SHA}\n"
+            f"      - uses: actions/{setup}@{SHA}\n        with:\n          {setup.split('-')[1]}-version: '{version}'\n"
+            f"      - run: make {jid}\n{extra}")
+
+
+class ToolchainOverrideTests(Base):
+    """Ruling 1 (2026-10-21): a per-job toolchain override with a reason."""
+
+    def go_cli(self, **kw):
+        self.wf("release.yml", "on: push\njobs:\n" + job_yaml("build", "setup-go", "1.27.2")
+                + job_yaml("min-go", "setup-go", "1.23"))
+        jobs = {"release.yml:build": {"local": "make build"}, "release.yml:min-go": {"local": "make min-go"}}
+        self.cfg(toolchain={"go": "1.27.2"}, jobs=jobs, **kw)
+        self.m.local_go_version = lambda: "1.27.2"
+        return self.run_cli("parity")
+
+    def test_without_override_the_old_job_drifts(self):
+        rc, out = self.go_cli()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PIN_DRIFT", out)
+
+    def test_cli_release_go_123_job_passes_with_override(self):
+        rc, out = self.go_cli(toolchain_overrides={
+            "release.yml:min-go": {"go": "1.23", "reason": "go.mod minimum-version build"}})
+        self.assertEqual(rc, 0, out)
+
+    def test_override_does_not_excuse_other_jobs(self):
+        # the override names min-go, but `build` drifts to 1.23 too: still a finding
+        self.wf("release.yml", "on: push\njobs:\n" + job_yaml("build", "setup-go", "1.23")
+                + job_yaml("min-go", "setup-go", "1.23"))
+        self.cfg(toolchain={"go": "1.27.2"},
+                 toolchain_overrides={"release.yml:min-go": {"go": "1.23", "reason": "go.mod minimum-version build"}},
+                 jobs={"release.yml:build": {"local": "make build"}, "release.yml:min-go": {"local": "make min-go"}})
+        self.m.local_go_version = lambda: "1.27.2"
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PIN_DRIFT release.yml", out)
+
+    def test_override_job_on_a_third_version_still_drifts(self):
+        self.wf("release.yml", "on: push\njobs:\n" + job_yaml("min-go", "setup-go", "1.22"))
+        self.cfg(toolchain={"go": "1.27.2"},
+                 toolchain_overrides={"release.yml:min-go": {"go": "1.23", "reason": "go.mod minimum-version build"}},
+                 jobs={"release.yml:min-go": {"local": "make min-go"}})
+        self.m.local_go_version = lambda: "1.27.2"
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PIN_DRIFT", out)
+
+    def test_sdk_node_20_ci_and_node_22_publish(self):
+        self.wf("ci.yml", "on: push\njobs:\n" + job_yaml("test", "setup-node", "20")
+                + job_yaml("publish", "setup-node", "22"))
+        self.cfg(toolchain={"node": "22"},
+                 toolchain_overrides={"ci.yml:test": {"node": "20", "reason": "sdk supports Node 20 as its minimum"}},
+                 jobs={"ci.yml:test": {"local": "make test"}, "ci.yml:publish": {"local": "make publish"}})
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 0, out)
+        # the publish job moving to 20 is NOT excused by the CI job's override
+        self.wf("ci.yml", "on: push\njobs:\n" + job_yaml("test", "setup-node", "20")
+                + job_yaml("publish", "setup-node", "20"))
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PIN_DRIFT", out)
+
+    def test_missing_reason_exit_2(self):
+        rc, out = self.go_cli(toolchain_overrides={"release.yml:min-go": {"go": "1.23"}})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("NO_REASON", out)
+
+    def test_short_reason_exit_2(self):
+        rc, out = self.go_cli(toolchain_overrides={"release.yml:min-go": {"go": "1.23", "reason": "too short"}})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("NO_REASON", out)
+
+    def test_malformed_override_exit_2(self):
+        for bad in ({"release.yml:min-go": {"reason": "r" * 25}},
+                    {"release.yml:min-go": {"go": "1.23", "node": "20", "reason": "r" * 25}},
+                    {"release.yml:min-go": {"rust": "1.80", "reason": "r" * 25}},
+                    {"min-go": {"go": "1.23", "reason": "r" * 25}}):
+            rc, out = self.go_cli(toolchain_overrides=bad)
+            self.assertEqual(rc, 2, f"{bad}: {out}")
+
+    def test_override_for_missing_job_is_stale(self):
+        rc, out = self.go_cli(toolchain_overrides={
+            "release.yml:min-go": {"go": "1.23", "reason": "go.mod minimum-version build"},
+            "release.yml:gone": {"go": "1.23", "reason": "go.mod minimum-version build"}})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("STALE release.yml:gone", out)
+
+    def test_override_equal_to_toolchain_is_redundant(self):
+        self.wf("release.yml", "on: push\njobs:\n" + job_yaml("build", "setup-go", "1.27.2"))
+        self.cfg(toolchain={"go": "1.27.2"},
+                 toolchain_overrides={"release.yml:build": {"go": "1.27.2", "reason": "pointless but long enough"}},
+                 jobs={"release.yml:build": {"local": "make build"}})
+        self.m.local_go_version = lambda: "1.27.2"
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("REDUNDANT_OVERRIDE release.yml:build", out)
+
+
+class OrgTagPinTests(Base):
+    """Ruling 2 (2026-10-21): tag or tag-commit SHA for Just-Git-Dev/reusable-workflows."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        self.online = {"v3.8.1": TAGSHA}
+
+        def fake(tag):
+            self.calls.append(tag)
+            return self.online.get(tag)
+        self.m.remote_tag_sha = fake
+
+    def lint(self, uses_line):
+        self.wf("ci.yml", CI_GOOD + f"      - uses: {uses_line}\n")
+        self.cfg(tools={"actionlint": tool_version("actionlint", "-version"),
+                        "shellcheck": tool_version("shellcheck", "--version", "version")})
+        return self.run_cli("lint")
+
+    def test_exact_tag_passes_for_action_and_workflow(self):
+        rc, out = self.lint(f"{ORG}/actions/deploy@v3.8.1")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("UNPINNED", out)
+        self.wf("ci.yml", CI_GOOD + f"  call:\n    uses: {ORG}/.github/workflows/x.yml@v3.8.1\n")
+        rc, out = self.run_cli("lint")
+        self.assertEqual(rc, 0, out)
+
+    def test_sha_with_matching_tag_comment_passes_and_is_verified(self):
+        rc, out = self.lint(f"{ORG}/actions/deploy@{TAGSHA}  # v3.8.1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.calls, ["v3.8.1"])
+        self.assertNotIn("NOT verified", out)
+
+    def test_sha_without_tag_comment_is_a_finding(self):
+        rc, out = self.lint(f"{ORG}/actions/deploy@{TAGSHA}")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NO_TAG_COMMENT", out)
+
+    def test_floating_ref_is_unpinned(self):
+        for ref in ("v3", "main", "v3.8"):
+            rc, out = self.lint(f"{ORG}/actions/deploy@{ref}")
+            self.assertEqual(rc, 1, f"{ref}: {out}")
+            self.assertIn("UNPINNED", out)
+
+    def test_tag_sha_mismatch_is_a_finding(self):
+        rc, out = self.lint(f"{ORG}/actions/deploy@{'d' * 40}  # v3.8.1")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("TAG_SHA_MISMATCH", out)
+
+    def test_nonexistent_tag_is_a_mismatch(self):
+        rc, out = self.lint(f"{ORG}/actions/deploy@{TAGSHA}  # v9.9.9")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("TAG_SHA_MISMATCH", out)
+
+    def test_offline_warns_loudly_and_does_not_fail(self):
+        def down(tag):
+            raise self.m.NetworkUnavailable("no route")
+        self.m.remote_tag_sha = down
+        rc, out = self.lint(f"{ORG}/actions/deploy@{TAGSHA}  # v3.8.1")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("tag/SHA NOT verified (offline)", out)
+
+    def test_offline_flag_skips_network_and_warns(self):
+        self.lint(f"{ORG}/actions/deploy@{TAGSHA}  # v3.8.1")
+        self.calls.clear()
+        rc, out = self.run_cli("lint", "--offline")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.calls, [])
+        self.assertIn("tag/SHA NOT verified (offline)", out)
+
+    def test_other_third_party_still_needs_a_sha(self):
+        rc, out = self.lint("other-org/some-action@v1.2.3")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("UNPINNED", out)
+
+    def test_lookalike_org_is_third_party(self):
+        rc, out = self.lint("Just-Git-Dev/reusable-workflows-evil/actions/x@v3.8.1")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("UNPINNED", out)
+
+    def test_remote_tag_sha_parses_peeled_ls_remote(self):
+        m = load()
+        t, p = "b" * 40, "c" * 40
+        real = m.subprocess.run
+
+        class R:
+            returncode = 0
+            stdout = f"{t}\trefs/tags/v3.8.1\n{p}\trefs/tags/v3.8.1^{{}}\n"
+            stderr = ""
+        m.subprocess.run = lambda *a, **k: R()
+        try:
+            self.assertEqual(m.remote_tag_sha("v3.8.1"), p)
+            R.stdout = f"{t}\trefs/tags/v3.8.1\n"  # lightweight tag
+            self.assertEqual(m.remote_tag_sha("v3.8.1"), t)
+            R.stdout = ""
+            self.assertIsNone(m.remote_tag_sha("v3.8.1"))
+            R.returncode, R.stderr = 128, "fatal: unable to access"
+            with self.assertRaises(m.NetworkUnavailable):
+                m.remote_tag_sha("v3.8.1")
+        finally:
+            m.subprocess.run = real
 
 
 class CliTests(Base):

@@ -59,7 +59,7 @@ jobs:
       matrix:
         # 1.23 proves the go.mod minimum (what goreleaser ships); 1.27 is the
         # fleet toolchain, so a result on the dev host agrees with CI.
-        go: ['1.23', '1.27']
+        go: ['1.23', '1.27.2']
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

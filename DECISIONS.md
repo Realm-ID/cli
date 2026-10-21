@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-30 entries. Newest first.
+31 entries. Newest first.
 
+- [2026-10-21 — goreleaser's Go 1.23 is a declared per-job override, not drift](#2026-10-21--goreleasers-go-123-is-a-declared-per-job-override-not-drift)
 - [2026-10-20 — Fleet par: todo-hygiene and workflow-preflight vendored; actionlint installed from a checksummed tarball](#2026-10-20--fleet-par-todo-hygiene-and-workflow-preflight-vendored-actionlint-installed-from-a-checksummed-tarball)
 - [2026-10-19 — proof and invitation resend exposed in the CLI (owner ruling)](#2026-10-19--proof-and-invitation-resend-exposed-in-the-cli-owner-ruling)
 - [2026-10-17 — 2026-10-17 — messaging exposed in the CLI; secrets by stdin or hidden prompt, never a flag](#2026-10-17--2026-10-17--messaging-exposed-in-the-cli-secrets-by-stdin-or-hidden-prompt-never-a-flag)
@@ -39,6 +40,20 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-21 — goreleaser's Go 1.23 is a declared per-job override, not drift
+
+**Decision.** `.workflow-preflight.json` gains `toolchain_overrides["release.yml:goreleaser"] =
+{"go": "1.23"}`, and the `tests.yml` matrix's fleet leg moves from `'1.27'` to `'1.27.2'`.
+
+- workflow-preflight re-vendored at the canonical version that has the owner's two 2026-10-21
+  rulings. A per-job override needs a reason. A repo-wide allow-list was rejected.
+- The release job deliberately builds at the `go.mod` minimum (see "Why `1.23`" above). Before
+  this, parity reported it as `PIN_DRIFT`, which would have started blocking on 2026-11-03. With
+  the override removed, it still reports exactly that one job, so the override is load-bearing.
+- `'1.27'` → `'1.27.2'`: the owner ruled that exact patch versions are intended, because a
+  patch-level CI/laptop mismatch caused an earlier failure. The checker cannot see a matrix
+  value, so this was a hand fix.
 
 ## 2026-10-20 — Fleet par: todo-hygiene and workflow-preflight vendored; actionlint installed from a checksummed tarball
 
