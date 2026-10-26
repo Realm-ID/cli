@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VENDORED from claude-config skills/workflow-preflight @ 6fe86373a0ed — edit canonical, not this copy
+# VENDORED from claude-config skills/workflow-preflight @ ee0c8a770669 — edit canonical, not this copy
 """Tests for workflow_preflight.py (W1: lint + parity) — stdlib + PyYAML, no runner to install.
 
 Fixtures are synthetic repos built in temp dirs (no checked-in tree, so the vendored copy of
@@ -8,6 +8,8 @@ whatever version is installed, and stub binaries for the refusal / canary cases.
 
   T1 lint    version refusal, SC2086 canary, SHA pins, 0-examined
   T2 parity  T2a UNMAPPED first, then every finding code, the exit-2 cases, the positive control
+  T3 refs    T3a-T3j, --static, the Q4/Q7/Q8 grades; dispatch-check reads the workflow at the remote ref
+             (the network is a stand-in `gh` script and a names fixture: no real network)
   T6 vendor  vendor.sh --check passes on a clean copy and fails on a one-line tamper
 """
 import contextlib
@@ -16,6 +18,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -279,7 +282,7 @@ class ParityTests(Base):
         self.assertIn("PIN_DRIFT", out)
 
     def test_shellcheck_version_is_not_attributed_to_actionlint(self):
-        """AutoMahn 2026-10-20: ci.yml: actionlint version is 0.11.0 (shellcheck's), config pins 1.7.12."""
+        """Consumer A 2026-10-20: ci.yml: actionlint version is 0.11.0 (shellcheck's), config pins 1.7.12."""
         extra = (f"      - uses: raven-actions/actionlint@{SHA}\n        with:\n          version: 1.7.12\n"
                  "      - name: Install shellcheck\n        env:\n          SC_VERSION: v0.11.0\n"
                  "        run: |\n          echo \"actionlint shells out to shellcheck v0.11.0\"\n"
@@ -291,26 +294,26 @@ class ParityTests(Base):
         self.assertNotIn("PIN_DRIFT", out)
 
     def _raven_job(self, raven_version):
-        """AutoMahn 2026-10-20 fixture, verbatim shape: job `lint` in ci.yml."""
+        """Consumer A 2026-10-20 fixture, verbatim shape: job `lint` in ci.yml."""
         return ("name: ci\non: [push, pull_request]\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n"
                 "      - name: install pinned shellcheck\n        env:\n          SC_VERSION: v0.11.0\n"
                 "        run: echo installing\n"
                 f"      - uses: raven-actions/actionlint@{SHA}\n        with:\n"
                 f"          version: {raven_version}\n"
                 "          flags: -shellcheck=${{ runner.temp }}/shellcheck-v0.11.0/shellcheck\n"
-                # the canary step of automahn 734bf7e: actionlint and a hyphen-bound shellcheck-v0.11.0 in ONE run text
+                # the canary step of consumer A (commit 734bf7e): actionlint and a hyphen-bound shellcheck-v0.11.0 in ONE run text
                 "      - name: canary\n        shell: bash\n        run: |\n"
                 "          out=$(\"$RUNNER_TEMP/actionlint-1.7.12/actionlint\" "
                 "-shellcheck=\"$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck\" .github/workflows/canary.yml 2>&1 || true)\n")
 
-    def test_automahn_raven_flags_shellcheck_path_is_not_actionlint_version(self):
+    def test_consumer_a_raven_flags_shellcheck_path_is_not_actionlint_version(self):
         self.wf("ci.yml", self._raven_job("1.7.12"))
         self.cfg(tools={"actionlint": "1.7.12", "shellcheck": "0.11.0"}, jobs={"ci.yml:lint": {"waiver": "ci-only", "reason": "uses an install-and-run action"}})
         rc, out = self.run_cli("parity")
         self.assertNotIn("PIN_DRIFT", out)
         self.assertEqual(rc, 0, out)
 
-    def test_automahn_raven_real_actionlint_drift_still_fires(self):
+    def test_consumer_a_raven_real_actionlint_drift_still_fires(self):
         self.wf("ci.yml", self._raven_job("1.7.11"))
         self.cfg(tools={"actionlint": "1.7.12", "shellcheck": "0.11.0"}, jobs={"ci.yml:lint": {"waiver": "ci-only", "reason": "uses an install-and-run action"}})
         rc, out = self.run_cli("parity")
@@ -661,12 +664,6 @@ class OrgTagPinTests(Base):
 
 
 class CliTests(Base):
-    def test_unbuilt_subcommands_exit_2(self):
-        for sub in ("refs", "calls", "dispatch-check"):
-            rc, out = self.run_cli(sub)
-            self.assertEqual(rc, 2, out)
-            self.assertIn("not built yet (W2)", out)
-
     def test_subprocess_entry_point(self):
         self.wf("ci.yml", ci(jobs=("test", "integration")))
         self.cfg(jobs={"ci.yml:test": {"local": "make test"}})
@@ -674,6 +671,777 @@ class CliTests(Base):
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("examined:", p.stdout)
+
+
+CALLEE = """on:
+  workflow_call:
+    inputs:
+      env_name: {type: string, required: true}
+      dry_run: {type: boolean, default: false}
+      retries: {type: number, required: false}
+    secrets:
+      TOKEN: {required: true}
+      EXTRA: {required: false}
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"""
+
+
+class CallsTests(Base):
+    """W3 `calls`: the reusable-workflow contract (spec 3.4). Remote fetches are stubbed."""
+
+    def setUp(self):
+        super().setUp()
+        self.resolved, self.fetched = [], []
+        self.remote = {"v1.2.3": "e" * 40, "v1": "f" * 40, "main": "9" * 40}
+        self.text = CALLEE
+        self.fail = None
+
+        def resolve(gh, repo, ref):
+            self.resolved.append((repo, ref))
+            if self.fail:
+                raise self.m.CalleeUnavailable(*self.fail)
+            if re.fullmatch(r"[0-9a-f]{40}", ref):
+                return ref
+            if ref not in self.remote:
+                raise self.m.CalleeUnavailable("bad_ref", f"{ref} does not exist in {repo}")
+            return self.remote[ref]
+
+        def fetch(gh, repo, path, sha):
+            self.fetched.append((repo, path, sha))
+            return self.text
+        self.m.resolve_ref = resolve
+        self.m.fetch_callee_text = fetch
+        self.m.remote_tag_sha = lambda tag: self.remote.get(tag)
+
+    def caller(self, with_=None, secrets=None, ref="v1.2.3", uses=None):
+        w = "".join(f"      {k}: {v}\n" for k, v in (with_ if with_ is not None else {"env_name": "stage"}).items())
+        s = ""
+        if secrets == "inherit":
+            s = "    secrets: inherit\n"
+        elif secrets is not None:
+            s = "    secrets:\n" + "".join(f"      {k}: {v}\n" for k, v in secrets.items())
+        u = uses or f"{ORG}/.github/workflows/x.yml@{ref}"
+        self.wf("c.yml", f"on: workflow_dispatch\njobs:\n  call:\n    uses: {u}\n"
+                         + (f"    with:\n{w}" if w else "") + s)
+
+    def calls(self, *extra, repo="my-org/r"):
+        return self.run_cli("calls", "--repo", repo, *extra)
+
+    def test_clean_call_passes_and_prints_examined(self):
+        self.caller(secrets={"TOKEN": "${{ secrets.T }}"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("examined 1 calls (1 remote checked, 0 local left to actionlint), 1 callee contracts", out)
+
+    def test_unpinned_main(self):
+        self.caller(ref="main", secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("UNPINNED", out)
+
+    def test_legacy_alias_v1(self):
+        self.caller(ref="v1", secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("LEGACY_ALIAS", out)
+        self.assertNotIn("UNPINNED", out)
+
+    def test_exact_tag_and_commented_sha_both_pass(self):
+        self.caller(ref="e" * 40 + "  # v1.2.3", secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("UNPINNED", out)
+
+    def test_sha_whose_comment_tag_points_elsewhere(self):
+        self.caller(ref="d" * 40 + "  # v1.2.3", secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("TAG_SHA_MISMATCH", out)
+
+    def test_nonexistent_tag_is_bad_ref(self):
+        self.caller(ref="v9.9.9", secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("BAD_REF", out)
+
+    def test_missing_required_input(self):
+        self.caller(with_={}, secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISSING_INPUT", out)
+        self.assertIn("env_name", out)
+
+    def test_unknown_input(self):
+        self.caller(with_={"env_name": "s", "bogus": "1"}, secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("UNKNOWN_INPUT", out)
+        self.assertIn("bogus", out)
+
+    def test_input_type_literals(self):
+        self.caller(with_={"env_name": "s", "dry_run": "maybe", "retries": "many"}, secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(out.count("INPUT_TYPE"), 2, out)
+        self.caller(with_={"env_name": "s", "dry_run": "true", "retries": "3"}, secrets={"TOKEN": "x"})
+        self.assertEqual(self.calls()[0], 0)
+        self.caller(with_={"env_name": "true", "dry_run": "${{ inputs.d }}"}, secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)  # YAML bool true into a string input
+        self.assertIn("INPUT_TYPE", out)
+
+    def test_missing_secret(self):
+        self.caller(secrets={})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISSING_SECRET", out)
+        self.assertIn("TOKEN", out)
+
+    def test_unknown_secret(self):
+        self.caller(secrets={"TOKEN": "x", "NOPE": "y"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("UNKNOWN_SECRET", out)
+
+    def test_inherit_same_org_satisfies_required_secret(self):
+        self.caller(secrets="inherit", uses="my-org/rw/.github/workflows/x.yml@" + "e" * 40)
+        self.assertEqual(self.calls()[0], 0)
+
+    def test_inherit_cross_org_flags_only_when_callee_requires_a_secret(self):
+        self.caller(secrets="inherit")
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("INHERIT_CROSS_ORG", out)
+        self.assertNotIn("MISSING_SECRET", out)
+        self.text = CALLEE.replace("TOKEN: {required: true}", "TOKEN: {required: false}")
+        shutil.rmtree(self.tree / ".scratch")  # the contract is cached by (repo, sha)
+        rc, out = self.calls()
+        self.assertEqual(rc, 0, out)
+
+    def test_unfetchable_callee_is_cannot_verify_never_a_pass(self):
+        self.caller(secrets={"TOKEN": "x"})
+        self.fail = ("cannot", "HTTP 404")
+        rc, out = self.calls()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT-VERIFY", out)
+
+    def test_local_callee_is_left_to_actionlint(self):
+        self.wf("callee.yml", CALLEE)
+        self.wf("c.yml", "on: workflow_dispatch\njobs:\n  call:\n    uses: ./.github/workflows/callee.yml\n"
+                         "    with:\n      nope: 1\n")
+        rc, out = self.calls()
+        self.assertEqual(rc, 0, out)
+        for code in ("UNKNOWN_INPUT", "MISSING_INPUT", "MISSING_SECRET", "MISSING_CALLEE"):
+            self.assertNotIn(code, out)
+        self.assertIn("examined 1 calls (0 remote checked, 1 local left to actionlint), 0 callee contracts", out)
+        self.assertEqual(self.fetched, [])
+
+    def test_inherit_with_unknown_caller_org_is_cannot_verify(self):
+        self.caller(secrets="inherit")
+        self.m.repo_slug = lambda root: None
+        rc, out = self.run_cli("calls")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT-VERIFY", out)
+        self.assertIn("--repo", out)
+
+    def test_tag_comment_belongs_to_its_own_line(self):
+        u = f"{ORG}/.github/workflows/x.yml@" + "d" * 40
+        self.wf("c.yml", "on: workflow_dispatch\njobs:\n"
+                f"  a:\n    uses: {u}\n    with: {{env_name: s}}\n    secrets: {{TOKEN: x}}\n"
+                f"  b:\n    uses: {u} # v1.2.3\n    with: {{env_name: s}}\n    secrets: {{TOKEN: x}}\n")
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(out.count("TAG_SHA_MISMATCH"), 1, out)
+        self.assertIn("TAG_SHA_MISMATCH c.yml:b", out)
+
+    def test_yaml11_booleans_are_strings_like_github(self):
+        self.caller(with_={"env_name": "no", "dry_run": "yes"}, secrets={"TOKEN": "x"})
+        rc, out = self.calls()
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(out.count("INPUT_TYPE"), 1, out)  # dry_run=yes is a string for a boolean input
+        self.assertIn("with.dry_run", out)
+        self.assertNotIn("with.env_name", out)
+
+    def test_duplicate_job_ids_fail_the_self_check(self):
+        u = f"{ORG}/.github/workflows/x.yml@v1.2.3"
+        job = f"    uses: {u}\n    with: {{env_name: s}}\n    secrets: {{TOKEN: x}}\n"
+        self.wf("c.yml", f"on: workflow_dispatch\njobs:\n  a:\n{job}  a:\n{job}")
+        rc, out = self.calls()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("2 uses: lines", out)
+        self.assertIn("1 calls", out)
+
+    def test_uses_text_inside_a_run_block_is_not_a_call(self):
+        self.wf("c.yml", "on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: |\n"
+                         f"          uses: {ORG}/.github/workflows/x.yml@v1\n")
+        rc, out = self.calls()
+        self.assertEqual(rc, 0, out)
+
+    def test_corrupt_cache_file_is_refetched_and_writes_are_atomic(self):
+        self.caller(ref="e" * 40 + "  # v1.2.3", secrets={"TOKEN": "x"})
+        self.assertEqual(self.calls()[0], 0)
+        cdir = self.tree / ".scratch" / "workflow-preflight"
+        (cf,) = list(cdir.iterdir())
+        cf.write_text("on: [unclosed\n  - : :")
+        self.assertEqual(self.calls()[0], 0)
+        self.assertEqual(len(self.fetched), 2, self.fetched)
+        self.assertIn("workflow_call", cf.read_text())
+        self.assertEqual([p.name for p in cdir.iterdir()], [cf.name])  # no temp file left behind
+        seen, real = [], os.replace
+        self.m.os.replace = lambda a, b: (seen.append((a, b)), real(a, b))[1]
+        self.addCleanup(setattr, self.m.os, "replace", real)
+        cf.unlink()
+        self.calls()
+        self.assertEqual(len(seen), 1, seen)
+
+    def test_cache_hit_by_repo_and_sha(self):
+        self.caller(ref="e" * 40 + "  # v1.2.3", secrets={"TOKEN": "x"})
+        self.calls()
+        self.calls()
+        self.assertEqual(len(self.fetched), 1, self.fetched)
+        self.assertTrue(any((self.tree / ".scratch" / "workflow-preflight").iterdir()))
+
+    def test_zero_calls_with_reusable_uses_lines_is_exit_2(self):
+        self.caller(secrets={"TOKEN": "x"})
+        self.m.reusable_calls = lambda wfs: []
+        rc, out = self.calls()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("examined 0 calls", out)
+
+    def test_repo_without_calls_is_ok_and_says_so(self):
+        self.wf("ci.yml", CI_GOOD)
+        rc, out = self.calls()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("examined 0 calls (0 remote checked, 0 local left to actionlint), 0 callee contracts", out)
+
+
+# A `gh` that answers per request path from STUB_DIR/routes.json and FAILS (exit 99) on any request it
+# was not told about, so a wrong path or a fetch at the wrong ref cannot pass by accident.
+GH_ROUTES_STUB = r'''#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["STUB_DIR"]
+args = sys.argv[1:]
+open(os.path.join(d, "requests.jsonl"), "a").write(json.dumps(args) + "\n")
+path = next((a for a in args[1:] if a.startswith("repos/")), "")
+r = json.load(open(os.path.join(d, "routes.json"))).get(path)
+if r is None:
+    sys.stderr.write("UNEXPECTED REQUEST: %s\n" % path)
+    sys.exit(99)
+sys.stderr.write(r.get("err", ""))
+sys.stdout.write(r.get("out", ""))
+sys.exit(r.get("rc", 0))
+'''
+
+SHA_E, SHA_D = "e" * 40, "d" * 40
+TAG_JQ = '.object.type + " " + .object.sha'
+
+
+class GhFacingCallsTests(Base):
+    """`calls` through the REAL _gh_api/resolve_ref/fetch_callee_text, against a request-checking gh stub."""
+
+    def setUp(self):
+        super().setUp()
+        self.m.remote_tag_sha = lambda tag: {"v1.2.3": SHA_E}.get(tag)
+        self.dir = self.tree / "stub"
+        self.dir.mkdir()
+        gh = self.dir / "gh"
+        gh.write_text(GH_ROUTES_STUB)
+        gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+        os.environ["STUB_DIR"] = str(self.dir)
+        self.addCleanup(os.environ.pop, "STUB_DIR", None)
+        self.gh = str(gh)
+        self.routes = {}
+
+    def serve(self, **routes):
+        self.routes.update({k.replace("__", "/"): v for k, v in routes.items()})
+
+    def put(self, path, out="", rc=0, err=""):
+        self.routes[path] = {"out": out, "rc": rc, "err": err}
+
+    def requests(self):
+        f = self.dir / "requests.jsonl"
+        return [json.loads(ln)[1:] for ln in f.read_text().splitlines()] if f.exists() else []
+
+    def call(self, ref, third_party=False):
+        u = ("other-org/rw" if third_party else ORG) + f"/.github/workflows/x.yml@{ref}"
+        self.wf("c.yml", f"on: workflow_dispatch\njobs:\n  call:\n    uses: {u}\n"
+                         "    with: {env_name: s}\n    secrets: {TOKEN: x}\n")
+        (self.dir / "routes.json").write_text(json.dumps(self.routes))
+        return self.run_cli("calls", "--repo", "my-org/r", "--gh", self.gh)
+
+    RAW = ["-H", "Accept: application/vnd.github.raw+json"]
+    WF = f"repos/{ORG}/contents/.github/workflows/x.yml"
+
+    def test_tag_resolves_via_git_ref_tags_then_fetches_at_the_sha(self):
+        self.put(f"repos/{ORG}/git/ref/tags/v1.2.3", f"commit {SHA_E}\n")
+        self.put(f"{self.WF}?ref={SHA_E}", CALLEE)
+        rc, out = self.call("v1.2.3")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.requests(), [
+            [f"repos/{ORG}/git/ref/tags/v1.2.3", "--jq", TAG_JQ],
+            self.RAW + [f"{self.WF}?ref={SHA_E}"]])
+
+    def test_annotated_tag_is_dereferenced_to_its_commit(self):
+        self.put(f"repos/{ORG}/git/ref/tags/v1.2.3", f"tag {SHA_D}\n")
+        self.put(f"repos/{ORG}/git/tags/{SHA_D}", f"commit {SHA_E}\n")
+        self.put(f"{self.WF}?ref={SHA_E}", CALLEE)
+        rc, out = self.call("v1.2.3")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.requests()[:2], [
+            [f"repos/{ORG}/git/ref/tags/v1.2.3", "--jq", TAG_JQ],
+            [f"repos/{ORG}/git/tags/{SHA_D}", "--jq", TAG_JQ]])
+        self.assertEqual(self.requests()[2], self.RAW + [f"{self.WF}?ref={SHA_E}"])
+
+    def test_branch_named_like_a_tag_is_bad_ref_not_a_tag(self):
+        self.put(f"repos/{ORG}/git/ref/tags/v1.2.3", rc=1, err="gh: Not Found (HTTP 404)")
+        self.put(f"repos/{ORG}", ORG)  # the repo itself answers
+        rc, out = self.call("v1.2.3")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("BAD_REF", out)
+        self.assertNotIn("CANNOT-VERIFY", out)
+        self.assertEqual(self.requests(), [
+            [f"repos/{ORG}/git/ref/tags/v1.2.3", "--jq", TAG_JQ],
+            [f"repos/{ORG}", "--jq", ".full_name"]])
+
+    def test_unreachable_repo_is_cannot_verify_not_bad_ref(self):
+        self.put(f"repos/{ORG}/git/ref/tags/v1.2.3", rc=1, err="gh: Not Found (HTTP 404)")
+        self.put(f"repos/{ORG}", rc=1, err="gh: Not Found (HTTP 404)")
+        rc, out = self.call("v1.2.3")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT-VERIFY", out)
+        self.assertNotIn("BAD_REF", out)
+
+    def test_non_tag_ref_is_quoted_into_the_commits_url(self):
+        self.put("repos/other-org/rw/commits/release%2F1", SHA_E + "\n")
+        self.put(f"repos/other-org/rw/contents/.github/workflows/x.yml?ref={SHA_E}", CALLEE)
+        rc, out = self.call("release/1", third_party=True)
+        self.assertEqual(self.requests()[0], ["repos/other-org/rw/commits/release%2F1", "--jq", ".sha"])
+        self.assertEqual(self.requests()[1], self.RAW + [f"repos/other-org/rw/contents/.github/workflows/x.yml?ref={SHA_E}"])
+
+    def test_pinned_sha_is_fetched_directly_and_cached(self):
+        self.put(f"{self.WF}?ref={SHA_E}", CALLEE)
+        rc, out = self.call(SHA_E + "  # v1.2.3")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.requests(), [self.RAW + [f"{self.WF}?ref={SHA_E}"]])
+        os.remove(self.dir / "requests.jsonl")
+        rc, out = self.call(SHA_E + "  # v1.2.3")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.requests(), [])
+
+    def test_nonexistent_sha_is_bad_ref(self):
+        self.put(f"{self.WF}?ref={SHA_D}", rc=1, err="gh: No commit found for the ref (HTTP 404)")
+        self.put(f"repos/{ORG}/commits/{SHA_D}", rc=1, err="gh: No commit found (HTTP 422)")
+        self.put(f"repos/{ORG}", ORG)
+        rc, out = self.call(SHA_D)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("BAD_REF", out)
+        self.assertNotIn("CANNOT-VERIFY", out)
+
+    def test_fetch_failure_on_an_existing_commit_is_cannot_verify(self):
+        self.put(f"{self.WF}?ref={SHA_D}", rc=1, err="gh: Not Found (HTTP 404)")
+        self.put(f"repos/{ORG}/commits/{SHA_D}", SHA_D + "\n")
+        rc, out = self.call(SHA_D)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT-VERIFY", out)
+
+    def test_an_unexpected_request_fails_the_stub(self):
+        rc, out = self.call("v1.2.3")  # no routes at all
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(self.requests()[0][0], f"repos/{ORG}/git/ref/tags/v1.2.3")
+
+
+SECRET_VALUE = "SUPER-SECRET-VALUE-8841"
+
+# A stand-in for `gh api` (the injectable network): serves the names fixture and workflow files from
+# STUB_DIR. Without --jq it prints the REAL API shape, values included, so a tool that forgets to
+# project names at fetch time leaks them into the output and T3h catches it.
+GH_STUB = r'''#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["STUB_DIR"]
+args = sys.argv[1:]
+open(os.path.join(d, "calls.log"), "a").write(" ".join(args) + "\n")
+path = next((a for a in args[1:] if a.startswith("repos/")), "")
+fp = os.path.join(d, "fail.json")
+for k, code in (json.load(open(fp)) if os.path.exists(fp) else {}).items():
+    if k in path:
+        sys.stderr.write("gh: HTTP %s\n" % code)
+        sys.exit(1)
+if "/contents/.github/workflows/" in path:
+    wf, _, ref = path.split("/contents/.github/workflows/")[1].partition("?ref=")
+    f = os.path.join(d, "contents", ref or "_default", wf)
+    if not os.path.exists(f):
+        sys.stderr.write("gh: Not Found (HTTP 404)\n")
+        sys.exit(1)
+    sys.stdout.write(open(f).read())
+    sys.exit(0)
+names = json.load(open(os.path.join(d, "names.json")))
+tail = path.split("/", 3)[3].split("?")[0]
+parts = tail.split("/")
+if tail == "actions/secrets": key, items = "secrets", names["repo"]["secrets"]
+elif tail == "actions/variables": key, items = "variables", names["repo"]["variables"]
+elif tail == "actions/organization-secrets": key, items = "secrets", names["org"]["secrets"]
+elif tail == "actions/organization-variables": key, items = "variables", names["org"]["variables"]
+elif tail == "dependabot/secrets": key, items = "secrets", names.get("dependabot", [])
+elif tail == "environments": key, items = "environments", list(names["environments"])
+elif parts[0] == "environments" and parts[2] in ("secrets", "variables"):
+    key, items = parts[2], names["environments"][parts[1]][parts[2]]
+else:
+    sys.stderr.write("gh: Not Found (HTTP 404)\n")
+    sys.exit(1)
+items = [i if isinstance(i, dict) else {"name": i, "value": "v"} for i in items]
+if "--jq" in args:
+    for i in items:
+        print(i["name"])
+else:
+    print(json.dumps({"total_count": len(items), key: items}))
+'''
+
+
+def refs_wf(expr, environment=None, on="workflow_dispatch", extra_step=""):
+    env = f"    environment: {environment}\n" if environment else ""
+    return (f"on: {on}\njobs:\n  sync:\n    runs-on: ubuntu-latest\n{env}    steps:\n"
+            f"      - run: echo hi\n        env:\n          K: ${{{{ {expr} }}}}\n{extra_step}")
+
+
+class RefsBase(Base):
+    def names(self, repo_s=(), repo_v=(), org_s=(), org_v=(), envs=None, errors=None, dependabot=None):
+        n = {"repo": {"secrets": list(repo_s), "variables": list(repo_v)},
+             "org": {"secrets": list(org_s), "variables": list(org_v)},
+             "environments": {e: {"secrets": list(v.get("secrets", [])), "variables": list(v.get("variables", []))}
+                              for e, v in (envs or {}).items()},
+             "errors": errors or {}}
+        if dependabot is not None:
+            n["dependabot"] = dependabot
+        p = self.tree / "names.json"
+        p.write_text(json.dumps(n))
+        return str(p)
+
+    def refs(self, names=None, *extra, repo="o/r"):
+        argv = ["refs", "--repo", repo]
+        if names is not None:
+            argv += ["--names-file", names]
+        return self.run_cli(*argv, *extra)
+
+    def stub_gh(self):
+        d = self.tree / "stub"
+        (d / "contents").mkdir(parents=True, exist_ok=True)
+        gh = d / "gh"
+        gh.write_text(GH_STUB)
+        gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+        os.environ["STUB_DIR"] = str(d)
+        self.addCleanup(os.environ.pop, "STUB_DIR", None)
+        return d, str(gh)
+
+
+class RefsTests(RefsBase):
+    def test_T3a_missing_secret_is_a_finding(self):
+        self.wf("rotate.yml", refs_wf("secrets.R2_ACCESS_KEY_ID"))
+        rc, out = self.refs(self.names(repo_s=["OTHER"]))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISSING", out)
+        self.assertIn("R2_ACCESS_KEY_ID", out)
+
+    def test_present_in_repo_or_org_is_clean_and_prints_the_positive_control(self):
+        self.wf("a.yml", refs_wf("secrets.A_KEY") + "          V: ${{ vars.B_VAR }}\n")
+        rc, out = self.refs(self.names(repo_s=["A_KEY"], org_v=["B_VAR"]))
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"examined: 1 workflows, 1 jobs, 2 references \(1 secrets, 1 vars, 0 dynamic, 0 optional, 0 GITHUB_TOKEN\)")
+        self.assertIn("live names: repo 1/0, org-visible 0/1", out)
+
+    def test_names_compare_case_insensitively_and_bracket_form_is_read(self):
+        self.wf("a.yml", refs_wf("secrets['a_key']"))
+        rc, out = self.refs(self.names(repo_s=["A_KEY"]))
+        self.assertEqual(rc, 0, out)
+        self.wf("a.yml", refs_wf("secrets['NOPE']"))
+        rc, out = self.refs(self.names(repo_s=["A_KEY"]))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISSING", out)
+
+    def test_a_quoted_literal_is_not_a_reference(self):
+        self.wf("a.yml", refs_wf("format('{0}', 'secrets.NOT_A_REF')") + "          R: ${{ secrets.REAL }}\n")
+        rc, out = self.refs(self.names(repo_s=["REAL"]))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 references", out)
+
+    def test_T3b_env_scoped_name_in_the_wrong_environment(self):
+        self.wf("d.yml", refs_wf("secrets.DB_PASSWORD", environment="prod"))
+        n = self.names(envs={"stage": {"secrets": ["DB_PASSWORD"]}, "prod": {}})
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ENV_MISMATCH", out)
+        n = self.names(envs={"stage": {"secrets": ["DB_PASSWORD"]}, "prod": {"secrets": ["DB_PASSWORD"]}})
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 0, out)
+
+    def test_a_job_with_no_environment_does_not_see_an_environment_name(self):
+        self.wf("d.yml", refs_wf("secrets.DB_PASSWORD"))
+        rc, out = self.refs(self.names(envs={"stage": {"secrets": ["DB_PASSWORD"]}}))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ENV_MISMATCH", out)
+
+    def test_T3c_calling_job_with_reads_an_env_only_var(self):
+        self.wf("rel.yml", "on: workflow_dispatch\njobs:\n  call:\n    uses: o/rw/.github/workflows/rf.yml@v1.0.0\n"
+                           "    with:\n      app-id: ${{ vars.RELEASE_APP_ID }}\n")
+        rc, out = self.refs(self.names(envs={"release": {"variables": ["RELEASE_APP_ID"]}}))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ENV_ONLY_AT_CALLER", out)
+        rc, out = self.refs(self.names(repo_v=["RELEASE_APP_ID"]))
+        self.assertEqual(rc, 0, out)
+
+    def test_calling_job_never_gets_the_callees_environment(self):
+        # even a literal environment name elsewhere in the file does not extend a calling job's scope
+        self.wf("rel.yml", "on: workflow_dispatch\njobs:\n  call:\n    uses: o/rw/.github/workflows/rf.yml@v1.0.0\n"
+                           "    with:\n      x: ${{ vars.ONLY_PROD }}\n")
+        rc, out = self.refs(self.names(envs={"prod": {"variables": ["ONLY_PROD"]}}))
+        self.assertIn("ENV_ONLY_AT_CALLER", out)
+
+    def test_Q7_env_secret_passed_by_name_is_unproven_not_missing(self):
+        self.wf("rel.yml", "on: workflow_dispatch\njobs:\n  call:\n    uses: o/rw/.github/workflows/rf.yml@v1.0.0\n"
+                           "    secrets:\n      KEY: ${{ secrets.RELEASE_APP_KEY }}\n")
+        n = self.names(envs={"release": {"secrets": ["RELEASE_APP_KEY"]}})
+        self.cfg(adopted=datetime.date.today().isoformat())
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN UNPROVEN", out)
+        self.assertNotIn("MISSING", out)
+        # owner ruling 2026-10-21: UNPROVEN warns until proven and never escalates on a deadline
+        self.cfg()  # no `adopted`
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN UNPROVEN", out)
+        self.cfg(adopted="2020-01-01")  # long past the 14-day window
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN UNPROVEN", out)
+
+    def test_T3d_cross_org_inherit(self):
+        wf = ("on: workflow_dispatch\njobs:\n  call:\n    uses: %s/rw/.github/workflows/rf.yml@v1.0.0\n"
+              "    secrets: inherit\n")
+        self.wf("rel.yml", wf % "other-org")
+        rc, out = self.refs(self.names(), repo="my-org/r")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("INHERIT_CROSS_ORG", out)
+        self.wf("rel.yml", wf % "my-org")
+        rc, out = self.refs(self.names(), repo="my-org/r")
+        self.assertEqual(rc, 0, out)
+
+    def test_T3e_dynamic_secret_needs_a_waiver(self):
+        self.wf("d.yml", refs_wf("secrets[inputs.n]"))
+        n = self.names()
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("DYNAMIC", out)
+        self.assertIn("1 dynamic", out)
+        self.cfg(refs={"dynamic": {"d.yml:sync": "name comes from a workflow_dispatch choice input"}})
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 dynamic", out)
+        self.cfg(adopted=datetime.date.today().isoformat())
+        rc, out = self.refs(n)
+        self.assertEqual((rc, "WARN DYNAMIC" in out), (0, True), out)
+
+    def test_dynamic_environment_each_waived_value_is_checked(self):
+        self.wf("d.yml", refs_wf("secrets.DB", environment="${{ inputs.target }}"))
+        n = self.names(envs={"stage": {"secrets": ["DB"]}, "prod": {}})
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("DYNAMIC_ENV", out)
+        self.cfg(refs={"dynamic_env": {"d.yml:sync": {"values": ["stage", "prod"],
+                                                      "reason": "target is a choice input: stage or prod"}}})
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("DYNAMIC_ENV", out)
+        self.assertRegex(out, r"ENV_MISMATCH.*prod|prod.*ENV_MISMATCH")
+
+    def test_T3f_github_token_is_skipped_and_counted(self):
+        self.wf("a.yml", refs_wf("secrets.GITHUB_TOKEN"))
+        rc, out = self.refs(self.names())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 GITHUB_TOKEN", out)
+
+    def test_T3g_text_holds_secrets_but_the_parser_found_none(self):
+        self.wf("a.yml", "on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+                         "      - run: echo secrets.X are not expressions here\n")
+        rc, out = self.refs(self.names())
+        self.assertEqual(rc, 2, out)
+        self.assertIn("0 references", out)
+
+    def test_no_workflows_is_exit_2(self):
+        rc, out = self.refs(self.names())
+        self.assertEqual(rc, 2, out)
+
+    def test_T3h_no_variable_value_appears_anywhere(self):
+        self.wf("a.yml", refs_wf("vars.MODE") + "          S: ${{ secrets.NOPE }}\n")
+        n = self.names(repo_v=[{"name": "MODE", "value": SECRET_VALUE}], org_s=[{"name": "ORG", "value": SECRET_VALUE}])
+        rc, out = self.refs(n)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn(SECRET_VALUE, out)
+        # the live path: through a gh stand-in that returns values unless the tool projects names with --jq
+        d, gh = self.stub_gh()
+        (d / "names.json").write_text(json.dumps({
+            "repo": {"secrets": [], "variables": [{"name": "MODE", "value": SECRET_VALUE}]},
+            "org": {"secrets": [], "variables": [{"name": "OV", "value": SECRET_VALUE}]},
+            "environments": {"stage": {"secrets": [], "variables": [{"name": "SV", "value": SECRET_VALUE}]}}}))
+        rc, out = self.refs(None, "--gh", gh)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn(SECRET_VALUE, out)
+        calls = (d / "calls.log").read_text()
+        self.assertEqual(calls.count("api"), len(calls.splitlines()), calls)
+        self.assertTrue(all("--jq" in c for c in calls.splitlines()), calls)
+        for f in self.tree.rglob("*"):
+            if f.is_file() and f.name not in ("names.json", "gh") and ".github" not in f.parts:
+                self.assertNotIn(SECRET_VALUE, f.read_text(errors="ignore"), f)
+
+    def test_T3i_a_403_is_cannot_verify_never_clean(self):
+        self.wf("a.yml", refs_wf("secrets.A_KEY"))
+        rc, out = self.refs(self.names(repo_s=["A_KEY"], errors={"repo.secrets": 403}))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT-VERIFY", out)
+        self.assertIn("403", out)
+        self.assertNotIn("ok:", out)
+        d, gh = self.stub_gh()
+        (d / "fail.json").write_text(json.dumps({"actions/secrets": 403}))
+        (d / "names.json").write_text(json.dumps({"repo": {"secrets": ["A_KEY"], "variables": []},
+                                                  "org": {"secrets": [], "variables": []}, "environments": {}}))
+        rc, out = self.refs(None, "--gh", gh)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT-VERIFY", out)
+
+    def test_missing_gh_is_cannot_verify(self):
+        self.wf("a.yml", refs_wf("secrets.A_KEY"))
+        rc, out = self.refs(None, "--gh", str(self.tree / "no-such-gh"))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT-VERIFY", out)
+
+    def test_T3j_emptiness_guard_makes_the_reference_optional(self):
+        guard = "      - if: secrets.SLACK_URL != ''\n        run: echo notify\n        env:\n          U: ${{ secrets.SLACK_URL }}\n"
+        self.wf("a.yml", refs_wf("secrets.A_KEY", extra_step=guard))
+        rc, out = self.refs(self.names(repo_s=["A_KEY"]))
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"2 optional|, 2 optional")
+        self.assertNotIn("MISSING", out)
+
+    def test_config_optional_covers_the_rest_and_needs_a_reason(self):
+        self.wf("a.yml", refs_wf("secrets.SOMETIMES"))
+        self.cfg(refs={"optional": {"SOMETIMES": "only set on forks that publish"}})
+        rc, out = self.refs(self.names())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 optional", out)
+        self.cfg(refs={"optional": {"SOMETIMES": "short"}})
+        rc, out = self.refs(self.names())
+        self.assertEqual(rc, 2, out)
+        self.cfg(refs={"surprise": {}})
+        rc, out = self.refs(self.names())
+        self.assertEqual(rc, 2, out)
+
+    def test_static_makes_no_network_call_and_checks_syntax_only(self):
+        self.wf("d.yml", refs_wf("secrets[inputs.n]") + "          M: ${{ secrets.ANYTHING }}\n")
+        d, gh = self.stub_gh()
+        rc, out = self.refs(None, "--static", "--gh", gh)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("DYNAMIC", out)
+        self.assertNotIn("MISSING", out)
+        self.assertFalse((d / "calls.log").exists())
+        self.wf("d.yml", refs_wf("secrets.ANYTHING"))
+        rc, out = self.refs(None, "--static", "--gh", str(self.tree / "no-such-gh"))
+        self.assertEqual(rc, 0, out)
+
+    def test_callee_only_workflow_is_counted_not_resolved(self):
+        self.wf("c.yml", "on:\n  workflow_call:\n    secrets:\n      TOK:\n        required: true\n"
+                         "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                         "        env:\n          T: ${{ secrets.TOK }}\n          V: ${{ vars.CALLER_VAR }}\n")
+        rc, out = self.refs(self.names())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 in callee-only workflows", out)
+
+    def test_declared_workflow_call_secret_is_not_looked_up(self):
+        self.wf("c.yml", "on:\n  workflow_dispatch:\n  workflow_call:\n    secrets:\n      TOK:\n        required: true\n"
+                         "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                         "        env:\n          T: ${{ secrets.TOK }}\n")
+        rc, out = self.refs(self.names())
+        self.assertEqual(rc, 0, out)
+
+    def test_Q8_pull_request_secret_absent_from_dependabot_store_warns_only(self):
+        self.wf("pr.yml", refs_wf("secrets.A_KEY", on="pull_request"))
+        rc, out = self.refs(self.names(repo_s=["A_KEY"], dependabot=[]))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN DEPENDABOT_GAP", out)
+        rc, out = self.refs(self.names(repo_s=["A_KEY"], dependabot=["A_KEY"]))
+        self.assertNotIn("DEPENDABOT_GAP", out)
+
+
+DISPATCH_REMOTE = refs_wf("secrets.R2_ACCESS_KEY_ID").replace(
+    "on: workflow_dispatch",
+    "on:\n  workflow_dispatch:\n    inputs:\n      mode:\n        type: choice\n        options: [dry, apply]\n"
+    "        required: true\n      note:\n        type: string\n")
+DISPATCH_LOCAL = refs_wf("secrets.PRESENT")
+
+
+class DispatchCheckTests(RefsBase):
+    def setup_remote(self, remote=DISPATCH_REMOTE, secrets=("PRESENT",)):
+        d, gh = self.stub_gh()
+        (d / "contents" / "main").mkdir(parents=True, exist_ok=True)
+        (d / "contents" / "main" / "x.yml").write_text(remote)
+        (d / "names.json").write_text(json.dumps({"repo": {"secrets": list(secrets), "variables": []},
+                                                  "org": {"secrets": [], "variables": []}, "environments": {}}))
+        self.wf("x.yml", DISPATCH_LOCAL)  # the checked-out file differs from the remote one
+        return d, gh
+
+    def dc(self, gh, *extra):
+        return self.run_cli("dispatch-check", "-R", "o/r", "x.yml", "--ref", "main", "--gh", gh, *extra)
+
+    def test_the_remote_workflow_decides_not_the_local_file(self):
+        d, gh = self.setup_remote()
+        rc, out = self.dc(gh, "-f", "mode=dry")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISSING", out)
+        self.assertIn("R2_ACCESS_KEY_ID", out)
+        self.assertIn("contents/.github/workflows/x.yml?ref=main", (d / "calls.log").read_text())
+        self.assertIn("secrets-named: 1", out)
+
+    def test_passes_when_the_remote_names_resolve(self):
+        d, gh = self.setup_remote(secrets=("R2_ACCESS_KEY_ID",))
+        rc, out = self.dc(gh, "-f", "mode=dry")
+        self.assertEqual(rc, 0, out)
+
+    def test_input_checks(self):
+        d, gh = self.setup_remote(secrets=("R2_ACCESS_KEY_ID",))
+        rc, out = self.dc(gh, "-f", "mode=dry", "-f", "bogus=1")
+        self.assertEqual((rc, "UNKNOWN_DISPATCH_INPUT" in out), (1, True), out)
+        rc, out = self.dc(gh)
+        self.assertEqual((rc, "MISSING_DISPATCH_INPUT" in out), (1, True), out)
+        rc, out = self.dc(gh, "-f", "mode=explode")
+        self.assertEqual((rc, "BAD_CHOICE" in out), (1, True), out)
+
+    def test_workflow_without_dispatch_trigger(self):
+        d, gh = self.setup_remote(remote=refs_wf("secrets.PRESENT", on="push"))
+        rc, out = self.dc(gh)
+        self.assertEqual((rc, "NOT_DISPATCHABLE" in out), (1, True), out)
+
+    def test_unreadable_remote_workflow_is_cannot_verify(self):
+        d, gh = self.setup_remote()
+        rc, out = self.run_cli("dispatch-check", "-R", "o/r", "x.yml", "--ref", "nope", "--gh", gh)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT-VERIFY", out)
+
+    def test_cannot_verify_names_still_reports_how_many_secrets_are_named(self):
+        d, gh = self.setup_remote()
+        (d / "fail.json").write_text(json.dumps({"actions/secrets": 403}))
+        rc, out = self.dc(gh, "-f", "mode=dry")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("secrets-named: 1", out)
+
+    def test_another_repos_config_is_not_used(self):
+        d, gh = self.setup_remote()
+        self.cfg(refs={"optional": {"R2_ACCESS_KEY_ID": "this repo's waiver, not the target's"}})
+        rc, out = self.dc(gh, "-f", "mode=dry")
+        self.assertEqual(rc, 1, out)
+        rc, out = self.dc(gh, "-f", "mode=dry", "--config", str(self.tree / ".workflow-preflight.json"))
+        self.assertEqual(rc, 0, out)
 
 
 @unittest.skipUnless((HERE / "vendor.sh").is_file(),

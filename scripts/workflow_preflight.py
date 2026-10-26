@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-# VENDORED from claude-config skills/workflow-preflight @ 6a157daeda00 — edit canonical, not this copy
-"""workflow-preflight: stop GitHub Actions failures before push (W1: `lint` and `parity`).
+# VENDORED from claude-config skills/workflow-preflight @ 02f6022fd009 — edit canonical, not this copy
+"""workflow-preflight: stop GitHub Actions failures before push (`lint`, `parity`, `refs`, `calls`, `dispatch-check`).
 
 Canonical copy lives in claude-config `skills/workflow-preflight/scripts/`; repos carry a stamped
 vendored copy (vendor.sh). Never edit a vendored copy. See SKILL.md for the codes and config.
 
   workflow_preflight.py lint   [--root R] [--config F] [--actionlint P] [--shellcheck P]
   workflow_preflight.py parity [--root R] [--config F] [--gate-log FILE]
-  refs / calls / dispatch-check  -> exit 2 "not built yet (W2)"
+  workflow_preflight.py refs   [--root R] [--config F] [--repo O/R] [--static] [--names-file F] [--gh P]
+  workflow_preflight.py dispatch-check -R O/R <workflow.yml> --ref REF [-f k=v ...]   (reads the workflow AT REF)
+  workflow_preflight.py calls  [--root R] [--repo O/R] [--gh P]   (reusable-workflow contract: ref, inputs, secrets)
 
 Exit 0 clean (WARN lines allowed), 1 findings, 2 usage / config / parse error or a check that
 could not be verified (wrong tool version, canary silent, 0 items examined). Every subcommand
@@ -21,6 +23,7 @@ PyYAML (stdlib has no YAML parser) and exits 2 without it.
 import argparse
 import datetime
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -190,31 +193,35 @@ def workflow_files(root):
     return sorted(list(d.glob("*.yml")) + list(d.glob("*.yaml"))) if d.is_dir() else []
 
 
+def parse_workflow_text(name, text, path=None):
+    if yaml is None:
+        raise Fatal("PyYAML is required (pip install pyyaml); refusing to guess without a YAML parser")
+    label = path or name
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise Fatal(f"{label}: cannot parse: {str(e).splitlines()[0]}")
+    if not isinstance(doc, dict):
+        raise Fatal(f"{label}: not a workflow mapping")
+    on = doc.get("on", doc.get(True))  # PyYAML reads the bare key `on` as True
+    if isinstance(on, str):
+        triggers = {on}
+    elif isinstance(on, list):
+        triggers = {str(t) for t in on}
+    elif isinstance(on, dict):
+        triggers = {str(t) for t in on}
+    else:
+        triggers = set()
+    jobs = doc.get("jobs") or {}
+    if not isinstance(jobs, dict):
+        raise Fatal(f"{label}: 'jobs' is not a mapping")
+    return {"name": name, "path": path, "doc": doc, "triggers": triggers, "jobs": jobs, "text": text}
+
+
 def load_workflows(root):
     if yaml is None:
         raise Fatal("PyYAML is required (pip install pyyaml); refusing to guess without a YAML parser")
-    out = []
-    for f in workflow_files(root):
-        try:
-            doc = yaml.safe_load(f.read_text())
-        except yaml.YAMLError as e:
-            raise Fatal(f"{f}: cannot parse: {str(e).splitlines()[0]}")
-        if not isinstance(doc, dict):
-            raise Fatal(f"{f}: not a workflow mapping")
-        on = doc.get("on", doc.get(True))  # PyYAML reads the bare key `on` as True
-        if isinstance(on, str):
-            triggers = {on}
-        elif isinstance(on, list):
-            triggers = {str(t) for t in on}
-        elif isinstance(on, dict):
-            triggers = {str(t) for t in on}
-        else:
-            triggers = set()
-        jobs = doc.get("jobs") or {}
-        if not isinstance(jobs, dict):
-            raise Fatal(f"{f}: 'jobs' is not a mapping")
-        out.append({"name": f.name, "path": f, "doc": doc, "triggers": triggers, "jobs": jobs})
-    return out
+    return [parse_workflow_text(f.name, f.read_text(), f) for f in workflow_files(root)]
 
 
 def steps_of(job):
@@ -489,9 +496,708 @@ def cmd_parity(root, cfg, args):
     return finish(findings, warns, summary, notes=notes)
 
 
+# ---------------------------------------------------------------- refs / dispatch-check
+
+# One scan over an expression: a quoted literal is skipped whole (so 'secrets.X' in a string is not a
+# reference); otherwise `secrets.X`, `secrets['X']`, `vars.X`, `secrets[<expr>]` or a bare context.
+EXPR_RE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+TOKEN_RE = re.compile(r"""'(?:[^']|'')*'|(?<![\w.])(secrets|vars)(?:\.([A-Za-z_]\w*)|\[\s*'([^']*)'\s*\]|(\[)|(?![\w.\[]))""")
+GUARD_RE = re.compile(r"""(?<![\w.])(secrets|vars)\.([A-Za-z_]\w*)\s*[!=]=\s*''""")
+REF_CONFIG_KEYS = {"optional", "dynamic", "dynamic_env"}
+GH_TIMEOUT = 15
+SLUG_RE = re.compile(r"""github\.com[:/](?:\d+/)?([^/\s]+)/([^/\s]+?)(?:\.git)?/?$""")
+
+
+def expression_tokens(text, is_if):
+    """Yield (kind, NAME-or-None) for every secrets/vars reference in the expressions of a string."""
+    exprs = [m.group(1) for m in EXPR_RE.finditer(text)]
+    if is_if and not exprs:
+        exprs = [text]
+    for expr in exprs:
+        for m in TOKEN_RE.finditer(expr):
+            if not m.group(1):
+                continue
+            kind = "secrets" if m.group(1) == "secrets" else "variables"
+            name = m.group(2) or m.group(3)
+            yield kind, (name.upper() if name else None)
+
+
+def walk_strings(node, path=()):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from walk_strings(v, path + (str(k),))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from walk_strings(v, path + (i,))
+    elif isinstance(node, str):
+        yield path, node
+
+
+def guard_names(cond):
+    return {(("secrets" if m.group(1) == "secrets" else "variables"), m.group(2).upper())
+            for m in GUARD_RE.finditer(cond)} if isinstance(cond, str) else set()
+
+
+def validate_refs_config(cfg):
+    r = cfg.get("refs", {})
+    if not isinstance(r, dict):
+        raise Fatal("config 'refs' must be an object")
+    bad = sorted(set(r) - REF_CONFIG_KEYS)
+    if bad:
+        raise Fatal(f"config refs: unknown key(s) {bad}; allowed {sorted(REF_CONFIG_KEYS)}")
+    for sect in REF_CONFIG_KEYS:
+        if not isinstance(r.get(sect, {}), dict):
+            raise Fatal(f"config refs.{sect} must be an object")
+    short = []
+    for sect in ("optional", "dynamic"):
+        for k, reason in r.get(sect, {}).items():
+            if not isinstance(reason, str) or len(reason.strip()) < MIN_REASON:
+                short.append(f"NO_REASON refs.{sect}['{k}']: needs a reason of at least {MIN_REASON} characters")
+    for k, e in r.get("dynamic_env", {}).items():
+        ok = isinstance(e, dict) and set(e) == {"values", "reason"} and isinstance(e["values"], list) and e["values"] \
+            and all(isinstance(v, str) for v in e["values"])
+        if not ok:
+            raise Fatal(f"config refs.dynamic_env['{k}'] must be {{\"values\": [env names], \"reason\": ...}}")
+        if len(str(e["reason"]).strip()) < MIN_REASON:
+            short.append(f"NO_REASON refs.dynamic_env['{k}']: needs a reason of at least {MIN_REASON} characters")
+    if short:
+        print("\n".join(short))
+        raise Fatal(f"{len(short)} refs waiver(s) without a reason")
+    return r
+
+
+def in_grace(cfg):
+    adopted = cfg.get("adopted")
+    return bool(adopted and (today() - datetime.date.fromisoformat(str(adopted))).days < GRACE_DAYS)
+
+
+def scan_refs(wfs, rcfg):
+    """Static half: every reference with its scope facts. No network."""
+    jobs_n, refs, inherit, notes = 0, [], [], []
+    for w in wfs:
+        callee_only = w["triggers"] == {"workflow_call"}
+        on = w["doc"].get("on", w["doc"].get(True))
+        wc = on.get("workflow_call") if isinstance(on, dict) else None
+        declared = {str(k).upper() for k in (wc.get("secrets") or {})} if isinstance(wc, dict) and isinstance(wc.get("secrets"), dict) else set()
+        units = [(None, {k: v for k, v in w["doc"].items() if k != "jobs"})]
+        units += [(jid, job) for jid, job in w["jobs"].items() if isinstance(job, dict)]
+        for jid, job in units:
+            jobs_n += jid is not None
+            calling = jid is not None and isinstance(job.get("uses"), str)
+            env, env_expr = None, False
+            if jid is not None and not calling:
+                env = job.get("environment")
+                env = env.get("name") if isinstance(env, dict) else env
+                env_expr = isinstance(env, str) and "${{" in env
+                env = None if env_expr or env is None else str(env)
+            if calling and job.get("secrets") == "inherit":
+                inherit.append((w["name"], jid, job["uses"]))
+            jg = guard_names(job.get("if")) if jid is not None else set()
+            for path, text in walk_strings(job):
+                step = path[1] if path[:1] == ("steps",) and len(path) > 1 and isinstance(path[1], int) else None
+                g = set(jg)
+                if step is not None and isinstance(job["steps"][step], dict):
+                    g |= guard_names(job["steps"][step].get("if"))
+                for kind, name in expression_tokens(text, path[-1] == "if"):
+                    refs.append({"wf": w["name"], "job": jid, "kind": kind, "name": name, "env": env,
+                                 "env_expr": env_expr, "calling": calling, "callee_only": callee_only,
+                                 "slot": path[0] if path else None, "optional": (kind, name) in g,
+                                 "declared": kind == "secrets" and name in declared,
+                                 "pr": bool(w["triggers"] & {"pull_request", "pull_request_target"})})
+    named = sum(1 for r in refs if r["kind"] == "secrets" and r["name"] != "GITHUB_TOKEN") + len(inherit)
+    return {"refs": refs, "jobs": jobs_n, "inherit": inherit, "secrets_named": named, "notes": notes}
+
+
+class Names:
+    """Secret/variable NAMES by scope. Upper-cased: GitHub treats names case-insensitively."""
+
+    def __init__(self, repo, org, envs, dependabot=None):
+        self.repo, self.org, self.envs, self.dependabot = repo, org, envs, dependabot
+
+    def base(self, kind):
+        return self.repo[kind] | self.org[kind]
+
+    def env(self, e, kind):
+        return self.envs.get(e, {}).get(kind, set())
+
+    def describe(self):
+        envs = ", ".join(f"{e} {len(v['secrets'])}/{len(v['variables'])}" for e, v in sorted(self.envs.items()))
+        return (f"repo {len(self.repo['secrets'])}/{len(self.repo['variables'])}, "
+                f"org-visible {len(self.org['secrets'])}/{len(self.org['variables'])}, "
+                f"envs {len(self.envs)}[{envs}]")
+
+
+def _pair(names_by_kind):
+    return {k: {str(n).upper() for n in names_by_kind.get(k, [])} for k in ("secrets", "variables")}
+
+
+def names_from_fixture(path, need_dependabot):
+    try:
+        d = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        raise Fatal(f"--names-file {path}: {e}")
+    errors = d.get("errors", {})
+
+    def get(key, items):
+        if key in errors:
+            raise Fatal(f"CANNOT-VERIFY: names for {key}: HTTP {errors[key]}")
+        return [i["name"] if isinstance(i, dict) else i for i in items]  # project the name: never a value
+
+    repo = _pair({k: get(f"repo.{k}", d.get("repo", {}).get(k, [])) for k in ("secrets", "variables")})
+    org = _pair({k: get(f"org.{k}", d.get("org", {}).get(k, [])) for k in ("secrets", "variables")})
+    get("environments", [])
+    envs = {e: _pair({k: get(f"env:{e}.{k}", v.get(k, [])) for k in ("secrets", "variables")})
+            for e, v in d.get("environments", {}).items()}
+    dep = None
+    if need_dependabot and "dependabot" in d:
+        dep = {str(n).upper() for n in get("dependabot", d["dependabot"])}
+    return Names(repo, org, envs, dep)
+
+
+def names_from_gh(gh, repo, need_dependabot):
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import quote
+
+    def call(path, jq, upper=True):
+        try:
+            p = subprocess.run([gh, "api", "--paginate", path, "--jq", jq], capture_output=True, text=True,
+                               timeout=GH_TIMEOUT)
+        except OSError as e:
+            raise Fatal(f"CANNOT-VERIFY: cannot run gh ({gh}): {e}")
+        except subprocess.TimeoutExpired:
+            raise Fatal(f"CANNOT-VERIFY: GET {path}: no answer within {GH_TIMEOUT}s")
+        if p.returncode != 0:
+            err = (p.stderr.strip().splitlines() or ["failed"])[0]
+            raise Fatal(f"CANNOT-VERIFY: GET {path}: {err}")
+        return [(ln.strip().upper() if upper else ln.strip()) for ln in p.stdout.splitlines() if ln.strip()]
+
+    base = f"repos/{repo}"
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        fixed = {"rs": f"{base}/actions/secrets?per_page=100", "rv": f"{base}/actions/variables?per_page=100",
+                 "os": f"{base}/actions/organization-secrets?per_page=100",
+                 "ov": f"{base}/actions/organization-variables?per_page=100"}
+        jq = {"rs": ".secrets[].name", "rv": ".variables[].name", "os": ".secrets[].name", "ov": ".variables[].name"}
+        futs = {k: ex.submit(call, p, jq[k]) for k, p in fixed.items()}
+        fenv = ex.submit(call, f"{base}/environments?per_page=100", ".environments[].name", False)
+        fdep = ex.submit(call, f"{base}/dependabot/secrets?per_page=100", ".secrets[].name") if need_dependabot else None
+        got = {k: f.result() for k, f in futs.items()}
+        env_names = fenv.result()  # environment names are not upper-cased: they are URL parts
+        efuts = {(e, k): ex.submit(call, f"{base}/environments/{quote(e, safe='')}/{k}?per_page=100", f".{k}[].name")
+                 for e in env_names for k in ("secrets", "variables")}
+        envs = {e: {"secrets": set(efuts[(e, "secrets")].result()), "variables": set(efuts[(e, "variables")].result())}
+                for e in env_names}
+        dep = None
+        if fdep:
+            try:
+                dep = set(fdep.result())
+            except Fatal:
+                dep = None
+    return Names({"secrets": set(got["rs"]), "variables": set(got["rv"])},
+                 {"secrets": set(got["os"]), "variables": set(got["ov"])}, envs, dep)
+
+
+def repo_slug(root):
+    p = subprocess.run(["git", "-C", str(root), "config", "--get", "remote.origin.url"], capture_output=True, text=True)
+    m = SLUG_RE.search(p.stdout.strip()) if p.returncode == 0 else None
+    return ("%s/%s" % m.groups()) if m else None
+
+
+def classify(ref, names, envname):
+    """None when the reference resolves, else the finding code."""
+    n, kind = ref["name"], ref["kind"]
+    if n in names.base(kind) or (envname and n in names.env(envname, kind)):
+        return None
+    elsewhere = [e for e in names.envs if e != envname and n in names.env(e, kind)]
+    if not elsewhere:
+        return "MISSING"
+    if ref["calling"]:
+        return "UNPROVEN" if kind == "secrets" and ref["slot"] == "secrets" else "ENV_ONLY_AT_CALLER"
+    return "ENV_MISMATCH"
+
+
+def evaluate_refs(scan, rcfg, cfg, names, repo, static):
+    grace = in_grace(cfg)
+    findings, warns, notes = {}, {}, []
+    cnt = dict(S=0, V=0, D=0, O=0, T=0, K=0)
+
+    def add(code, where, msg, graded=False):
+        line = f"{code} {where}: {msg}"
+        # UNPROVEN always warns (owner ruling 2026-10-21): no deadline escalation
+        bucket = warns if code == "UNPROVEN" or (graded and grace) else findings
+        bucket[("WARN " if bucket is warns else "") + line] = 1
+
+    seen_env = set()
+    for r in scan["refs"]:
+        where = f"{r['wf']}:{r['job']}" if r["job"] else f"{r['wf']} (workflow level)"
+        label = f"{'secrets' if r['kind'] == 'secrets' else 'vars'}.{r['name']}" if r["name"] else \
+            f"{'secrets' if r['kind'] == 'secrets' else 'vars'}[<expr>]"
+        if r["kind"] == "secrets" and r["name"] == "GITHUB_TOKEN":
+            cnt["T"] += 1
+            continue
+        if r["callee_only"]:
+            cnt["K"] += 1
+            continue
+        if r["env_expr"] and (where not in seen_env):
+            seen_env.add(where)
+            spec = rcfg.get("dynamic_env", {}).get(where)
+            cnt["D"] += 1
+            if not spec:
+                add("DYNAMIC_ENV", where, "environment is an expression; list its possible values in refs.dynamic_env", True)
+        if r["name"] is None:
+            cnt["D"] += 1
+            if where not in rcfg.get("dynamic", {}):
+                add("DYNAMIC", where, f"{label} cannot be resolved statically; waive it in refs.dynamic with a reason", True)
+            continue
+        if r["optional"] or r["name"] in {k.upper() for k in rcfg.get("optional", {})}:
+            cnt["O"] += 1
+            continue
+        cnt["S" if r["kind"] == "secrets" else "V"] += 1
+        if r["declared"] or static or names is None:
+            continue
+        if r["env_expr"]:
+            spec = rcfg.get("dynamic_env", {}).get(where)
+            envs = spec["values"] if spec else [None]
+        else:
+            envs = [r["env"]]
+        for e in envs:
+            code = classify(r, names, e)
+            if code == "ENV_MISMATCH" and r["env_expr"] and e is None:
+                continue  # an unwaived expression environment is already reported as DYNAMIC_ENV
+            if not code:
+                continue
+            at = f"environment {e}" if e else "no environment"
+            if r["env"] is None and not e and r["calling"]:
+                at = "the calling job (no environment)"
+            if e and e not in names.envs:
+                at += f" (no such environment among {sorted(names.envs)})"
+            in_envs = sorted(x for x in names.envs if r["name"] in names.env(x, r["kind"]))
+            msg = {"MISSING": f"{label} is in no scope this job can read (repo, org-visible, {at})",
+                   "ENV_MISMATCH": f"{label} exists only in environment(s) {in_envs}; this job runs in {at}",
+                   "ENV_ONLY_AT_CALLER": f"{label} exists only in environment(s) {in_envs}; a calling job has no environment, so it is empty here",
+                   "UNPROVEN": f"{label} is an environment secret passed by name into a reusable workflow (in {in_envs}); GitHub documents it, no fleet run has proven it"}[code]
+            add(code, where, msg, graded=(code == "UNPROVEN"))
+        if r["pr"] and r["kind"] == "secrets" and names.dependabot is not None and r["name"] not in names.dependabot:
+            warns[f"WARN DEPENDABOT_GAP {r['wf']}: {label} is not in Dependabot's secret store; a Dependabot PR gets it empty"] = 1
+    for wfname, jid, uses in scan["inherit"]:
+        if uses.startswith("./") or not repo:
+            if not repo and not uses.startswith("./"):
+                notes.append(f"caller org unknown (pass --repo O/R): INHERIT_CROSS_ORG not evaluated for {wfname}:{jid}")
+            continue
+        if uses.split("/")[0].lower() != repo.split("/")[0].lower():
+            add("INHERIT_CROSS_ORG", f"{wfname}:{jid}",
+                f"`secrets: inherit` into {uses.split('@')[0]} crosses orgs; inherit passes nothing there, pass each secret by name")
+    return list(findings), list(warns), notes, cnt
+
+
+def refs_summary(wfs, scan, cnt, names):
+    R = sum(cnt[k] for k in "SVDOTK")
+    s = (f"examined: {len(wfs)} workflows, {scan['jobs']} jobs, {R} references ({cnt['S']} secrets, {cnt['V']} vars, "
+         f"{cnt['D']} dynamic, {cnt['O']} optional, {cnt['T']} GITHUB_TOKEN)")
+    if cnt["K"]:
+        s += f"; {cnt['K']} in callee-only workflows (not resolved here)"
+    s += f"; live names: {names.describe()}" if names else "; static: no names fetched"
+    return s, R
+
+
+def run_refs(wfs, cfg, repo, loader, static, announce=False):
+    """Shared by `refs` and `dispatch-check`. Returns (findings, warns, notes, summary)."""
+    rcfg = validate_refs_config(cfg)
+    scan = scan_refs(wfs, rcfg)
+    if announce:
+        print(f"secrets-named: {scan['secrets_named']}")
+    if not wfs or not scan["jobs"]:
+        print(f"examined: {len(wfs)} workflows, {scan['jobs']} jobs")
+        raise Fatal("0 workflows/jobs examined; a check that looked at nothing proves nothing")
+    names = None if static else loader(any(r["pr"] for r in scan["refs"]))
+    findings, warns, notes, cnt = evaluate_refs(scan, rcfg, cfg, names, repo, static)
+    summary, R = refs_summary(wfs, scan, cnt, names)
+    if R == 0 and any(re.search(r"\b(?:secrets|vars)\.", w["text"]) for w in wfs):
+        print(summary)
+        raise Fatal("parser self-check: 0 references found although a workflow's text holds `secrets.` or `vars.` "
+                    "(a reference outside ${{ }} or if:, or a parser gap); refusing to call this clean")
+    return findings, warns, notes, summary
+
+
+def find_gh(args):
+    gh = args.gh or os.environ.get("WORKFLOW_PREFLIGHT_GH") or shutil.which("gh")
+    if not gh:
+        raise Fatal("CANNOT-VERIFY: gh is not installed")
+    return gh
+
+
+def names_loader(args, repo):
+    if args.names_file:
+        return lambda dep: names_from_fixture(args.names_file, dep)
+    if not repo:
+        raise Fatal("cannot tell which repo to read names from: pass --repo O/R (or --names-file / --static)")
+    gh = find_gh(args)
+    return lambda dep: names_from_gh(gh, repo, dep)
+
+
+def cmd_refs(root, args):
+    cfg_path = Path(args.config) if args.config else root / CONFIG_NAME
+    cfg = load_config(cfg_path) if cfg_path.is_file() else {}
+    repo = args.repo or repo_slug(root)
+    wfs = load_workflows(root)
+    loader = None if args.static else names_loader(args, repo)
+    findings, warns, notes, summary = run_refs(wfs, cfg, repo, loader, args.static)
+    return finish(findings, warns, summary, notes=notes + ([] if cfg else [f"no {CONFIG_NAME}: no refs waivers or grace in effect"]),
+                  examined=len(wfs), what="workflows")
+
+
+def fetch_remote_workflow(gh, repo, wf, ref):
+    from urllib.parse import quote
+    path = f"repos/{repo}/contents/.github/workflows/{wf}" + (f"?ref={quote(ref, safe='')}" if ref else "")
+    try:
+        p = subprocess.run([gh, "api", "-H", "Accept: application/vnd.github.raw+json", path],
+                           capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except OSError as e:
+        raise Fatal(f"CANNOT-VERIFY: cannot run gh ({gh}): {e}")
+    except subprocess.TimeoutExpired:
+        raise Fatal(f"CANNOT-VERIFY: GET {path}: no answer within {GH_TIMEOUT}s")
+    if p.returncode != 0:
+        raise Fatal(f"CANNOT-VERIFY: cannot read {wf} at ref {ref or '(default branch)'} of {repo}: "
+                    f"{(p.stderr.strip().splitlines() or ['failed'])[0]}")
+    return p.stdout
+
+
+def dispatch_input_findings(w, pairs):
+    on = w["doc"].get("on", w["doc"].get(True))
+    if not (isinstance(on, dict) and "workflow_dispatch" in on) and "workflow_dispatch" not in w["triggers"]:
+        return [f"NOT_DISPATCHABLE {w['name']}: no workflow_dispatch trigger at this ref; GitHub will answer 422"]
+    spec = on.get("workflow_dispatch") if isinstance(on, dict) else None
+    inputs = (spec or {}).get("inputs") or {} if isinstance(spec, dict) or spec is None else {}
+    out = []
+    for k in sorted(set(pairs) - set(inputs)):
+        out.append(f"UNKNOWN_DISPATCH_INPUT {w['name']}: -f {k}=... is not declared under workflow_dispatch.inputs {sorted(inputs)}")
+    for k, d in inputs.items():
+        d = d if isinstance(d, dict) else {}
+        if k not in pairs and d.get("required") and "default" not in d:
+            out.append(f"MISSING_DISPATCH_INPUT {w['name']}: required input '{k}' is not passed with -f")
+        if k in pairs and d.get("type") == "choice" and pairs[k] not in [str(o) for o in d.get("options", [])]:
+            out.append(f"BAD_CHOICE {w['name']}: input '{k}'={pairs[k]!r} is not one of {d.get('options')}")
+    return out
+
+
+def cmd_dispatch_check(root, args):
+    if not (args.repo and args.workflow):
+        raise Fatal("usage: dispatch-check -R O/R <workflow.yml> --ref REF [-f k=v ...]")
+    wf = args.workflow.rsplit("/", 1)[-1]
+    if not wf.endswith((".yml", ".yaml")):
+        raise Fatal(f"CANNOT-VERIFY: give the workflow FILE name (x.yml), not {args.workflow!r}")
+    pairs = {}
+    for kv in args.field or []:
+        if "=" not in kv:
+            raise Fatal(f"-f needs k=v, got {kv!r}")
+        pairs[kv.split("=", 1)[0]] = kv.split("=", 1)[1]
+    gh = find_gh(args)
+    text = fetch_remote_workflow(gh, args.repo, wf, args.ref)
+    w = parse_workflow_text(wf, text)
+    cfg = {}
+    cfg_path = Path(args.config) if args.config else root / CONFIG_NAME
+    if cfg_path.is_file() and (args.config or (repo_slug(root) or "").lower() == args.repo.lower()):
+        cfg = load_config(cfg_path)
+    loader = names_loader(args, args.repo)
+    findings, warns, notes, summary = run_refs([w], cfg, args.repo, loader, args.static, announce=True)
+    findings = dispatch_input_findings(w, pairs) + findings
+    notes.append("calls: not built yet (W3); callee contracts are not checked")
+    return finish(findings, warns, summary, notes=notes, examined=1, what="workflows")
+
+
+# ---------------------------------------------------------------- calls
+
+class CalleeUnavailable(Exception):
+    """kind 'bad_ref': the repo answers but the ref does not exist (a finding).
+    kind 'cannot': offline, no gh, private cross-org 404 (CANNOT-VERIFY, exit 2). Tests replace the fetchers."""
+
+    def __init__(self, kind, msg):
+        super().__init__(msg)
+        self.kind = kind
+
+
+def _gh_api(gh, path, jq=None, raw=False):
+    if not gh:
+        raise CalleeUnavailable("cannot", "gh is not installed")
+    cmd = [gh, "api"] + (["-H", "Accept: application/vnd.github.raw+json"] if raw else []) + [path] + (["--jq", jq] if jq else [])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except OSError as e:
+        raise CalleeUnavailable("cannot", f"cannot run gh ({gh}): {e}")
+    except subprocess.TimeoutExpired:
+        raise CalleeUnavailable("cannot", f"GET {path}: no answer within {GH_TIMEOUT}s")
+    return p
+
+
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+TAG_OBJ_JQ = '.object.type + " " + .object.sha'
+
+
+def _unreadable(gh, repo, ref, why):
+    """`ref` did not resolve: a finding when the repo itself answers, else CANNOT-VERIFY."""
+    if _gh_api(gh, f"repos/{repo}", jq=".full_name").returncode == 0:
+        return CalleeUnavailable("bad_ref", f"{ref} does not resolve in {repo} ({why})")
+    return CalleeUnavailable("cannot", f"cannot read {repo} ({why}); private or offline")
+
+
+def resolve_ref(gh, repo, ref):
+    """Commit SHA of `ref` in `repo`. A 40-hex ref is its own SHA (the fetch proves it exists). A
+    tag-shaped ref goes through `git/ref/tags/REF` (spec 3.4), so a branch named like a tag is not taken
+    for the tag; annotated tags are dereferenced to their commit. Tests replace this function."""
+    from urllib.parse import quote
+    if SHA_RE.fullmatch(ref):
+        return ref
+    if re.fullmatch(r"v\d[\w.\-]*", ref):
+        p = _gh_api(gh, f"repos/{repo}/git/ref/tags/{quote(ref, safe='')}", jq=TAG_OBJ_JQ)
+        for _ in range(5):  # tag object -> ... -> commit
+            kind, _, sha = p.stdout.strip().partition(" ")
+            if p.returncode != 0 or not SHA_RE.fullmatch(sha):
+                break
+            if kind == "commit":
+                return sha
+            if kind != "tag":
+                break
+            p = _gh_api(gh, f"repos/{repo}/git/tags/{sha}", jq=TAG_OBJ_JQ)
+    else:
+        p = _gh_api(gh, f"repos/{repo}/commits/{quote(ref, safe='')}", jq=".sha")
+        if p.returncode == 0 and SHA_RE.fullmatch(p.stdout.strip()):
+            return p.stdout.strip()
+    raise _unreadable(gh, repo, ref, (p.stderr.strip().splitlines() or ["failed"])[0])
+
+
+def fetch_callee_text(gh, repo, path, sha):
+    """Raw text of `path` in `repo` at commit `sha`. A failure where `sha` is not a commit of a readable
+    repo is a BAD_REF (a typo'd pin), anything else CANNOT-VERIFY. Tests replace this function."""
+    p = _gh_api(gh, f"repos/{repo}/contents/{path}?ref={sha}", raw=True)
+    if p.returncode != 0:
+        why = (p.stderr.strip().splitlines() or ["failed"])[0]
+        if _gh_api(gh, f"repos/{repo}/commits/{sha}", jq=".sha").returncode != 0:
+            raise _unreadable(gh, repo, sha, why)
+        raise CalleeUnavailable("cannot", f"cannot read {path} at {sha[:12]} of {repo}: {why}")
+    return p.stdout
+
+
+def job_uses_lines(text):
+    """[(job id, raw line, uses value)] for each job-level `uses:` of a reusable workflow, read from the raw
+    text (indentation-scoped, so `uses:` inside a `run: |` block or a step is not one). A flow-style job
+    (`a: {uses: ...}`) is not seen, which the calls self-check reports as a count mismatch."""
+    out, in_jobs, jind, jid, cind = [], False, None, None, None
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        ind = len(ln) - len(ln.lstrip())
+        if ind == 0:
+            in_jobs, jind, jid = s.startswith("jobs:"), None, None
+            continue
+        if not in_jobs:
+            continue
+        if jind is None:
+            jind = ind
+        if ind == jind:
+            m = re.match(r"['\"]?([^'\":\s]+)['\"]?\s*:", s)
+            jid, cind = (m.group(1) if m else None), None
+            continue
+        if jid is None:
+            continue
+        if cind is None:
+            cind = ind
+        m = USES_RE.match(ln) if ind == cind and not s.startswith("-") else None
+        if m and ".github/workflows/" in m.group(1):
+            out.append((jid, ln, m.group(1)))
+    return out
+
+
+YAML11_BOOL_WORDS = {"yes", "no", "on", "off"}
+
+
+def raw_with_strings(text):
+    """{job id: {input name: raw text}} for `with:` values PyYAML (YAML 1.1) read as bool from yes/no/on/off.
+    GitHub reads those as strings, so the literal check must see the string, not the bool."""
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError:
+        return {}
+    out = {}
+    jobs = next((v for k, v in root.value if getattr(k, "value", None) == "jobs"), None) if isinstance(root, yaml.MappingNode) else None
+    if not isinstance(jobs, yaml.MappingNode):
+        return out
+    for jk, jv in jobs.value:
+        w = next((v for k, v in jv.value if getattr(k, "value", None) == "with"), None) if isinstance(jv, yaml.MappingNode) else None
+        if isinstance(w, yaml.MappingNode):
+            out[jk.value] = {k.value: v.value for k, v in w.value
+                             if isinstance(v, yaml.ScalarNode) and v.tag == "tag:yaml.org,2002:bool"
+                             and v.value.lower() in YAML11_BOOL_WORDS}
+    return out
+
+
+def reusable_calls(wfs):
+    """Every job-level `uses:` that names a reusable workflow, with the tag comment on ITS OWN line."""
+    out = []
+    for w in wfs:
+        lines = job_uses_lines(w["text"])
+        raw = raw_with_strings(w["text"])
+        for jid, job in w["jobs"].items():
+            u = job.get("uses") if isinstance(job, dict) else None
+            if not isinstance(u, str) or ".github/workflows/" not in u:
+                continue
+            comment = None
+            for j, ln, v in lines:
+                if j == str(jid) and v == u:
+                    c = TAG_COMMENT_RE.search(ln)
+                    comment = c.group(1) if c else None
+                    break
+            wth = dict(job.get("with")) if isinstance(job.get("with"), dict) else {}
+            for k, s in raw.get(str(jid), {}).items():
+                if k in wth:
+                    wth[k] = s
+            out.append({"wf": w["name"], "job": jid, "uses": u, "comment": comment,
+                        "with": wth, "secrets": job.get("secrets")})
+    return out
+
+
+def literal_type_ok(declared, v):
+    if isinstance(v, str) and "${{" in v:
+        return True
+    if declared == "boolean":
+        return isinstance(v, bool) or (isinstance(v, str) and v in ("true", "false"))
+    if declared == "number":
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, (int, float)):
+            return True
+        try:
+            float(v)
+            return True
+        except (TypeError, ValueError):
+            return False
+    return isinstance(v, str)  # string (the default when `type` is absent)
+
+
+def contract_of(text, label):
+    w = parse_workflow_text(label, text)
+    on = w["doc"].get("on", w["doc"].get(True))
+    wc = on.get("workflow_call") if isinstance(on, dict) else None
+    if "workflow_call" not in w["triggers"]:
+        return None
+    wc = wc if isinstance(wc, dict) else {}
+    ins = wc.get("inputs") if isinstance(wc.get("inputs"), dict) else {}
+    sec = wc.get("secrets") if isinstance(wc.get("secrets"), dict) else {}
+    return {"inputs": {str(k): (v if isinstance(v, dict) else {}) for k, v in ins.items()},
+            "secrets": {str(k): (v if isinstance(v, dict) else {}) for k, v in sec.items()}}
+
+
+def cmd_calls(root, args):
+    wfs = load_workflows(root)
+    caller_org = ((args.repo or repo_slug(root) or "").split("/")[0]).lower()
+    gh = args.gh or os.environ.get("WORKFLOW_PREFLIGHT_GH") or shutil.which("gh")
+    calls = reusable_calls(wfs)
+    findings, warns, notes = [], [], []
+    contracts, cache_dir = {}, root / ".scratch" / "workflow-preflight"
+    n_local = n_remote = 0
+    tag_cache = {}
+    for c in calls:
+        where = f"{c['wf']}:{c['job']}"
+        uses = c["uses"]
+        path, _, ref = uses.partition("@")
+        if path.startswith("./"):
+            n_local += 1  # local callees are actionlint's job (`lint`), not this command's
+            continue
+        n_remote += 1
+        parts = path.split("/")
+        repo = "/".join(parts[:2])
+        fpath = "/".join(parts[2:])
+        callee_org = parts[0].lower()
+        is_org = (path.lower() + "/").startswith(ORG_REPO + "/")
+        is_sha = bool(re.fullmatch(r"[0-9a-f]{40}", ref))
+        if is_org and ref == "v1":
+            findings.append(f"LEGACY_ALIAS {where}: {uses} pins the frozen v1 alias; pin an exact vX.Y.Z")
+        elif is_org and not (TAG_RE.fullmatch(ref) or is_sha):
+            findings.append(f"UNPINNED {where}: {uses} must be an exact tag vX.Y.Z or a 40-hex SHA with a # vX.Y.Z comment")
+        elif not is_org and not (is_sha or re.fullmatch(r"v\d+(\.\d+){0,2}", ref)):
+            findings.append(f"UNPINNED {where}: {uses} is not a tag or a full commit SHA")
+        if is_org and is_sha and c["comment"]:
+            try:
+                if c["comment"] not in tag_cache:
+                    tag_cache[c["comment"]] = remote_tag_sha(c["comment"])
+                if tag_cache[c["comment"]] != ref:
+                    findings.append(f"TAG_SHA_MISMATCH {where}: {c['comment']} "
+                                    + (f"points at {tag_cache[c['comment']]}" if tag_cache[c["comment"]] else "does not exist")
+                                    + f", but the pin is {ref}")
+            except NetworkUnavailable as e:
+                warns.append(f"WARNING: tag/SHA NOT verified (offline) {where}: {e}")
+        try:
+            sha = resolve_ref(gh, repo, ref)
+            key = (repo, sha, fpath)
+            cf = cache_dir / ("__".join([repo.replace("/", "__"), sha, fpath.replace("/", "__")]))
+            text = None
+            if cf.is_file():
+                text = cf.read_text()
+                try:
+                    parse_workflow_text(cf.name, text)
+                except Fatal:
+                    text = None  # a torn or corrupt cache file is ignored and refetched
+            if text is None:
+                text = fetch_callee_text(gh, repo, fpath, sha)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                tmp = cf.with_name(cf.name + f".tmp{os.getpid()}")
+                tmp.write_text(text)
+                os.replace(tmp, cf)
+        except CalleeUnavailable as e:
+            if e.kind == "bad_ref":
+                findings.append(f"BAD_REF {where}: {e}")
+            else:
+                findings.append(f"CANNOT-VERIFY {where}: {uses}: {e}")
+            continue
+        if key not in contracts:
+            contracts[key] = contract_of(text, str(path))
+        k = contracts[key]
+        if k is None:
+            findings.append(f"NOT_CALLABLE {where}: {uses} has no on.workflow_call trigger")
+            continue
+        ins = {n.lower(): (n, d) for n, d in k["inputs"].items()}
+        passed = {str(n).lower(): (n, v) for n, v in c["with"].items()}
+        for low, (n, v) in passed.items():
+            if low not in ins:
+                findings.append(f"UNKNOWN_INPUT {where}: with.{n} is not declared by {uses.split('@')[0]} (declares {sorted(k['inputs'])})")
+            elif not literal_type_ok(ins[low][1].get("type", "string"), v):
+                findings.append(f"INPUT_TYPE {where}: with.{n}={v!r} is a {type(v).__name__} literal, the callee declares {ins[low][1].get('type', 'string')}")
+        for low, (n, d) in ins.items():
+            if d.get("required") and "default" not in d and low not in passed:
+                findings.append(f"MISSING_INPUT {where}: required input '{n}' is not passed to {uses.split('@')[0]}")
+        sec = c["secrets"]
+        required = [n for n, d in k["secrets"].items() if d.get("required")]
+        if sec == "inherit":
+            if required and callee_org != caller_org:
+                if caller_org:
+                    findings.append(f"INHERIT_CROSS_ORG {where}: `secrets: inherit` into {uses.split('@')[0]} crosses orgs and passes nothing; "
+                                    f"pass the required secret(s) {sorted(required)} by name")
+                else:
+                    findings.append(f"CANNOT-VERIFY {where}: caller org unknown, so `secrets: inherit` into "
+                                    f"{uses.split('@')[0]} (requires {sorted(required)}) cannot be judged; pass --repo O/R")
+            continue
+        given = {str(n).upper(): n for n in sec} if isinstance(sec, dict) else {}
+        decl = {n.upper() for n in k["secrets"]}
+        for up, n in given.items():
+            if up not in decl:
+                findings.append(f"UNKNOWN_SECRET {where}: secrets.{n} is not declared by {uses.split('@')[0]} (declares {sorted(k['secrets'])})")
+        for n in required:
+            if n.upper() not in given:
+                findings.append(f"MISSING_SECRET {where}: required secret '{n}' is not passed to {uses.split('@')[0]} (and not inherited within one org)")
+    summary = (f"examined {len(calls)} calls ({n_remote} remote checked, {n_local} local left to actionlint), "
+               f"{len(contracts)} callee contracts")
+    raw_lines = sum(len(job_uses_lines(w["text"])) for w in wfs)
+    if raw_lines != len(calls):
+        findings.append(f"CANNOT-VERIFY self-check: {raw_lines} uses: lines of reusable workflows in the raw text but "
+                        f"{len(calls)} calls parsed (duplicate job ids, or a flow-style job); the check cannot be trusted")
+    rc = finish(findings, warns, summary, notes=notes, examined=(len(wfs) and (len(calls) or not raw_lines)), what="calls")
+    if any(f.startswith("CANNOT-VERIFY") for f in findings):
+        return 2
+    return rc
+
+
 # ---------------------------------------------------------------- output / CLI
 
-def finish(findings, warns, summary, notes=(), examined=1):
+def finish(findings, warns, summary, notes=(), examined=1, what="uses: lines"):
     for line in findings:
         print(line)
     for line in warns:
@@ -500,7 +1206,7 @@ def finish(findings, warns, summary, notes=(), examined=1):
         print("note: " + line)
     print(summary)
     if not examined:
-        print("FAIL: examined 0 uses: lines; a guard that looked at nothing proves nothing")
+        print(f"FAIL: examined 0 {what}; a guard that looked at nothing proves nothing")
         return 2
     print(f"{'FAIL' if findings else 'ok'}: {len(findings)} finding(s), {len(warns)} warning(s)")
     return 1 if findings else 0
@@ -514,21 +1220,31 @@ def default_root():
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="workflow-preflight", description=__doc__.split("\n")[0])
     ap.add_argument("subcommand", choices=["lint", "parity", "refs", "calls", "dispatch-check"])
+    ap.add_argument("workflow", nargs="?", help="dispatch-check: the workflow file name")
     ap.add_argument("--root")
     ap.add_argument("--config")
     ap.add_argument("--actionlint")
     ap.add_argument("--shellcheck")
     ap.add_argument("--gate-log")
+    ap.add_argument("-R", "--repo", help="refs/dispatch-check: O/R whose names and workflow are read")
+    ap.add_argument("--ref", help="dispatch-check: the git ref the workflow is read at")
+    ap.add_argument("-f", "--field", action="append", help="dispatch-check: a k=v dispatch input (repeatable)")
+    ap.add_argument("--static", action="store_true", help="refs/dispatch-check: no network, syntax and dynamic refs only")
+    ap.add_argument("--names-file", help="refs/dispatch-check: JSON names fixture instead of gh (tests)")
+    ap.add_argument("--gh", help="refs/dispatch-check: path of the gh binary (default $WORKFLOW_PREFLIGHT_GH or PATH)")
     ap.add_argument("--offline", action="store_true", help="lint: skip the tag/SHA network check (prints a warning)")
     args, extra = ap.parse_known_args(argv)
-    if args.subcommand in ("refs", "calls", "dispatch-check"):
-        print(f"workflow-preflight {args.subcommand}: not built yet (W2)", file=sys.stderr)
-        return 2
     if extra:
         print(f"unexpected arguments: {extra}", file=sys.stderr)
         return 2
     root = Path(args.root).resolve() if args.root else default_root()
     try:
+        if args.subcommand == "refs":
+            return cmd_refs(root, args)
+        if args.subcommand == "dispatch-check":
+            return cmd_dispatch_check(root, args)
+        if args.subcommand == "calls":
+            return cmd_calls(root, args)
         cfg = load_config(Path(args.config) if args.config else root / CONFIG_NAME)
         return {"lint": cmd_lint, "parity": cmd_parity}[args.subcommand](root, cfg, args)
     except Fatal as e:
