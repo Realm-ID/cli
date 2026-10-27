@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-32 entries. Newest first.
+33 entries. Newest first.
 
+- [2026-10-27 — Planned key-session docs follow R55-R58](#2026-10-27--planned-key-session-docs-follow-r55-r58)
 - [2026-10-27 — Split signing and BFF-only CLI: planned docs first, vendored error reference untouched](#2026-10-27--split-signing-and-bff-only-cli-planned-docs-first-vendored-error-reference-untouched)
 - [2026-10-21 — goreleaser's Go 1.23 is a declared per-job override, not drift](#2026-10-21--goreleasers-go-123-is-a-declared-per-job-override-not-drift)
 - [2026-10-20 — Fleet par: todo-hygiene and workflow-preflight vendored; actionlint installed from a checksummed tarball](#2026-10-20--fleet-par-todo-hygiene-and-workflow-preflight-vendored-actionlint-installed-from-a-checksummed-tarball)
@@ -41,6 +42,10 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-27 — Planned key-session docs follow R55-R58
+
+README's planned section scoped to R57 and R58. The CLI refuses `rk_live_` locally on the user-key path only, and `realm-id doctor` keeps working until service mode is removed. A key session gets no refresh token. Per R55 every key session is refused on the never-via-key list, and per R56 SA management is a "no API key" operation, so a platform token may still do it. Docs only.
 
 ## 2026-10-27 — Split signing and BFF-only CLI: planned docs first, vendored error reference untouched
 

@@ -266,6 +266,12 @@ signs the CLI in, and the typed tree no longer runs issuer-direct (ADR-062 § 4 
 `rk_live_` in `REALM_ID_API_KEY` will exit 2 with a message pointing at a user API key
 (`uk_live_`) or workload identity. The CLI is BFF-only.
 
+Scope of the `rk_live_` refusal (R57): the key session accepts only `uk_live_` (service accounts
+have no API keys), and the CLI refuses `rk_live_` locally on the USER-KEY path only, with the
+migration message. `realm-id doctor` keeps working with `REALM_ID_API_KEY=rk_live_…` until service
+mode itself is removed. A key session gets an access token only, no refresh token (R58: the key is
+presented again when the token expires, so a revoked key stops on its next use).
+
 Credentials:
 
 - `realm-id auth login` (device flow; TOTP in the page, R41).
@@ -302,6 +308,9 @@ the handshake is SDK-only (G9).
 Other planned behaviour: dangerous verbs (`tenants delete`, `tenants transfer-owner`,
 `users deactivate`, `platform-keys create|revoke`) are human-session only with step-up; a key or
 workload session exits 8 (R40). The CLI reads `x-realmid-human-only` from its vendored spec (G12).
+Per R55 the issuer refuses EVERY key session (capped or uncapped `uk_live_`) on its never-via-key
+list; per R56 a platform token may still manage service accounts, so SA create/change/delete is a
+"no API key" operation, not a "person must perform" one.
 Also `platform bootstrap [--split]`, `doctor --split`, `explain <code>` rows for the new codes,
 `help --json`, completion, `export-config` and `--dry-run` (C5). Removed against the earlier
 draft: `activate`, `repin`, `retire`, `emergency-retire`, and the `signing split …` family name.
