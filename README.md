@@ -254,8 +254,8 @@ Exit codes today (for agents): `0` ok · `2` usage · `4` conflict · `5` not-fo
 ## Planned: split signing, BFF-only CLI (NOT BUILT YET)
 
 Everything in this section is **planned and the code does not exist yet**. It is specified in
-`plans/2026-10-27-split-signing-v2.md` § 5.1 (rulings R6, R7, R24, R40, R41; G13-G15) in the
-root repo. Until it ships, only the sections above describe the binary.
+`plans/2026-10-27-split-signing-v3.md` § 3.9 and § 7.2 (rulings R6, R7, R24, R40, R41, R55, R63,
+R68.1, R72-R74; G13-G15, G19) in the root repo. One release, no release A/B (R62). Until it ships, only the sections above describe the binary.
 
 **Run `init` yourself, not via an agent (J5).** `signing-keys init` generates the realm's private
 signing key and splits it; the half you keep must never pass through an agent's context, shell
@@ -264,7 +264,12 @@ history or logs. Run it in your own terminal and send the share to a secret stor
 **What R6/R7 remove (the service mode described above):** `REALM_ID_API_KEY=rk_live_…` no longer
 signs the CLI in, and the typed tree no longer runs issuer-direct (ADR-062 § 4 Service mode).
 `rk_live_` in `REALM_ID_API_KEY` will exit 2 with a message pointing at a user API key
-(`uk_live_`) or workload identity. The CLI is BFF-only.
+(`uk_live_`) or workload identity. The CLI is BFF-only (R6, R63): every call goes through a BFF,
+including partner CI key rotation (via `api.realmid.dev`).
+
+**Reach is the holder's reach (R68.1, R74).** The CLI gets exactly today's console reach, nothing
+new; a person's CLI reaches what that person reaches in the console. Per R55 the issuer refuses a
+key session on its never-via-key list.
 
 Scope of the `rk_live_` refusal (R57): the key session accepts only `uk_live_` (service accounts
 have no API keys), and the CLI refuses `rk_live_` locally on the USER-KEY path only, with the
@@ -291,13 +296,13 @@ The `signing-keys` family (G14; `init`, `pin` and `rotate` are kept in it, read 
 | Verb | What it does |
 |---|---|
 | `signing-keys init --realm R [--kid K] --share-to <target>` | Offline keygen and dealer split (R5). Writes the bundle and the public-only list (R39); prints `{kid, fingerprint, n_bits, written_to}`. |
-| `signing-keys upload --realm R --bundle … [--overlap 24h]` | Sends `n`, `e`, `d_ri`, `kid`, then drops `d_ri` locally. Starts `overlap_pending` (R36). Needs the human owner session or a `signing_keys:rotate` key (G9). Overlap plus extensions at most 7d (G8). |
+| `signing-keys upload --realm R --bundle … [--overlap 24h]` | Sends `n`, `e`, `d_ri`, `kid`, then drops `d_ri` locally. Starts `overlap_pending` (R36). Human only: the owner, with MFA (R73). Overlap plus extensions at most 7d (G8). |
 | `signing-keys status --realm R` | Custody, state, overlap, per-kid fingerprint and last handshake, rotation due/overdue, emergency rotations today. |
 | `signing-keys extend --realm R --by D` | Extend the overlap (R36, G8). |
 | `signing-keys cancel --realm R` | Cancel the overlap; deletes the uploaded split key and the realm stays full (G8). |
 | `signing-keys pin --realm R` | Print the public-only list or pin snippet for verify-only and hand-pinned services (R23). |
-| `signing-keys rotate` | Rotation from CI with a `signing_keys:rotate` key (R9). |
-| `signing-keys recover` | Recovery from an env source only; prints the new value (R39). |
+| `signing-keys rotate` | Rotation from an env source; a human verb (R73). The CI service-account rotation path is dropped (R73). |
+| `signing-keys recover` | Recovery from an env source only; prints the new value (R39). A human verb (R73). |
 | `signing-keys downgrade [--cosign-from <store>] [--cancel]` | Human owner only. Co-signed is immediate, otherwise 24h (R38). |
 
 `--share-to` targets (G13): `gsm:<secret>`, `file:<path>`, `redis:<url>` and `stdout`. `stdout`
@@ -305,12 +310,15 @@ is accepted only when asked for explicitly, and prints `::add-mask::` first (R9)
 encrypts the share with a key read from `REALM_ID_SHARE_KEK`. There is no manual handshake verb:
 the handshake is SDK-only (G9).
 
-Other planned behaviour: dangerous verbs (`tenants delete`, `tenants transfer-owner`,
-`users deactivate`, `platform-keys create|revoke`) are human-session only with step-up; a key or
-workload session exits 8 (R40). The CLI reads `x-realmid-human-only` from its vendored spec (G12).
+Verb rules: `signing-keys upload|extend|cancel|downgrade|rotate|recover` are human-only (R73).
+`platform-keys create|revoke` run for a person, or for a carried `platform_mgmt_api` workload
+session only (R72: the one non-human step-up exemption, the WIF binding counting as the second
+factor). Any other key or workload session gets `needs_human`, exit 8 (R40). Other dangerous verbs
+(`tenants delete`, `tenants transfer-owner`, `users deactivate`) are human-session only with
+step-up; a key or workload session exits 8 (R40). The CLI reads `x-realmid-human-only` from its vendored spec (G12).
 Per R55 the issuer refuses EVERY key session (capped or uncapped `uk_live_`) on its never-via-key
-list; per R56 a platform token may still manage service accounts, so SA create/change/delete is a
-"no API key" operation, not a "person must perform" one.
+list. R56 (a platform token managing service accounts) is superseded by R64/R65: administration
+is people-only, so SA create/change/delete is a person's act through the CLI or console.
 Also `platform bootstrap [--split]`, `doctor --split`, `explain <code>` rows for the new codes,
 `help --json`, completion, `export-config` and `--dry-run` (C5). Removed against the earlier
 draft: `activate`, `repin`, `retire`, `emergency-retire`, and the `signing split …` family name.
@@ -318,7 +326,8 @@ draft: `activate`, `repin`, `retire`, `emergency-retire`, and the `signing split
 Planned exit codes (G15): `0` ok · `1` error · `2` usage · `3` incomplete · `4` conflict ·
 `5` not found · `6` unauthenticated (401; split out of 7) · `7` forbidden · `8` needs a human
 (R40) · `9` split signing (share unavailable, untrusted kid, handshake failed). Moving 401 from
-7 to 6 is a breaking change and goes under `### Breaking` in the CHANGELOG.
+7 to 6 is a breaking change and goes under `### Breaking` in the CHANGELOG. New code mapping
+(G19; plan § 3.9, § 7.2): `platform_bearer_required` (401) exits 6, `actor_required` (403) exits 7.
 
 Planned error codes (G15 adopts v2 § 5.3; names marked * were proposed in W0 and the owner may
 rename them): `split_signing_required` 409, `realm_not_split` 409, `platform_key_not_a_user_key`
@@ -328,7 +337,8 @@ rename them): `split_signing_required` 409, `realm_not_split` 409, `platform_key
 `rotation_lease_held`* 409, `emergency_rotation_cap_reached`* 429, `not_in_overlap`* 409,
 `install_pass_invalid`* 401, `installation_not_found`* 404, `integration_endpoint_missing`* 409,
 `integration_endpoint_unverified`* 422, `integration_grant_requires_install_pass`* 400,
-`downgrade_already_pending`* 409, `login_grant_removed`* 400 (release B only).
+`downgrade_already_pending`* 409, `login_grant_removed` 400, `platform_bearer_required` 401 and
+`actor_required` 403 (G19; all in the one release, R62).
 
 `explain` answers these only after the sdk error reference carries them and
 `cmd/realm-id/error-reference.md` is re-vendored (see above); until then it returns

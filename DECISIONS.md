@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-33 entries. Newest first.
+34 entries. Newest first.
 
+- [2026-10-27 — W0b: planned CLI docs follow R60-R76 (human-only verbs, exit 6/7 for G19)](#2026-10-27--w0b-planned-cli-docs-follow-r60-r76-human-only-verbs-exit-67-for-g19)
 - [2026-10-27 — Planned key-session docs follow R55-R58](#2026-10-27--planned-key-session-docs-follow-r55-r58)
 - [2026-10-27 — Split signing and BFF-only CLI: planned docs first, vendored error reference untouched](#2026-10-27--split-signing-and-bff-only-cli-planned-docs-first-vendored-error-reference-untouched)
 - [2026-10-21 — goreleaser's Go 1.23 is a declared per-job override, not drift](#2026-10-21--goreleasers-go-123-is-a-declared-per-job-override-not-drift)
@@ -42,6 +43,22 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-27 — W0b: planned CLI docs follow R60-R76 (human-only verbs, exit 6/7 for G19)
+
+W0b D9 doc pass on the planned split-signing section of README.md, per rulings R60-R76.
+
+- BFF-only (R6, R63) now names partner CI key rotation via api.realmid.dev. Reach is the holder's
+  reach, exactly today's console reach (R68.1, R74); never-via-key applies (R55).
+- Verb rules: signing-keys upload|extend|cancel|downgrade|rotate|recover are human-only (R73);
+  platform-keys create|revoke for a person or a carried platform_mgmt_api workload session only
+  (R72); every other key/workload session gets needs_human, exit 8.
+- Exit mapping (G19): platform_bearer_required (401) exits 6, actor_required (403) exits 7.
+- The CI service-account rotation path is dropped (R73); R56 is superseded by R64/R65.
+- release-B qualifier on login_grant_removed removed (R62, one release).
+- cmd/realm-id/error-reference.md is NOT edited: it is a hash-gated vendored copy of the sdk's
+  docs/error-reference.md (ERROR_REFERENCE_CONTRACT, revendor-error-reference.sh). Its "release A"
+  wording and missing G19 rows must be fixed in the sdk file, then re-vendored at an sdk commit sha.
 
 ## 2026-10-27 — Planned key-session docs follow R55-R58
 
