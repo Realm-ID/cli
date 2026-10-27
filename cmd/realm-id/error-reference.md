@@ -44,8 +44,9 @@ These fire from `realm.auth.*` calls.
 | `tenant_required`         | `auth.token` was called without a `tenantId` and the user belongs to multiple.               | Surface a tenant picker; supply `tenantId` to `auth.token`.                                                |
 | `tenant_invalid`          | `tenantId` is not a tenant the user belongs to in this realm.                                | Reject; the picker shouldn't have offered it.                                                              |
 | `token_stale`             | (401, verifier-emitted, ADR-107) The token was minted before its subject's authority changed.  | Refresh ONCE and replay; never treat it as a sign-out (check it before any generic 401 handling).        |
-| `user_suspended`          | (403; the issuer also sends 401 on the user-API-key exchange) The user's row in THIS org is suspended or deactivated (ADR-104 R-d). | Show "not allowed in this org". Do not sign the user out of other orgs; the Go BFF middleware relays it without tearing the session down. Breaking in go 0.66.0: it used to be `forbidden` + `details.server_code`. |
-| `escort_suspended`        | (403 from the issuer, shown as 503 by the Go BFF middleware) Your backend's `/auth/*` escort account is suspended or deactivated (ADR-104 R-d). | A service problem, not the user's: alert operators. The session is untouched. |
+| `user_suspended`          | (403; the issuer also sends 401 on the user-API-key exchange) The user's row in THIS org is suspended or deactivated (ADR-104 R-d). | Show "not allowed in this org". Do not sign the user out of other orgs; the Go, TS and Java BFF middleware relay it without tearing the session down. Breaking in go 0.66.0: it used to be `forbidden` + `details.server_code`. |
+| `escort_suspended`        | (403 from the issuer, shown as 503 by the Go, TS and Java BFF middleware) Your backend's `/auth/*` escort account is suspended or deactivated (ADR-104 R-d). | A service problem, not the user's: alert operators. The session is untouched. |
+| `tenant_disabled`         | (403) The organization this token is for is suspended or deactivated (ADR-049 amendment, 2026-10-16). Sent on bearer requests, on refresh and on a login that asks for that org. | Show "this organization is unavailable" and offer the other orgs. Do not sign the user out: the session is NOT ended, other orgs keep working, and the same token works again once the org is reactivated. Not the 410 `tenant_suspended` of the integration routes. |
 | `account_suspended`       | The user's account is suspended.                                                             | Surface a "your account is suspended" message; do not retry.                                              |
 | `account_deactivated`     | The user's account is deactivated.                                                           | Surface a "this account has been closed" message.                                                         |
 | `realm_origin_mismatch`   | The request's `Origin` header disagrees with the body's `realm_id`.                          | Configuration error — either set `createRealm({ origin })` correctly or stop overriding per call.         |
@@ -122,9 +123,23 @@ These come from issuing, viewing and verifying a one-time code. HTTP status is i
 | `invalid_purpose` | [400] `purpose` is not lowercase letters, digits and underscores, starting with a letter, up to 64 characters. | Fix the request. |
 | `invalid_subject_ref` | [400] `subject_ref` is empty or over 256 characters; for a `login` code it must be exactly `user:<id>`. | Fix the request. |
 | `invalid_scope` | [400] The call has no tenant or no acting user to scope the code to. (A scope rename also uses it for a name that is not a valid RFC 6749 scope token.) | Call with a user-scoped, tenant-scoped token. |
-| `unsupported_delivery_mode` | [400] `delivery_mode` is not `view_bff`, `email` or `sms` (WhatsApp is not available). | Use a supported mode, or omit it for `view_bff`. |
-| `delivery_unavailable` | [503] The mode is valid but this deployment has no transport configured for it. | Not your request's fault; use another mode or contact support. |
-| `no_delivery_address` | [400] `delivery_mode` is `email` and the code's subject has no email address on record. | Add an address first, or use another mode. |
+| `unsupported_delivery_mode` | [400] `delivery_mode` is not `view_bff`, `email`, `sms` or `whatsapp`. | Use a supported mode, or omit it for `view_bff`. |
+| `delivery_unavailable` | [503] The mode is valid but nothing can send it. For `sms` and `whatsapp` the body carries a `channel` field (`sms` or `whatsapp`; the SDKs put it in `details.channel`): the realm has not saved credentials for that channel, or the channel is marked `failing`. Not a registered SDK code: it reaches you as `details.server_code`. | Not the end user's fault. Offer the other channel if the realm lists one in discovery `phone_channels`; otherwise tell the realm owner to check the channel (`GET /platforms/{id}/messaging/{channel}` shows `status` and `status_reason`). |
+| `phone_otp_rate_limited` | [429] This phone number was already sent the realm's `phone_otp` limit of codes (default 5 per 15 minutes, one counter for SMS and WhatsApp together) within the window. The `Retry-After` header gives the seconds to wait. | Show "try again in a few minutes" and wait; switching channel does not help. The realm owner can raise the limit with `phone_otp` in realm config, up to RealmID's ceiling (20 per hour; `window_seconds` may not exceed 3600, else `400 invalid_config_value`). |
+| `sign_in_ip_rate_limited` | [429] Raised by the sign-in code send (`POST /auth/otp/send-login`; `auth.sendLoginCode`). The end user's IP (the `X-On-Behalf-Of-IP` you passed) has already requested the realm's `phone_otp.sign_in_per_ip_per_hour` sign-in codes this hour (default 10, range 1-60). An IPv4 address is counted per address, an IPv6 address per `/64`. Never raised when you pass no IP. The `Retry-After` header gives the seconds to wait. | Show "too many codes requested, try again later". Make sure you pass the END USER's IP, not your server's. |
+| `invalid_on_behalf_of_ip` | [400] `X-On-Behalf-Of-IP` is present on the sign-in code send but is not a parseable IPv4 or IPv6 address. Nothing was counted or sent. | A caller bug: pass the end user's real address, or omit the header. |
+| `method_not_enabled` | [403 on the sign-in code send; also [400] on the per-org domain-SSO routes (ADR-094)] The realm has one-time-code sign-in switched off (`otp_login_enabled = false`). A registered code in go/ts/java from the release that adds `sendLoginCode`; before that, the SDKs delivered it as `details.server_code` on the domain-SSO routes. | Do not offer the phone option. If you branched on `details.server_code == "method_not_enabled"`, branch on the code instead. |
+| `no_delivery_address` | [400] `delivery_mode` is `email` and the code's subject has no email address on record (or `sms` / `whatsapp` and no phone number). Also returned when the provider says this ONE number cannot receive on the channel (invalid, opted out, not on WhatsApp; Twilio 21608, Meta 130497); the message then reads "this phone number cannot receive codes on <channel>". | Add an address first, or use another mode or channel. It never marks the channel `failing`. |
+
+## Phone-code channel codes (`/platforms/{id}/messaging/{channel}`)
+
+These come from saving, reading and deleting a realm's own SMS (Twilio) or WhatsApp (Meta) credentials. HTTP status is in brackets. All three need the realm permission `platform:config`.
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `invalid_channel_config` | [400] The saved body breaks a shape rule: neither or both Twilio auth forms (`auth_token` or `api_key_sid` + `api_key_secret`), neither or both sender forms (`from_number` in E.164 or `messaging_service_sid`), a field that belongs to the other provider, a field of the wrong type, or a secret (`auth_token`, `api_key_secret`, `access_token`) shorter than 20 characters. The message names the field. Nothing was stored. | Fix the named field and save again. |
+| `channel_validation_failed` | [422] Twilio or Meta refused the credentials when RealmID checked them (no message is sent for this check). The message is the provider's reason, never a secret. Nothing was stored. | Read the reason, fix the credential in the provider's console, save again. |
+| `channel_not_configured` | [404] The realm has no saved credentials for this channel. | For a first-time setup, show an empty form. Otherwise save the credentials with `PUT`. |
 
 ## API key codes
 
@@ -232,7 +247,7 @@ Organization admins reviewing contact changes, delinking a contact and handing a
 
 | Code | When | What to do |
 | --- | --- | --- |
-| `contact_not_found` | [404] The contact does not belong to that user in this organization. | Re-list the user's contacts. |
+| `contact_not_found` | [404] The contact does not belong to that user in this organization. Also (registered with the contact-proof routes, issuer spec 0.62.0): `/me/contacts/{id}/proof[/confirm]` on a contact that is not an active phone of the caller's own membership; an admin acting for the person, a foreign id and an unknown id are indistinguishable. | Re-list the user's contacts. |
 | `user_not_found` | [404] The user does not exist in this organization. | Check the id. |
 | `from_user_not_found` | [404] The `from_user_id` account does not exist in this organization. | Check the id. |
 | `missing_from_user_id` | [400] Hand-back was called without `from_user_id`. | Send it. |
@@ -413,6 +428,89 @@ HTTP status is in brackets.
 | `key_class_mismatch` | `mintToken` — the api key is not a platform-class key. | Mint with the realm's `platform_api` key, not a service key or user token. |
 | `installation_not_found` | `mintToken` — unknown installation id, **or** a platform key from a realm other than the integration's (no cross-realm existence oracle). | Verify the installation id and that you are minting with the source realm's key. |
 
+## Unique contact kinds, invitation links and contact proof (issuer spec 0.62.0, ADR-117)
+
+A platform declares which contact kinds are identifying (`contacts.unique_kinds`); these codes come
+from changing that list, from the routes that depend on it, and from the invitation-link and
+phone-proof flows. HTTP status is in brackets. The 409 bodies carry their offender in `details`.
+(`contact_not_found` is in the contact review table above; `invalid_config_value` and
+`identifier_collision` already existed and are not newly registered.)
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `unique_kinds_requires_password` | [400] Config PATCH would leave `contacts.unique_kinds` empty while `password_login_enabled` is false. | Turn password sign-in on in the same patch, or keep a kind. |
+| `password_login_required` | [409] Config PATCH turns password sign-in off while the list is empty. | Keep a kind identifying first. |
+| `unique_kind_lockout` | [409] The change would lock people out. `details`: `{kind, locked_out, mfa_locked_out}`. | Show both counts; resend with `confirm_lockout` (Go `ConfigUpdateOptions.ConfirmLockout`) only on an explicit human yes. |
+| `unique_kind_lockout_check_failed` | [503] A count could not be taken (`-1` means "could not count", never "none"). Never escaped by `confirm_lockout`. | Retry later. |
+| `unique_kind_duplicates` | [409] Adding a kind over duplicates inside one org. `details`: `{kind, conflicting_values}`. | Resolve the duplicates, then retry. |
+| `email_keyed_signin_enabled` | [409] Removing `email` while email-keyed identity providers or SSO grants are enabled. `details`: `{identity_providers, sso_domains}`. | Disable or migrate those first. |
+| `require_verified_email_conflict` | [409] `require_verified_email` with a non-identifying email, in either order. | Make email identifying, or drop the requirement. |
+| `idp_requires_identifying_email` | [409] `POST/PATCH /identity-providers`: an email-keyed provider on a platform where email is not identifying. | Make email identifying, or do not enable the provider. |
+| `idp_requires_identifying_phone` | [409] `firebase` provider when phone is not identifying either. | Make phone identifying, or do not enable the provider. |
+| `domain_sso_requires_unique_email` | [409] Domain SSO (ADR-094) routes on a platform where email is not identifying. | Make email identifying first. |
+| `invite_contact_not_identifying` | [400] An invitation (also org-create owner seed, bulk-import invite row) to a contact kind that is not identifying. | Invite by an identifying kind. |
+| `recipient_email_not_identifying` | [400] Ownership transfer naming an email recipient while email is not identifying. | Name the recipient by an identifying kind. |
+| `invalid_invitation_token` | [400] Inspect/accept: unknown, malformed, used, expired, superseded by a resend, withdrawn, or the membership is no longer invited. ONE code, no oracle. | Ask the inviter for a new link. |
+| `contact_already_verified` | [409] `/me/contacts/{id}/proof`: the phone is already proven; nothing was sent. | Nothing to do. |
+| `assertion_replayed` | [409] `POST /auth/login` (token-exchange grant): the workload assertion was already used (two instances fetched the same GCP ID token in the same second). Transient, not a credential rejection. The SDK retries it itself (1 s, then 2 s, re-fetching the credential, 3 attempts in all) and surfaces it only when all three are replayed. | Nothing for a normal start-up; if it surfaces, restart the instance. |
+| `contact_changed` | [409] `/me/contacts/{id}/proof/confirm`: the contact was released or replaced after the send; the code is spent. | Start a fresh proof for the current contact. |
+| `reset_email_not_identifying` | [409] `POST /tenants/{tid}/users/{uid}/password-reset`: no identifying verified email. | Use another recovery path. |
+
+## Split signing, install pass and idempotency codes (issuer spec 0.65.0, UNRELEASED)
+
+> **Added in spec 0.65.0 (unreleased).** These codes are in `issuer/docs/swagger.yaml` 0.65.0 and
+> reach partners only with release A of the split-signing work; until then no issuer answers them.
+> HTTP status is in brackets. Background: `docs/partner-integration-guide.md` §6.8 and §6.9, and
+> issuer ADR-068 / ADR-120. Rulings are cited by number (`plans/2026-10-27-split-signing-*.md`).
+
+### Which endpoint, and what a realm does (`/auth/token`, `/auth/token/partial`, `/auth/login`)
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `split_signing_required` | [409] A mint or login on a SPLIT realm that would need a whole signature: `/auth/token` (and the people and bot grants of `/auth/login`) answer it for every grant except `platform_api_key` (R49) and a platform-token WIF exchange (R53). Added in spec 0.65.0 (unreleased). | Send the call to `POST /auth/token/partial` and finish the half-signed answer with your half. The SDK's `split: true` option does this. |
+| `realm_not_split` | [409] `POST /auth/token/partial` on a realm that uses normal custody. Added in spec 0.65.0 (unreleased). | Use `POST /auth/token`. A configuration mismatch, not a transient fault. |
+| `platform_grant_not_partial` | [400] `POST /auth/token/partial` with `grant_type=platform_api_key` (R49), or a token exchange that yields a PLATFORM token (R53). The platform key is never split (R45). The grant check runs first, so this wins over `realm_not_split` on a normal realm. Added in spec 0.65.0 (unreleased). | Send the platform grant to `POST /auth/token`, which serves it as a finished `Bearer` token on every realm. |
+| `platform_key_not_a_user_key` | [400] `grant_type=user_api_key` presented an `rk_…` platform key (R24), checked before any lookup. Added in spec 0.65.0 (unreleased). | Use a `uk_live_…` user key, or `grant_type=platform_api_key` for a platform key. |
+| `signing_key_unavailable` | [409] `/auth/token/partial`: RealmID cannot use its half of the split key (R39). Added in spec 0.65.0 (unreleased). | The partner SDK runs an emergency rotation (below). Do not retry in a loop. |
+
+### Install pass and integration endpoint (ADR-082/083, R34, R47)
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `integration_grant_requires_install_pass` | [400] The removed direct `integration_installation` grant on `POST /auth/login`, authenticated by the source's `rk_live_` key (R34, R48). Added in spec 0.65.0 (unreleased). | Mint an install pass at `POST /integrations/installations/{install_id}/pass` and present it at the TARGET's token endpoint. |
+| `missing_install_pass` | [400] `grant_type=integration_installation` on `/auth/token` or `/auth/token/partial` without `install_pass`. Added in spec 0.65.0 (unreleased). | Send the `ip_…` pass. |
+| `install_pass_invalid` | [401] The `install_pass` is unknown, expired (5 minutes) or already used. A pass is a single exchange (R47). Added in spec 0.65.0 (unreleased). | Mint a fresh pass. Never retry a spent one. |
+| `integration_endpoint_missing` | [409] An integration install into an org whose platform has not registered an `integration_token_endpoint` (R47). Added in spec 0.65.0 (unreleased). | The target platform registers its endpoint first. The base realm registers none, so nothing installs into it. |
+| `missing_source_org_id` | [400] `POST /integrations/installations/{install_id}/pass` without `source_org_id`, the acting org of the source platform. It is the only attribution the target org gets for the acting call (R54b). Added in spec 0.65.0 (unreleased). | Send `source_org_id` in the request body. |
+| `invalid_installation_id` | [400] The `install_id` on the install-pass mint is malformed. Added in spec 0.65.0 (unreleased). | Use the id returned when the integration was installed. |
+| `invalid_integration_endpoint` | [400] The registered `integration_token_endpoint` is not an https URL. Added in spec 0.65.0 (unreleased). | Register an https URL. |
+| `integration_endpoint_unverified` | [422] The registration test-call to the endpoint failed; the message names what the call got back. Added in spec 0.65.0 (unreleased). | Fix the handler (the SDK's ready-made handler answers the canary), then register again. |
+
+### Split-key custody, handshake and rotation (`/platforms/{id}/signing-keys/split/...`)
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `split_key_size_unsupported` | [400] Upload of a key that is not RSA-2048. Added in spec 0.65.0 (unreleased). | Generate an RSA-2048 key. |
+| `split_kid_in_use` | [409] Upload with a `kid` the realm already has. The caller chooses the kid. Added in spec 0.65.0 (unreleased). | Choose an unused `kid`. |
+| `rotation_lease_held` | [409] Another holder has the 5-minute rotation lease (one holder at a time). Added in spec 0.65.0 (unreleased). | Wait for the lease to end or the other pod to finish; do not rotate from two pods. |
+| `emergency_rotation_cap_reached` | [429] Emergency rotations are counted per realm per UTC day; this is past the cap (R39). Added in spec 0.65.0 (unreleased). | Stop and alert a human; the cap exists to bound a runaway loop. |
+| `split_key_not_found` | [404] A handshake or challenge for a split key the realm does not have. Added in spec 0.65.0 (unreleased). | Upload the key first. |
+| `handshake_failed` | [401] The completed signature over the challenge did not verify. A failure stops and alerts, it never loops (G16). Added in spec 0.65.0 (unreleased). | Check the share and its version; fix before retrying. The key does not become active. |
+| `not_in_overlap` | [409] Extend or cancel while the key is not in the overlap window (R36). Added in spec 0.65.0 (unreleased). | Read the key's status first. |
+| `downgrade_already_pending` | [409] Start a return to normal custody while one is under way. Added in spec 0.65.0 (unreleased). | Wait for it or cancel it. |
+| `no_pending_downgrade` | [404] Cancel with no downgrade pending. Added in spec 0.65.0 (unreleased). | Nothing to cancel. |
+| `not_available_to_api_keys` | [403] A downgrade call made with an API key. Only a human realm-owner session may start one (R55: API keys are refused the never-via-key operations). Added in spec 0.65.0 (unreleased). | Use an owner session. |
+
+### Idempotency-Key (G11; parameter `IdempotencyKey` on 14 mutating operations)
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `idempotency_key_reused` | [422] The same `Idempotency-Key` was sent with a different body. Added in spec 0.65.0 (unreleased). | A key names ONE request. Generate a new key for a different body. |
+| `idempotency_in_progress` | [409] A duplicate arrived while the first request with that key is still running. Added in spec 0.65.0 (unreleased). | Wait and retry with the SAME key and body; you then get the stored response. |
+
+Swagger 0.65.0 lists these two only in the parameter description, not on the operations'
+responses (critic finding #6, unresolved at the issuer). A request without the header behaves as before.
+
 ## Management / generic codes
 
 These fire from any HTTP-backed call.
@@ -423,7 +521,7 @@ These fire from any HTTP-backed call.
 | `forbidden`     | Server returned 403. Role does not permit the operation.              | Surface a permission error. Check that the API key's role covers the call.                              |
 | `not_found`     | Server returned 404.                                                  | Treat as resource-not-present. Useful for `realm.tenants.get(unknownId)`.                                |
 | `conflict`      | Server returned 409. Optimistic-concurrency or unique-constraint violation. | Re-fetch and retry, or surface to user (e.g. duplicate tenant name).                                |
-| `rate_limited`  | Server returned 429.                                                  | Read `Retry-After` (the SDK puts it in `details`). Back off and retry.                                  |
+| `rate_limited`  | Server returned 429.                                                  | Read `Retry-After` from the error's `retryAfter` field (Go `RetryAfter`, ts `retryAfterSeconds`, Java `getRetryAfter()`). Back off and retry. |
 | `bad_request`   | Server returned 400 / 412 with a non-mfa code, or the SDK rejected your input shape. | Inspect `details` for field-level info; fix the request.                                       |
 | `network`       | Transport failure — DNS, TCP, TLS handshake, timeout.                 | Treat as transient. The SDK does not retry; caller policy varies.                                       |
 | `server_error`  | Server returned 5xx, or returned an unexpected wire shape.            | Treat as transient. If repeating, capture the request id (in `details.request_id` if present) for support. |
