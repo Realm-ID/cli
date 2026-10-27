@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-31 entries. Newest first.
+32 entries. Newest first.
 
+- [2026-10-27 — Split signing and BFF-only CLI: planned docs first, vendored error reference untouched](#2026-10-27--split-signing-and-bff-only-cli-planned-docs-first-vendored-error-reference-untouched)
 - [2026-10-21 — goreleaser's Go 1.23 is a declared per-job override, not drift](#2026-10-21--goreleasers-go-123-is-a-declared-per-job-override-not-drift)
 - [2026-10-20 — Fleet par: todo-hygiene and workflow-preflight vendored; actionlint installed from a checksummed tarball](#2026-10-20--fleet-par-todo-hygiene-and-workflow-preflight-vendored-actionlint-installed-from-a-checksummed-tarball)
 - [2026-10-19 — proof and invitation resend exposed in the CLI (owner ruling)](#2026-10-19--proof-and-invitation-resend-exposed-in-the-cli-owner-ruling)
@@ -40,6 +41,28 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-27 — Split signing and BFF-only CLI: planned docs first, vendored error reference untouched
+
+The CLI is moving to BFF-only with split signing (rulings R6, R7, R24, R40, R41, R47; gap
+defaults G13, G14, G15; plan `plans/2026-10-27-split-signing-v2.md` § 5.1 in the root repo).
+Nothing is built yet; this entry records the documentation decisions made first.
+
+- README.md gains a "Planned" section (marked NOT BUILT YET) with the `signing-keys` family
+  (G14: init, upload, status, extend, cancel, pin, rotate, recover, downgrade), the `--share-to`
+  targets including `redis:<url>` keyed by `REALM_ID_SHARE_KEK` (G13), the exit codes 6-9 and the
+  G15 error-code names (the W0-proposed names are starred; the owner may rename them).
+- The service-mode text in today's README (`rk_live_` in `REALM_ID_API_KEY`, issuer-direct typed
+  tree, the provisioning-run advice, the `doctor` key check) is tagged "removed by R6/R7" but kept,
+  because it still describes the shipped binary. Delete it when the code is removed.
+- "Run `init` yourself, not via an agent" (J5) is stated in the README: the private key and the
+  kept share must not pass through an agent's context.
+- `cmd/realm-id/error-reference.md` is NOT edited. It is vendored byte-for-byte from the sdk's
+  `docs/error-reference.md`, embedded in the binary, and pinned by `ERROR_REFERENCE_CONTRACT`
+  (sha256, checked by `TestErrorReferenceMatchesItsPin`); a hand edit fails the build. It has no
+  hand-written parts. The new codes reach `explain` by landing in the sdk error reference and
+  running `scripts/revendor-error-reference.sh <sdk sha>`.
+- Exit 401 moving from 7 to 6 will be a `### Breaking` CHANGELOG item when the code ships.
 
 ## 2026-10-21 — goreleaser's Go 1.23 is a declared per-job override, not drift
 
