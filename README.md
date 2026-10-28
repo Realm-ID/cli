@@ -317,8 +317,10 @@ factor). Any other key or workload session gets `needs_human`, exit 8 (R40). Oth
 (`tenants delete`, `tenants transfer-owner`, `users deactivate`) are human-session only with
 step-up; a key or workload session exits 8 (R40). The CLI reads `x-realmid-human-only` from its vendored spec (G12).
 Per R55 the issuer refuses EVERY key session (capped or uncapped `uk_live_`) on its never-via-key
-list. R56 (a platform token managing service accounts) is superseded by R64/R65: administration
-is people-only, so SA create/change/delete is a person's act through the CLI or console.
+list. R56 (a platform token managing service accounts) is superseded by R64/R65: a bare
+platform token never manages service accounts: SA create/change/delete takes a carried actor
+holding `service_accounts:manage` (R64, R67; a backend job may carry a service account), which for
+the CLI is a person's act.
 Also `platform bootstrap [--split]`, `doctor --split`, `explain <code>` rows for the new codes,
 `help --json`, completion, `export-config` and `--dry-run` (C5). Removed against the earlier
 draft: `activate`, `repin`, `retire`, `emergency-retire`, and the `signing split …` family name.
@@ -339,6 +341,11 @@ rename them): `split_signing_required` 409, `realm_not_split` 409, `platform_key
 `integration_endpoint_unverified`* 422, `integration_grant_requires_install_pass`* 400,
 `downgrade_already_pending`* 409, `login_grant_removed` 400, `platform_bearer_required` 401 and
 `actor_required` 403 (G19; all in the one release, R62).
+
+Partner-visible changes in that release also include R77 (first-login MFA enrolment is front door,
+first login only per R84; `401 x_user_token_required` is retired for `403 actor_required`, R78) and
+R79 (BREAKING: a refresh on a `user_api_key` session answers `401 m2m_refresh_withdrawn`; sign in
+again with the key).
 
 `explain` answers these only after the sdk error reference carries them and
 `cmd/realm-id/error-reference.md` is re-vendored (see above); until then it returns
