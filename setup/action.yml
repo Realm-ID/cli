@@ -1,0 +1,84 @@
+name: 'Realm-ID CLI setup'
+description: >-
+  Installs a pinned, checksum-verified realm-id CLI release on a Linux runner and, by default,
+  signs the job in as a workload by workload identity federation (realm-id auth workload).
+  The calling job needs `permissions: id-token: write` for the sign-in. Use as
+  `uses: Realm-ID/cli/setup@<full commit SHA> # vX.Y.Z` (R25).
+
+# R25: lives in the public Realm-ID/cli repo and is released with the CLI, so the two cannot drift.
+# R63: the CLI is BFF-only; `audience` is the BFF, never the issuer.
+
+inputs:
+  version:
+    description: 'CLI release to install, for example 0.6.0 or v0.6.0. Required: there is no "latest".'
+    required: true
+  login:
+    description: 'Run `realm-id auth workload` after installing. Set to "false" to install only.'
+    required: false
+    default: 'true'
+  provider:
+    description: 'OIDC provider passed to `auth workload --provider`.'
+    required: false
+    default: 'github'
+  audience:
+    description: 'Audience of the OIDC token (the BFF that will accept it).'
+    required: false
+    default: 'https://api.realmid.dev'
+
+outputs:
+  version:
+    description: 'The version string reported by the installed binary.'
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install realm-id
+      id: install
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [ "${RUNNER_OS}" != "Linux" ]; then
+          echo "::error::Realm-ID/cli/setup supports Linux runners only (got ${RUNNER_OS})"
+          exit 1
+        fi
+        case "${RUNNER_ARCH}" in
+          X64) arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "::error::unsupported runner arch ${RUNNER_ARCH}"; exit 1 ;;
+        esac
+        ver="${INPUT_VERSION#v}"
+        case "${ver}" in
+          ''|*[!0-9A-Za-z.+-]*) echo "::error::version '${INPUT_VERSION}' is not a release number"; exit 1 ;;
+        esac
+        name="realm-id_${ver}_linux_${arch}.tar.gz"
+        base="https://github.com/Realm-ID/cli/releases/download/v${ver}"
+        dir="${RUNNER_TEMP}/realm-id-setup"
+        mkdir -p "${dir}/bin"
+        curl -fsSL --retry 3 -o "${dir}/${name}" "${base}/${name}"
+        curl -fsSL --retry 3 -o "${dir}/checksums.txt" "${base}/checksums.txt"
+        # The checksum file names the asset; verify exactly that line and require that it was found.
+        grep -F " ${name}" "${dir}/checksums.txt" > "${dir}/expected.txt" \
+          || { echo "::error::${name} is not listed in checksums.txt"; exit 1; }
+        (cd "${dir}" && sha256sum -c expected.txt)
+        tar -xzf "${dir}/${name}" -C "${dir}/bin" realm-id
+        echo "${dir}/bin" >> "${GITHUB_PATH}"
+        reported="$("${dir}/bin/realm-id" --version)"
+        echo "version=${reported}" >> "${GITHUB_OUTPUT}"
+        echo "installed: ${reported}"
+
+    - name: Sign in by workload identity
+      if: ${{ inputs.login == 'true' }}
+      shell: bash
+      env:
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_AUDIENCE: ${{ inputs.audience }}
+      run: |
+        set -euo pipefail
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::no OIDC token available: the calling job needs 'permissions: id-token: write'"
+          exit 1
+        fi
+        realm-id auth workload --provider "${INPUT_PROVIDER}" --audience "${INPUT_AUDIENCE}"

@@ -1,0 +1,60 @@
+name: WIF self-test
+
+# Proves the R25 setup action end to end from a REAL Actions run: install the pinned CLI, sign in by
+# workload identity (GitHub OIDC token exchanged at the BFF), and read the session back. It needs a
+# federation binding for this repo (see root infra/scripts/ensure-ops-binding.sh), so it is a manual
+# run only: no push or pull_request trigger, which also keeps it out of the preflight parity map.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'CLI release to install (for example 0.6.0)'
+        required: true
+        type: string
+      audience:
+        description: 'OIDC audience (the BFF)'
+        required: false
+        default: 'https://api.realmid.dev'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wif-selftest-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    # GitHub's implicit default omits pipefail
+    shell: bash
+
+jobs:
+  selftest:
+    name: Workload sign-in
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # the OIDC token the workload sign-in exchanges
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install and sign in
+        id: setup
+        uses: ./setup
+        with:
+          version: ${{ inputs.version }}
+          audience: ${{ inputs.audience }}
+
+      - name: Read the session back
+        env:
+          WANT_VERSION: ${{ inputs.version }}
+        run: |
+          set -o pipefail
+          realm-id --version | grep -F "${WANT_VERSION#v}"
+          realm-id auth whoami --output json > whoami.json
+          # A sign-in that produced no identity must fail here, not pass on exit status alone.
+          test -s whoami.json
+          jq -e 'type == "object"' whoami.json > /dev/null
+          echo "workload session established"

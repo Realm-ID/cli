@@ -1,0 +1,100 @@
+# Partner template (I8): rotate the realm's platform API key (rk_live_) from CI.
+#
+# Copy to the PARTNER repo's .github/workflows/. Flow: sign in by workload identity -> mint a second
+# key -> write it to the secret store -> wait until the partner BFF reports the new key
+# -> revoke the old key. Every call goes through api.realmid.dev (R63), never the issuer.
+#
+# Prerequisites
+#   * A base-realm `platform_mgmt_api` federation binding for THIS repo (I7, made by the partner owner).
+#     That identity can only mint, list and revoke platform keys (R66) and is refused at /auth/*.
+#   * A platform holds at most TWO active rk_live_ keys (issuer cap, confirmed in P2): one steady
+#     state key plus this rotation slot. A third mint is `409 too_many_api_keys`.
+#   * Repository variables REALMID_PLATFORM (platform id) and READY_URL (partner BFF readiness URL that
+#     reports its active key ids); secret ROTATION_GH_TOKEN (can write Actions secrets and variables).
+#
+# Resume safety: the old key's id is kept in the repository variable PENDING_OLD_KEY_ID between the mint
+# and the revoke. A re-run with it set skips the mint and finishes the wait + revoke; with it unset it
+# starts a new rotation. Nothing is revoked until the new key is live.
+#
+# [inferred] Verb flags and JSON field names below (`id`, `key`, `active_key_ids`) follow the README's
+# "platform-keys create|revoke" and the api-keys response; platform-keys is planned (W5). Confirm
+# against `realm-id platform-keys --help` and the partner BFF's readiness body before use.
+name: Rotate platform key
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 1 * *' # monthly
+
+permissions:
+  contents: read
+  id-token: write # workload sign-in
+
+concurrency:
+  group: rotate-platform-key
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.ROTATION_GH_TOKEN }}
+      PLATFORM: ${{ vars.REALMID_PLATFORM }}
+      READY_URL: ${{ vars.READY_URL }}
+      CURRENT_KEY_ID: ${{ vars.CURRENT_KEY_ID }}
+      PENDING_OLD_KEY_ID: ${{ vars.PENDING_OLD_KEY_ID }}
+    steps:
+      # Pin to the full commit SHA of the CLI release tag, with the version in the comment.
+      - uses: Realm-ID/cli/setup@REPLACE_WITH_RELEASE_COMMIT_SHA # vX.Y.Z
+        with:
+          version: 'X.Y.Z'
+
+      - name: Mint the new key
+        if: ${{ env.PENDING_OLD_KEY_ID == '' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          realm-id platform-keys create --platform "${PLATFORM}" --label "ci-rotation-$(date -u +%Y%m%d)" \
+            --out "${RUNNER_TEMP}/new-key.json" > "${RUNNER_TEMP}/create.json"
+          new_id="$(jq -r '.id' "${RUNNER_TEMP}/create.json")"
+          test -n "${new_id}" && test "${new_id}" != null
+          # Store first: if this fails the old key is untouched and still live.
+          jq -r '.key' "${RUNNER_TEMP}/new-key.json" | gh secret set REALMID_PLATFORM_KEY --repo "${GITHUB_REPOSITORY}"
+          gh variable set PENDING_OLD_KEY_ID --repo "${GITHUB_REPOSITORY}" --body "${CURRENT_KEY_ID:-none}"
+          gh variable set CURRENT_KEY_ID --repo "${GITHUB_REPOSITORY}" --body "${new_id}"
+          rm -f "${RUNNER_TEMP}/new-key.json"
+          echo "NEW_KEY_ID=${new_id}" >> "${GITHUB_ENV}"
+          echo "OLD_KEY_ID=${CURRENT_KEY_ID:-none}" >> "${GITHUB_ENV}"
+
+      - name: Resume an interrupted rotation
+        if: ${{ env.PENDING_OLD_KEY_ID != '' }}
+        run: |
+          echo "NEW_KEY_ID=${CURRENT_KEY_ID}" >> "${GITHUB_ENV}"
+          echo "OLD_KEY_ID=${PENDING_OLD_KEY_ID}" >> "${GITHUB_ENV}"
+
+      - name: Wait for the partner BFF to report the new key
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            ids="$(curl -fsS "${READY_URL}" | jq -r '.active_key_ids // [] | join(",")' || true)"
+            case ",${ids}," in
+              *",${NEW_KEY_ID},"*) echo "new key reported live"; exit 0 ;;
+            esac
+            sleep 20
+          done
+          echo "::error::partner BFF did not report ${NEW_KEY_ID}; the old key is NOT revoked"
+          exit 1
+
+      - name: Revoke the old key
+        run: |
+          set -euo pipefail
+          if [ "${OLD_KEY_ID}" != none ]; then
+            realm-id platform-keys revoke --platform "${PLATFORM}" --keyId "${OLD_KEY_ID}"
+          fi
+          gh variable delete PENDING_OLD_KEY_ID --repo "${GITHUB_REPOSITORY}" || true
+          echo "rotation complete: ${NEW_KEY_ID} active, ${OLD_KEY_ID} revoked"
