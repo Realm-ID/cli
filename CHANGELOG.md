@@ -3,6 +3,14 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## Unreleased
+
+### Changed
+
+- `verify-token` comment corrected: the MFA-challenge and session-revoke tokens are signed by a
+  separate issuer-internal key that is never published (ADR-068 A7.b); refusal behaviour is
+  unchanged. Base-trust wording removed from `signing-keys pin` help text and README.
+
 ## v0.6.0 — split signing v3: BFF-only CLI, `signing-keys`, key and workload sessions
 
 ### Breaking

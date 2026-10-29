@@ -295,7 +295,7 @@ The `signing-keys` family (G14):
 | `signing-keys upload --realm R --bundle … [--overlap 24h]` | Sends `n`, `e`, `d_ri`, `kid`, then drops `d_ri` from the bundle file. The FIRST upload takes no lease (C5#1). Human only. |
 | `signing-keys status --realm R` | The custody document, as the server returns it. |
 | `signing-keys extend --realm R --by D` / `cancel --realm R` | Extend the overlap / cancel it (also allowed in `overlap_pending`, C5#2). |
-| `signing-keys pin --realm R` | Print the public-only standard JWKS `{"keys":[…]}` for the base-trust secret (C5#6; a bare array is refused downstream). |
+| `signing-keys pin --realm R` | Print the public-only standard JWKS `{"keys":[…]}` as a standard JWKS (C5#6; a bare array is refused downstream). |
 | `signing-keys rotate --realm R --share-to T [--kid K] [--overlap D]` | Takes the rotation lease itself (`reason: rotation`), deals a new key, stores the new share in T beside the old one, and uploads with `lease_id` (C5#1). `409 rotation_lease_held` exits 4 and uploads nothing. |
 | `signing-keys recover --realm R [--kid K] [--share-to T]` | The same with `reason: recovery` (R92); prints the new bundle masked on stdout unless T is given (R39). The emergency cap (`429`) exits 1. |
 | `signing-keys downgrade --realm R [--cosign-from file:PATH] [--kid K] [--cancel]` | With `--cosign-from`: takes the downgrade's OWN challenge (`…/split/downgrade/challenge`, C5#4), completes it with the partner half and sends `{cosig}` (immediate). Without: the 24h path, no challenge. `--cancel` deletes a pending downgrade. |

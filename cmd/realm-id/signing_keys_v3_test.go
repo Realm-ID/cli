@@ -222,7 +222,7 @@ func TestSigningKeysPin_PrintsAPublicOnlyStandardJWKS(t *testing.T) { // R23 + C
 	var jwks struct {
 		Keys []map[string]any `json:"keys"`
 	}
-	// C5#6: the base-trust secret is a standard JWKS object; a bare array is refused downstream.
+	// C5#6: the pinned output is a standard JWKS object; a bare array is refused downstream.
 	if err := json.Unmarshal([]byte(stdout), &jwks); err != nil || len(jwks.Keys) != 1 {
 		t.Fatalf("pin output is not a {keys:[…]} JWKS: %v\n%s", err, stdout)
 	}

@@ -223,8 +223,11 @@ func verifyToken(token, issuerBase, wantAud string, now time.Time, client *http.
 	}
 	// The issuer's internal challenge tokens (authsvc mintBaseJWT: MFA challenge
 	// "auth:mfa:challenge", session-revoke "auth:sessions:revoke") are signed by
-	// the same realm key with typ JWT, so the AccessOnly rule above does not
-	// catch them. They are single-purpose and must never be used as a bearer.
+	// a separate issuer-internal key that is never published (ADR-068 A7
+	// amendment 2026-10-29, A7.b), so a JWKS-based verify cannot validate them
+	// anyway. This scope check refuses one by its claims first, with a clear
+	// reason instead of a signature failure; they are single-purpose and must
+	// never be used as a bearer.
 	if sub, _ := claims["sub"].(string); sub == "authsvc" {
 		if sc, _ := claims["scope"].(string); strings.HasPrefix(sc, "auth:") {
 			bad("not_an_access_token", "this is an internal RealmID challenge token (scope %q), not an access token", sc)

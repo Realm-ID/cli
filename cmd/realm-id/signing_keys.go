@@ -506,7 +506,7 @@ func skUpload(cfg *Config, f *verbFlags, realm, base string) int {
 
 // ---- pin ----
 
-// skPin prints the public-only standard JWKS for the base-trust secret (C5#6).
+// skPin prints the public-only standard JWKS as a standard JWKS (C5#6).
 func skPin(cfg *Config, base string) int {
 	var out struct {
 		KID string `json:"kid"`
