@@ -40,6 +40,11 @@ type Config struct {
 	// per-command --tenant flag. Setting it re-pins the BFF session via
 	// POST /switch-tenant (no re-login).
 	Tenant string `json:"tenant,omitempty"`
+	// SessionClass is "" for a person (device flow) or "workload" (`auth workload`, a
+	// CI OIDC session); SessionRole is the actor role the BFF reported for it. A key
+	// session is never stored: it is derived per run from REALM_ID_API_KEY.
+	SessionClass string `json:"session_class,omitempty"`
+	SessionRole  string `json:"session_role,omitempty"`
 }
 
 // configPath honours XDG (~/.config/realm-id/config.json), with a

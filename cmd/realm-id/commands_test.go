@@ -119,64 +119,44 @@ func TestBuildBody(t *testing.T) {
 	}
 }
 
-// TestResolveCredential_ServiceModeExchangesTheKey pins the fix for a bug the
-// PREVIOUS version of this test actively protected: it asserted
-// `bearer == "rk_live_1"`, i.e. that the raw api key is sent as the bearer.
-// That is what the CLI did, and the issuer has never accepted it — requireAuth
-// runs the bearer through LocalVerifier.Verify, which rejects anything that is
-// not a 3-part JWT. The test encoded the implementation instead of the
-// contract, so it passed for the whole time service mode was broken. Asserting
-// the EXCHANGE, against a server that behaves like the issuer, is what makes it
-// a test of the contract.
-func TestResolveCredential_ServiceModeExchangesTheKey(t *testing.T) {
+// TestResolveCredential_UserKeyIsExchangedAtTheBFF replaces the service-mode tests (v3: no
+// service mode, no issuer calls, R6/R63). A uk_live_ key is exchanged ONCE per process at the
+// BFF's /auth/key-session, in the body, and its session token becomes the bearer on /api.
+func TestResolveCredential_UserKeyIsExchangedAtTheBFF(t *testing.T) {
 	platformTokenCache = ""
 	t.Cleanup(func() { platformTokenCache = "" })
 
-	var gotPath, gotGrant, gotKey, gotAuthz string
+	var gotPath, gotKey, gotAuthz string
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		gotPath = r.URL.Path
 		gotAuthz = r.Header.Get("Authorization")
 		var in struct {
-			GrantType string `json:"grant_type"`
-			APIKey    string `json:"api_key"`
+			APIKey string `json:"api_key"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&in)
-		gotGrant, gotKey = in.GrantType, in.APIKey
+		gotKey = in.APIKey
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"eyJ.header.sig","expires_in":600}`))
+		_, _ = w.Write([]byte(`{"session_token":"rsid_key","session_class":"key"}`))
 	}))
 	defer srv.Close()
 
-	t.Setenv("REALM_ID_ISSUER", srv.URL)
-	t.Setenv("REALM_ID_BFF", "https://bff.example")
-	t.Setenv("REALM_ID_API_KEY", "rk_live_1")
+	t.Setenv("REALM_ID_BFF", srv.URL)
+	t.Setenv("REALM_ID_ISSUER", "http://127.0.0.1:1") // never reached
+	t.Setenv("REALM_ID_API_KEY", "uk_live_1")
 
 	base, bearer, err := resolveCredential(&Config{SessionToken: "sess"})
 	if err != nil {
-		t.Fatalf("service mode: unexpected error: %v", err)
+		t.Fatalf("key session: unexpected error: %v", err)
 	}
-	if base != srv.URL {
-		t.Errorf("base = %q, want the issuer %q", base, srv.URL)
+	if base != srv.URL+"/api" || bearer != "rsid_key" {
+		t.Errorf("base=%q bearer=%q, want the BFF /api passthrough + the key session token", base, bearer)
 	}
-	if bearer == "rk_live_1" {
-		t.Fatal("service mode still sends the RAW api key as the bearer — the issuer answers 401 invalid bearer")
+	if gotPath != "/auth/key-session" || gotKey != "uk_live_1" || gotAuthz != "" {
+		t.Errorf("exchange sent path=%q key=%q authz=%q; want POST /auth/key-session, the key in the body, no bearer",
+			gotPath, gotKey, gotAuthz)
 	}
-	if bearer != "eyJ.header.sig" {
-		t.Errorf("bearer = %q, want the exchanged platform JWT", bearer)
-	}
-	if gotPath != "/auth/login" || gotGrant != "platform_api_key" || gotKey != "rk_live_1" {
-		t.Errorf("exchange sent path=%q grant=%q key=%q; want POST /auth/login platform_api_key + the raw key",
-			gotPath, gotGrant, gotKey)
-	}
-	// The key travels in the BODY of the bootstrap call, never as a bearer —
-	// that is the whole point of the two-endpoint surface (ADR-051).
-	if gotAuthz != "" {
-		t.Errorf("exchange sent Authorization=%q; the bootstrap call must be unauthenticated", gotAuthz)
-	}
-
-	// Cached for the process: one command must not re-exchange.
 	if _, _, err := resolveCredential(&Config{SessionToken: "sess"}); err != nil {
 		t.Fatalf("second resolve: %v", err)
 	}
@@ -195,17 +175,17 @@ func TestResolveCredential_ExchangeFailureIsReported(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	t.Setenv("REALM_ID_ISSUER", srv.URL)
-	t.Setenv("REALM_ID_API_KEY", "rk_live_bad")
+	t.Setenv("REALM_ID_BFF", srv.URL)
+	t.Setenv("REALM_ID_API_KEY", "uk_live_bad")
 
 	_, _, err := resolveCredential(&Config{})
 	if err == nil {
 		t.Fatal("a rejected api key must surface an error, not an empty bearer")
 	}
-	// The issuer's own body must reach the user: "401" alone leaves them unable
+	// The BFF's own body must reach the user: "401" alone leaves them unable
 	// to tell a bad key from a bad URL.
 	if !strings.Contains(err.Error(), "invalid_api_key") {
-		t.Errorf("error %q does not carry the issuer's response body", err)
+		t.Errorf("error %q does not carry the response body", err)
 	}
 }
 

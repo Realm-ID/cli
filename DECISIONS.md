@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-34 entries. Newest first.
+35 entries. Newest first.
 
+- [2026-10-29 — E6: split-signing CLI built — BFF-only sessions, own crypto, exit 6/8/9](#2026-10-29--e6-split-signing-cli-built--bff-only-sessions-own-crypto-exit-689)
 - [2026-10-27 — W0b: planned CLI docs follow R60-R76 (human-only verbs, exit 6/7 for G19)](#2026-10-27--w0b-planned-cli-docs-follow-r60-r76-human-only-verbs-exit-67-for-g19)
 - [2026-10-27 — Planned key-session docs follow R55-R58](#2026-10-27--planned-key-session-docs-follow-r55-r58)
 - [2026-10-27 — Split signing and BFF-only CLI: planned docs first, vendored error reference untouched](#2026-10-27--split-signing-and-bff-only-cli-planned-docs-first-vendored-error-reference-untouched)
@@ -43,6 +44,38 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-29 — E6: split-signing CLI built — BFF-only sessions, own crypto, exit 6/8/9
+
+The planned split-signing CLI (v3 plan § 3.9, § 7.2, W6 row E6) is built. Decisions a later session
+must not re-litigate:
+
+- **The CLI carries its own split crypto on the standard library**, not `sdk/go` via a `replace`.
+  A local `replace ../sdk/go` breaks any build that does not have the sdk repo beside it (CI,
+  goreleaser, the Docker context), and the CLI needs only the envelope v1, the dealer split and
+  the cosignature completion (about 150 lines). The E2 tests verify with an independent
+  implementation, which is the drift guard; revisit when the sdk publishes a stable crypto module.
+- **Credentials are BFF-only.** `uk_live_` becomes a key session at `POST /auth/key-session`
+  `{api_key, tenant_id?}`; a CI runner's OIDC token becomes a workload session at `POST
+  /auth/workload-session` `{subject_token}` (dispatcher's wire; the BFF implements the same). The
+  workload class and actor role are stored in the config file, a key session never is.
+- **`needs_human` is decided from local state before any request**, so a refused verb sends nothing,
+  not even the key exchange. R72 is the only exception (`platform-keys create` for a
+  `platform_mgmt_api` workload actor).
+- **Exit 6 vs 7** follows the status (401 vs 403) for every verb; exit 9 only for the split-signing
+  codes (`handshake_failed`, `share_load_failed`, a share or cosignature the CLI cannot complete).
+- **E2's flag and format choices stand** (recorded as reversible dispatcher calls): KEK in
+  `REALM_ID_SHARE_KEK` as base64url without padding, 32 bytes; `bundle.json` + `public.json`.
+- **`gsm:` and `redis:` share targets are refused with exit 2** (SDK add-ons; a redis client would
+  be the CLI's first dependency of that kind). `file:` and `stdout` only.
+- **`user-api-keys create` resolves `{uid}` from `GET /me` `user_id`, falling back to the literal
+  `me`** when `--user` is absent. Unverified: whether the issuer accepts `me` for `{uid}`.
+- **`needs_human` and `split_upload_not_allowed` are answered by a CLI-local `explain` table**
+  because the vendored error reference is hash-gated and re-vendored only at a tag; neither is in
+  the sdk's reference yet.
+- Old tests that encoded removed behaviour were changed in the same change: `TestExitForStatus`
+  and `TestWhoami_DeadSession…` (401 is 6), and the two `TestResolveCredential_ServiceMode*` tests
+  (now the BFF key exchange).
 
 ## 2026-10-27 — W0b: planned CLI docs follow R60-R76 (human-only verbs, exit 6/7 for G19)
 

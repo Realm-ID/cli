@@ -3,6 +3,34 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## Unreleased — split signing v3: BFF-only CLI, `signing-keys`, key and workload sessions
+
+### Breaking
+
+- **A `401` now exits 6 (unauthenticated), no longer 7.** 7 stays forbidden (`403`, including
+  `actor_required`); `platform_bearer_required` (401) exits 6. Agents that branched on 7 for an
+  expired session must branch on 6 (G19).
+- **No service mode.** `REALM_ID_API_KEY=rk_live_…` no longer signs the CLI in and the typed tree
+  never calls the issuer: `rk_live_` exits 2 offline with a pointer to `user-api-keys create`
+  (`doctor` still reads it, R57). A `uk_live_` key becomes a BFF key session (`POST
+  /auth/key-session`, key in the body).
+
+### Added
+
+- `realm-id signing-keys init|upload|status|pin|extend|cancel|rotate|recover|downgrade` (G14).
+  `rotate` and `recover` take the rotation lease themselves and upload with `lease_id` (owner
+  ruling C5#1); `downgrade --cosign-from file:PATH` takes the downgrade's own challenge (C5#4);
+  `pin` prints a standard `{"keys":[…]}` JWKS (C5#6). Example: `realm-id signing-keys init --realm R
+  --kid k1 --share-to file:shares.json --out ./out`. `--share-to` takes `file:` (sealed under
+  `REALM_ID_SHARE_KEK`) and `stdout` only; `gsm:`/`redis:` are not in this build.
+- `realm-id auth workload` (CI OIDC token to a workload session), `user-api-keys create`,
+  `platform-keys create`; a `412` step-up takes `--totp` and retries (R40/R41).
+- Exit 8 (`needs_human`: person-only verbs in a key or workload session send nothing; R72's
+  `platform_mgmt_api` actor may mint platform keys) and exit 9 (share, cosignature, handshake).
+- `explain needs_human` and `explain split_upload_not_allowed` from a CLI-local table (the vendored
+  error reference is re-vendored only at a release tag).
+- The embedded spec is NOT re-vendored in this change.
+
 ## v0.5.1 — phone proof and invitation resend commands (owner ruling) (2026-10-19)
 
 ### Added — `realm-id contacts proof`, `realm-id proof confirm`, `realm-id invitations resend`

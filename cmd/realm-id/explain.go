@@ -239,7 +239,7 @@ func cmdExplain(args []string) int {
 	if strings.TrimSpace(h.pos[0]) == "messaging" {
 		return explainMessaging(wantJSON(h.flags["output"]))
 	}
-	res := explainCode(strings.TrimSpace(h.pos[0]), parseErrorReference(errorReferenceMD))
+	res := explainCode(strings.TrimSpace(h.pos[0]), append(parseErrorReference(errorReferenceMD), cliLocalErrorRows()...))
 	if wantJSON(h.flags["output"]) {
 		writeJSON(res)
 	} else {

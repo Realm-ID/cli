@@ -400,7 +400,7 @@ func TestConfigSetTenant_FailedSwitchNotPersisted(t *testing.T) {
 func TestExitForStatus(t *testing.T) {
 	cases := map[int]int{
 		200:                            exitOK,
-		http.StatusUnauthorized:        exitForbidden,
+		http.StatusUnauthorized:        exitUnauthenticated, // G19: 401 is 6, split from 7
 		http.StatusForbidden:           exitForbidden,
 		http.StatusNotFound:            exitNotFound,
 		http.StatusConflict:            exitConflict,
@@ -616,8 +616,8 @@ func TestWhoami_DeadSessionNamesTheRemedy(t *testing.T) {
 			if strings.Contains(stdout, "auth login") {
 				t.Errorf("the human hint leaked into stdout, breaking the JSON contract.\ngot: %q", stdout)
 			}
-			if exit != exitForbidden {
-				t.Errorf("exit = %d, want exitForbidden (%d)", exit, exitForbidden)
+			if exit != exitUnauthenticated {
+				t.Errorf("exit = %d, want exitUnauthenticated (%d)", exit, exitUnauthenticated)
 			}
 		})
 	}

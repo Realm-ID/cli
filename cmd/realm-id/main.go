@@ -29,12 +29,18 @@ var version = "dev"
 
 // Exit codes (ADR-062 §1): agents branch on these.
 const (
-	exitOK        = 0
-	exitErr       = 1
-	exitUsage     = 2
-	exitConflict  = 4
-	exitNotFound  = 5
-	exitForbidden = 7
+	exitOK       = 0
+	exitErr      = 1
+	exitUsage    = 2
+	exitConflict = 4
+	exitNotFound = 5
+	// exitUnauthenticated: 401, no valid session or platform bearer (G19; split from 7).
+	exitUnauthenticated = 6
+	exitForbidden       = 7
+	// exitNeedsHuman: the verb needs a person's session (R40/R73); nothing was sent.
+	exitNeedsHuman = 8
+	// exitSplitSigning: a share, cosignature or handshake failure (v2 W1.10).
+	exitSplitSigning = 9
 )
 
 func main() {
@@ -57,6 +63,15 @@ func run(args []string) int {
 		return cmdSchema(args[1:])
 	case "doctor":
 		return cmdDoctor(args[1:])
+	case "signing-keys":
+		return cmdSigningKeys(args[1:])
+	case "platform-keys":
+		return cmdPlatformKeys(args[1:])
+	case "user-api-keys":
+		if len(args) > 1 && args[1] == "create" {
+			return cmdUserAPIKeysCreate(args[2:])
+		}
+		return cmdResource(args)
 	case "plan-import":
 		return cmdPlanImport(args[1:])
 	case "verify-token":
@@ -94,6 +109,10 @@ Usage:
   realm-id auth login              Authenticate via a browser link (device flow)
   realm-id auth whoami             Show the current session identity
   realm-id auth logout             Revoke the session and clear local credentials
+  realm-id auth workload           Sign in from CI with the runner's OIDC token (WIF)
+  realm-id signing-keys <verb>     Split signing: init|upload|status|pin|extend|cancel|rotate|recover|downgrade
+  realm-id user-api-keys create    Mint a user API key (a person's session; --totp on step-up)
+  realm-id platform-keys create    Mint a platform key (a person, or the platform_mgmt_api workload actor)
   realm-id config set <key> <val>  Set platform | tenant | bff_url | issuer_url
   realm-id config get <key>        Print a config value
   realm-id config list             Show the active configuration
@@ -115,7 +134,8 @@ Output: --output json|table (json when piped, table on a TTY)
 Scope:  --platform <id> (or active config) · --tenant <id>
 Body:   --json '<obj>' · --field k=v (repeatable, key:=rawjson for typed) · stdin
 
-Env: REALM_ID_BFF, REALM_ID_ISSUER, REALM_ID_API_KEY, REALM_ID_CONFIG
+Env: REALM_ID_BFF, REALM_ID_ISSUER, REALM_ID_API_KEY (a uk_live_ user key), REALM_ID_CONFIG, REALM_ID_SHARE_KEK
+Exit: 0 ok · 1 error · 2 usage · 3 incomplete · 4 conflict · 5 not found · 6 unauthenticated · 7 forbidden · 8 needs a person · 9 split-signing share/cosign
 `)
 }
 
@@ -123,7 +143,7 @@ Env: REALM_ID_BFF, REALM_ID_ISSUER, REALM_ID_API_KEY, REALM_ID_CONFIG
 
 func cmdAuth(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: realm-id auth <login|whoami|logout>")
+		fmt.Fprintln(os.Stderr, "usage: realm-id auth <login|whoami|logout|workload>")
 		return exitUsage
 	}
 	cfg, err := loadConfig()
@@ -135,6 +155,8 @@ func cmdAuth(args []string) int {
 		return authLogin(cfg, resolveDeviceName(args[1:]))
 	case "whoami":
 		return authWhoami(cfg)
+	case "workload":
+		return authWorkload(cfg, args[1:])
 	case "logout":
 		return authLogout(cfg)
 	default:
@@ -418,7 +440,8 @@ func authLogin(cfg *Config, deviceName string) int {
 		// approval" on every successful approval. Match the whole 2xx class.
 		if st/100 == 2 && tok.SessionToken != "" {
 			cfg.SessionToken = tok.SessionToken
-			cfg.Tenant = tok.TenantID // pinned at the BFF for a single-tenant user; "" otherwise
+			cfg.SessionClass, cfg.SessionRole = "", "" // a person
+			cfg.Tenant = tok.TenantID                  // pinned at the BFF for a single-tenant user; "" otherwise
 			if err := saveConfig(cfg); err != nil {
 				return fail(err)
 			}
@@ -562,6 +585,7 @@ func authLogout(cfg *Config) int {
 		_, _, _ = jsonRequest(http.MethodPost, cfg.bffURL()+"/logout", cfg.SessionToken, nil, nil)
 	}
 	cfg.SessionToken = ""
+	cfg.SessionClass, cfg.SessionRole = "", ""
 	if err := saveConfig(cfg); err != nil {
 		return fail(err)
 	}
@@ -773,7 +797,9 @@ func exitForStatus(status int) int {
 	switch {
 	case status < 400:
 		return exitOK
-	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+	case status == http.StatusUnauthorized:
+		return exitUnauthenticated
+	case status == http.StatusForbidden:
 		return exitForbidden
 	case status == http.StatusNotFound:
 		return exitNotFound
