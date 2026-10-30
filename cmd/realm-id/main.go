@@ -114,6 +114,7 @@ Usage:
   realm-id user-api-keys create    Mint a user API key (a person's session; --totp on step-up)
   realm-id platform-keys create    Mint a platform key (a person, or the platform_mgmt_api workload actor)
   realm-id config set <key> <val>  Set platform | tenant | bff_url | issuer_url
+                                   (tenant: --totp CODE if the workspace needs MFA)
   realm-id config get <key>        Print a config value
   realm-id config list             Show the active configuration
   realm-id <resource> <verb>       Typed API command (e.g. realm-id platforms list)
@@ -649,7 +650,7 @@ func cmdConfig(args []string) int {
 		return exitOK
 	case "set":
 		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: realm-id config set <platform|tenant|bff_url|issuer_url> <value>")
+			fmt.Fprintln(os.Stderr, "usage: realm-id config set <platform|tenant|bff_url|issuer_url> <value> [--totp CODE (tenant only)]")
 			return exitUsage
 		}
 		switch args[1] {
