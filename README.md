@@ -262,7 +262,23 @@ even the key exchange. `platform-keys create` is the one exception: a workload s
 role is `platform_mgmt_api` may run it (R72). `signing-keys status` and `pin` are reads and run in
 any session. A `412` step-up on a mutation takes `--totp CODE` (or a hidden prompt on a terminal),
 verifies it at `/auth/mfa/verify` and retries the same request; off a terminal with no code the
-exit is 3.
+exit is 3. The verify REPLACES the session: the BFF mints a new `session_token` and deletes the old
+one, so the CLI adopts the verify body's `session_token` (saved to config for an `auth login`
+session) and the retry carries THAT token. [R41 amendment, owner 2026-10-30; SPEC, NOT BUILT. A
+`REALM_ID_API_KEY` key session is never written to config.]
+
+**Picking a workspace that needs MFA (R41 amendment, owner 2026-10-30; SPEC, NOT BUILT).**
+`realm-id config set tenant <id> [--totp CODE]` re-pins the session through `POST /switch-tenant`.
+When that workspace needs MFA the BFF answers `412 mfa_required` with a challenge; the CLI then
+takes the code exactly as a step-up does (`--totp`, else the hidden `TOTP code: ` prompt on a
+terminal; off a terminal with no code: "error: this operation needs a TOTP code (step-up); pass
+--totp <code>", exit 3), verifies it at `/auth/mfa/verify`, ADOPTS the returned `session_token`
+into config (the old one is gone), saves the tenant, and prints `Active tenant: <id>`. A wrong
+code prints the server's error and changes nothing. This is the same whether the session was
+approved with "Choose later in the CLI" (unpinned) or is switching from one workspace to another.
+There is no interactive numbered pick after `auth login`: a multi-workspace login still lists the
+workspaces and prints `Select one with:  realm-id config set tenant <id>`, so the CLI stays
+scriptable (ADR-062).
 
 ```bash
 realm-id user-api-keys create --tenant T --label L (--permissions p1,p2 | --uncapped) [--user U] [--ttl-seconds N] [--totp 123456]
