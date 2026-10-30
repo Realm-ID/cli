@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-35 entries. Newest first.
+36 entries. Newest first.
 
+- [2026-10-30 — R41 CLI: config set tenant answers MFA; stepUpCall adopts the verified session (RCA)](#2026-10-30--r41-cli-config-set-tenant-answers-mfa-stepupcall-adopts-the-verified-session-rca)
 - [2026-10-29 — E6: split-signing CLI built — BFF-only sessions, own crypto, exit 6/8/9](#2026-10-29--e6-split-signing-cli-built--bff-only-sessions-own-crypto-exit-689)
 - [2026-10-27 — W0b: planned CLI docs follow R60-R76 (human-only verbs, exit 6/7 for G19)](#2026-10-27--w0b-planned-cli-docs-follow-r60-r76-human-only-verbs-exit-67-for-g19)
 - [2026-10-27 — Planned key-session docs follow R55-R58](#2026-10-27--planned-key-session-docs-follow-r55-r58)
@@ -44,6 +45,18 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-10-30 — R41 CLI: config set tenant answers MFA; stepUpCall adopts the verified session (RCA)
+
+**R41 CLI: `config set tenant` answers the MFA challenge; `stepUpCall` adopts the verified session.**
+`config set tenant <id> [--totp CODE]` now handles a 412 from `/switch-tenant`: it reuses the step-up prompt (`verifyStepUp`: flag, else hidden prompt on a terminal, else exit 3), POSTs `/auth/mfa/verify`, adopts the body's `session_token` into config and saves the tenant only after the verify succeeded. A wrong code changes nothing. `selectTenantAfterLogin` wording is unchanged and there is no numbered pick (ADR-062). Owner ruling 2026-10-30 (R41 rulings 6 and 7).
+
+RCA (latent bug found by the red test `TestStepUpCall_RetryUsesAdoptedToken`):
+- **Symptom:** after a successful step-up verify, the retried mutation (`user-api-keys create`, `signing-keys ...`) answered 401 `session_expired` for a human `auth login` session. Not seen in the field; the 412 path had no test against a server that deletes the old session.
+- **Root cause:** `stepUpCall` discarded the `/auth/mfa/verify` body and retried through `bffCall` with `cfg.SessionToken`. The BFF's `finishMFARecord` mints a NEW session on verify and deletes the prior `rsid_` bearer, so the retry carried a deleted token.
+- **Why it wasn't caught:** the step-up fakes answered verify with a bare 200 and left the old token valid, so the fake was more forgiving than the real BFF.
+- **Fix:** `verifyStepUp` decodes the verify body and adopts `session_token` (saved to config; a `REALM_ID_API_KEY` key session only updates the in-memory cache, never config); `stepUpCall` and `pinTenantStepUp` both use it.
+- **Prevention:** `r41BFF` in `cmd/realm-id/r41_picker_test.go` deletes the old session on verify like the real BFF; reuse it for any new step-up verb.
 
 ## 2026-10-29 — E6: split-signing CLI built — BFF-only sessions, own crypto, exit 6/8/9
 

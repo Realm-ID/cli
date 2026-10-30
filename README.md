@@ -264,10 +264,10 @@ any session. A `412` step-up on a mutation takes `--totp CODE` (or a hidden prom
 verifies it at `/auth/mfa/verify` and retries the same request; off a terminal with no code the
 exit is 3. The verify REPLACES the session: the BFF mints a new `session_token` and deletes the old
 one, so the CLI adopts the verify body's `session_token` (saved to config for an `auth login`
-session) and the retry carries THAT token. [R41 amendment, owner 2026-10-30; SPEC, NOT BUILT. A
+session) and the retry carries THAT token. [R41 amendment, owner 2026-10-30; BUILT. A
 `REALM_ID_API_KEY` key session is never written to config.]
 
-**Picking a workspace that needs MFA (R41 amendment, owner 2026-10-30; SPEC, NOT BUILT).**
+**Picking a workspace that needs MFA (R41 amendment, owner 2026-10-30; BUILT).**
 `realm-id config set tenant <id> [--totp CODE]` re-pins the session through `POST /switch-tenant`.
 When that workspace needs MFA the BFF answers `412 mfa_required` with a challenge; the CLI then
 takes the code exactly as a step-up does (`--totp`, else the hidden `TOTP code: ` prompt on a

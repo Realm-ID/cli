@@ -17,6 +17,10 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ### Added
 
+- `realm-id config set tenant <id> [--totp CODE]` answers a workspace's MFA challenge (R41): prompt or
+  `--totp`, verify, adopt the new `session_token`; off a terminal with no code it exits 3. A step-up
+  retry (`user-api-keys create`, `signing-keys ...`) now carries the verified session's token instead
+  of the deleted one.
 - `realm-id signing-keys init|upload|status|pin|extend|cancel|rotate|recover|downgrade` (G14).
   `rotate` and `recover` take the rotation lease themselves and upload with `lease_id` (owner
   ruling C5#1); `downgrade --cosign-from file:PATH` takes the downgrade's own challenge (C5#4);
