@@ -3,7 +3,7 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
-## Unreleased — split signing v3: BFF-only CLI, `signing-keys`, key and workload sessions
+## v0.6.0 — split signing v3: BFF-only CLI, `signing-keys`, key and workload sessions
 
 ### Breaking
 
