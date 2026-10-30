@@ -523,6 +523,10 @@ func pinTenant(cfg *Config, tenantID string) error {
 	if err != nil {
 		return err
 	}
+	return finishPin(cfg, tenantID, st, raw)
+}
+
+func finishPin(cfg *Config, tenantID string, st int, raw []byte) error {
 	if st >= 400 {
 		if code := errorCode(raw); code != "" {
 			return fmt.Errorf("switch-tenant failed: %s", code)
@@ -531,6 +535,36 @@ func pinTenant(cfg *Config, tenantID string) error {
 	}
 	cfg.Tenant = tenantID
 	return saveConfig(cfg)
+}
+
+// pinTenantStepUp is pinTenant for `config set tenant`: a 412 carrying an MFA challenge is
+// answered through verifyStepUp (the stepUpCall prompt), which adopts the verify body's new
+// session_token; the tenant is persisted only after the verify succeeded. Returns an exit code.
+func pinTenantStepUp(cfg *Config, tenantID, totp string) int {
+	if cfg.SessionToken == "" {
+		return fail(errors.New("not logged in (run: realm-id auth login)"))
+	}
+	st, raw, err := jsonRequest(http.MethodPost, cfg.bffURL()+"/switch-tenant",
+		cfg.SessionToken, map[string]string{"tenant_id": tenantID}, nil)
+	if err != nil {
+		return fail(err)
+	}
+	if st == http.StatusPreconditionFailed {
+		if tok := challengeToken(raw); tok != "" {
+			if abort := verifyStepUp(cfg, tok, totp); abort >= 0 {
+				return abort
+			}
+			cfg.Tenant = tenantID
+			if err := saveConfig(cfg); err != nil {
+				return fail(err)
+			}
+			return exitOK
+		}
+	}
+	if err := finishPin(cfg, tenantID, st, raw); err != nil {
+		return fail(err)
+	}
+	return exitOK
 }
 
 // sessionHint writes a remedy line to STDERR when a BFF call failed because the
@@ -623,9 +657,15 @@ func cmdConfig(args []string) int {
 			cfg.Platform = args[2]
 		case "tenant":
 			// Tenant selection re-pins the live BFF session (ADR-062 §2);
-			// pinTenant persists cfg.Tenant only on a successful switch.
-			if err := pinTenant(cfg, args[2]); err != nil {
-				return fail(err)
+			// pinTenant persists cfg.Tenant only on a successful switch. A 412 is the
+			// target tenant's MFA challenge: verify (--totp or prompt), adopt the new session.
+			f, ferr := parseVerbFlags(args[3:], []string{"totp"}, nil)
+			if ferr != nil {
+				fmt.Fprintln(os.Stderr, ferr)
+				return exitUsage
+			}
+			if code := pinTenantStepUp(cfg, args[2], f.vals["totp"]); code != exitOK {
+				return code
 			}
 			fmt.Fprintf(os.Stderr, "Active tenant: %s\n", args[2])
 			return exitOK

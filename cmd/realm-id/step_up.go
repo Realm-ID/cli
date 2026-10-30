@@ -226,6 +226,50 @@ func challengeToken(raw []byte) string {
 	return b.Err.Tok
 }
 
+// verifyStepUp answers a 412 challenge: it takes the TOTP code from totp, else prompts on a
+// terminal (exit 3 when there is none), POSTs /auth/mfa/verify and ADOPTS the body's session_token.
+// The BFF mints a NEW session on verify and deletes the old one, so a retry with the old bearer is
+// a 401. A key session (REALM_ID_API_KEY) is never written to config. abort >= 0 means stop with
+// that exit code (already reported).
+func verifyStepUp(cfg *Config, tok, totp string) (abort int) {
+	if totp == "" {
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			fmt.Fprintln(os.Stderr, "error: this operation needs a TOTP code (step-up); pass --totp <code>")
+			return exitIncomplete
+		}
+		fmt.Fprint(os.Stderr, "TOTP code: ")
+		b, rerr := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		if rerr != nil {
+			return failCode(fmt.Errorf("reading the TOTP code: %w", rerr), exitErr)
+		}
+		totp = strings.TrimSpace(string(b))
+	}
+	_, bearer, _ := resolveCredential(cfg)
+	var out sessionInfo
+	vst, vraw, verr := jsonRequest(http.MethodPost, cfg.bffURL()+"/auth/mfa/verify", bearer,
+		map[string]string{"mfa_challenge_token": tok, "code": totp, "method": "totp"}, &out)
+	if verr != nil {
+		return fail(verr)
+	}
+	if vst/100 != 2 {
+		fmt.Fprintln(os.Stderr, strings.TrimSpace(string(vraw)))
+		return exitForStatus(vst)
+	}
+	if out.SessionToken == "" {
+		return -1
+	}
+	if envOr("REALM_ID_API_KEY", "") != "" {
+		platformTokenCache = out.SessionToken
+		return -1
+	}
+	cfg.SessionToken = out.SessionToken
+	if err := saveConfig(cfg); err != nil {
+		return fail(err)
+	}
+	return -1
+}
+
 // stepUpCall sends a mutation and, on a 412 step-up, verifies a TOTP code (from --totp, else a
 // prompt on a terminal) and retries the SAME request once (R40/R41). abort >= 0 means stop with
 // that exit code (already reported).
@@ -241,28 +285,8 @@ func stepUpCall(cfg *Config, method, path string, body any, totp string) (status
 	if tok == "" {
 		return st, raw, -1
 	}
-	if totp == "" {
-		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			fmt.Fprintln(os.Stderr, "error: this operation needs a TOTP code (step-up); pass --totp <code>")
-			return 0, nil, exitIncomplete
-		}
-		fmt.Fprint(os.Stderr, "TOTP code: ")
-		b, rerr := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Fprintln(os.Stderr)
-		if rerr != nil {
-			return 0, nil, failCode(fmt.Errorf("reading the TOTP code: %w", rerr), exitErr)
-		}
-		totp = strings.TrimSpace(string(b))
-	}
-	_, bearer, _ := resolveCredential(cfg)
-	vst, vraw, verr := jsonRequest(http.MethodPost, cfg.bffURL()+"/auth/mfa/verify", bearer,
-		map[string]string{"mfa_challenge_token": tok, "code": totp, "method": "totp"}, nil)
-	if verr != nil {
-		return 0, nil, fail(verr)
-	}
-	if vst/100 != 2 {
-		fmt.Fprintln(os.Stderr, strings.TrimSpace(string(vraw)))
-		return 0, nil, exitForStatus(vst)
+	if abort := verifyStepUp(cfg, tok, totp); abort >= 0 {
+		return 0, nil, abort
 	}
 	st, raw, err = bffCall(cfg, method, path, body)
 	if err != nil {
