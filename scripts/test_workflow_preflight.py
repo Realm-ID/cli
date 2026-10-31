@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VENDORED from claude-config skills/workflow-preflight @ ee0c8a770669 — edit canonical, not this copy
+# VENDORED from claude-config skills/workflow-preflight @ 8dc177f4a676 — edit canonical, not this copy
 """Tests for workflow_preflight.py (W1: lint + parity) — stdlib + PyYAML, no runner to install.
 
 Fixtures are synthetic repos built in temp dirs (no checked-in tree, so the vendored copy of
@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -274,6 +275,48 @@ class ParityTests(Base):
         self.assertEqual(rc, 1, out)
         self.assertIn("PIN_DRIFT", out)
 
+    # A matrix leg was invisible: `go-version: ${{ matrix.go }}` was skipped as an expression
+    # (a consumer's cli repo found `go-version: ['1.27']` by hand, 2026-10-21).
+    def matrix_wf(self, matrix, field="go-version: ${{ matrix.go }}", use="actions/setup-go"):
+        return ("name: ci\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
+                f"    strategy:\n      matrix:\n{matrix}"
+                f"    steps:\n      - uses: {use}@{SHA}\n        with:\n          {field}\n"
+                "      - run: make test\n")
+
+    def parity_go(self, wf, tools=None):
+        self.wf("ci.yml", wf)
+        self.cfg(toolchain={"go": "1.27.2"}, tools=tools or {}, jobs={"ci.yml:test": {"local": "make test"}})
+        self.m.local_go_version = lambda: "1.27.2"
+        return self.run_cli("parity")
+
+    def test_matrix_list_value_drift_is_found(self):
+        rc, out = self.parity_go(self.matrix_wf("        go: ['1.27', '1.27.2']\n"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("go-version (matrix.go) is 1.27, config pins 1.27.2", out)
+        self.assertNotIn("is 1.27.2,", out)
+
+    def test_matrix_include_value_drift_is_found(self):
+        rc, out = self.parity_go(self.matrix_wf("        go: ['1.27.2']\n        include:\n          - go: '1.26.0'\n"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("go-version (matrix.go) is 1.26.0", out)
+
+    def test_matrix_all_matching_is_clean(self):
+        rc, out = self.parity_go(self.matrix_wf("        go: ['1.27.2']\n        os: [a, b]\n"))
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("PIN_DRIFT", out)
+
+    def test_non_matrix_expression_still_skipped(self):
+        rc, out = self.parity_go(self.matrix_wf("        go: ['1.26.0']\n", field="go-version: ${{ env.GO }}"))
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("PIN_DRIFT", out)
+
+    def test_matrix_golangci_lint_action_version(self):
+        rc, out = self.parity_go(self.matrix_wf("        lint: [v2.5.0]\n", field="version: ${{ matrix.lint }}",
+                                                use="golangci/golangci-lint-action"),
+                                 tools={"golangci-lint": "2.15.0"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("golangci-lint version (matrix.lint) is v2.5.0", out)
+
     def test_tool_pin_drift_in_run_text(self):
         self.wf("ci.yml", ci(extra_steps="      - run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.6.0\n"))
         self.cfg(tools={"actionlint": "1.7.12"}, jobs={"ci.yml:test": {"local": "make test"}})
@@ -458,6 +501,90 @@ class ParityTests(Base):
 
 ORG = "Just-Git-Dev/reusable-workflows"
 TAGSHA = "c" * 40
+
+
+class ScratchIgnoreTests(Base):
+    """F-036: `.scratch/` must be ignored by the repo itself, not only by the laptop's global excludes."""
+
+    def setUp(self):
+        super().setUp()
+        self.wf("ci.yml", ci())
+        self.cfg(jobs={"ci.yml:test": {"local": "make test"}})
+        self.gitenv = {k: v for k, v in os.environ.items() if k not in self.git_local_vars()}
+        self.gitenv.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
+        self.git("init", "-q")
+
+    @staticmethod
+    def git_local_vars():
+        return set(subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True).stdout.split())
+
+    def git(self, *args, env=None):
+        return subprocess.run(["git", "-C", str(self.tree), *args], capture_output=True, text=True,
+                              env=env or self.gitenv)
+
+    def gitignore(self, text):
+        (self.tree / ".gitignore").write_text(text)
+
+    def test_global_excludes_only_is_a_finding(self):
+        excludes = self.tree.parent / (self.tree.name + "-excludes")
+        excludes.write_text(".scratch/\n")
+        gcfg = self.tree.parent / (self.tree.name + "-gitconfig")
+        gcfg.write_text(f"[core]\n\texcludesFile = {excludes}\n")
+        self.addCleanup(excludes.unlink)
+        self.addCleanup(gcfg.unlink)
+        # positive control: under that global config git really does ignore it
+        self.assertEqual(self.git("check-ignore", "-q", ".scratch/probe",
+                                  env={**self.gitenv, "GIT_CONFIG_GLOBAL": str(gcfg)}).returncode, 0)
+        with unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(gcfg)}):
+            rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCRATCH_NOT_IGNORED", out)
+        self.assertIn("add the line `.scratch/` to this repo's .gitignore", out)
+        self.assertIn("GIT_CONFIG_GLOBAL=/dev/null git check-ignore -q .scratch/probe", out)
+
+    def test_not_ignored_anywhere_is_a_finding(self):
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCRATCH_NOT_IGNORED", out)
+
+    def test_repo_gitignore_forms_are_clean(self):
+        for form in (".scratch/", "/.scratch", "**/.scratch/", ".scratch*", "node_modules/\n.scratch/\n"):
+            with self.subTest(form=form):
+                self.gitignore(form + "\n")
+                rc, out = self.run_cli("parity")
+                self.assertEqual(rc, 0, out)
+                self.assertNotIn("SCRATCH_NOT_IGNORED", out)
+                self.assertIn("scratch-ignore: .scratch/ ignored by .gitignore", out)
+
+    def test_negation_after_ignore_is_a_finding(self):
+        self.gitignore(".scratch/\n!.scratch/\n")
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCRATCH_NOT_IGNORED", out)
+
+    def test_info_exclude_only_is_a_finding(self):
+        (self.tree / ".git" / "info").mkdir(exist_ok=True)
+        (self.tree / ".git" / "info" / "exclude").write_text(".scratch/\n")
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCRATCH_NOT_IGNORED", out)
+        self.assertIn(".git/info/exclude", out)
+
+    def test_hook_git_dir_does_not_redirect_the_check(self):
+        # inside a git hook GIT_DIR names the hooked repo; the check must still read --root
+        # (a GIT_DIR that does not exist makes an unscrubbed git fail, so only a scrub passes)
+        self.gitignore(".scratch/\n")
+        with unittest.mock.patch.dict(os.environ, {"GIT_DIR": str(self.tree / "no-such.git")}):
+            rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("scratch-ignore: .scratch/ ignored by .gitignore", out)
+
+    def test_not_a_git_repo_is_skipped_with_a_reason(self):
+        shutil.rmtree(self.tree / ".git")
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("scratch-ignore: skipped", out)
+        self.assertNotIn("SCRATCH_NOT_IGNORED", out)
 
 
 def job_yaml(jid, setup, version, extra=""):
@@ -671,6 +798,213 @@ class CliTests(Base):
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("examined:", p.stdout)
+
+
+def trig_wf(on, jobs):
+    return f"name: t\non:\n{on}\njobs:\n{jobs}\n"
+
+
+TEST_JOB = "  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n"
+PUSH_MAIN = "  push:\n    branches: [main]\n"
+PUSH_MAIN_PATHS = "  push:\n    branches: [main]\n    paths: ['infra/**']\n"
+WAIVER_OK = {"class": "outward", "paths": ["infra/**"], "reason": "applies policy from a committed file"}
+
+
+class TriggersTests(Base):
+    """D8 (ci-trigger-policy §7 item 1): the `triggers` check. Opt-in via {"triggers": {"enforce": true}}."""
+
+    def go(self, enforce=True, **kw):
+        base = {"triggers": {"enforce": True}} if enforce else {}
+        base.update(kw)
+        self.cfg(**base)
+        return self.run_cli("triggers")
+
+    def test_push_main_on_test_workflow_flagged(self):
+        self.wf("tests.yml", trig_wf(PUSH_MAIN, TEST_JOB))
+        rc, out = self.go(jobs={"tests.yml:test": {"local": "make test"}})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PUSH_MAIN tests.yml:test", out)
+        self.assertIn("rule 3", out)
+        self.assertIn("triggers: examined 1 workflows, 1 findings", out)
+
+    def test_bare_push_flagged(self):
+        self.wf("tests.yml", trig_wf("  push:\n", TEST_JOB))
+        rc, out = self.go(jobs={"tests.yml:test": {"local": "make test"}})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PUSH_MAIN tests.yml:test", out)
+
+    def test_tag_only_push_not_flagged(self):
+        self.wf("tests.yml", trig_wf("  push:\n    tags: ['v*']\n", TEST_JOB))
+        rc, out = self.go(jobs={"tests.yml:test": {"local": "make test"}})
+        self.assertEqual(rc, 0, out)
+
+    def test_build_class_by_docker_build(self):
+        job = "  img:\n    runs-on: ubuntu-latest\n    steps:\n      - run: docker build -t x .\n"
+        self.wf("image.yml", trig_wf(PUSH_MAIN, job))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PUSH_MAIN image.yml:img", out)
+        self.assertIn("rule 5", out)
+
+    def test_build_class_by_build_push_action(self):
+        job = (f"  img:\n    runs-on: ubuntu-latest\n    steps:\n"
+               f"      - uses: docker/build-push-action@{SHA}\n")
+        self.wf("image.yml", trig_wf(PUSH_MAIN, job))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+
+    def test_build_class_by_build_only_input(self):
+        job = "  img:\n    uses: o/r/.github/workflows/x.yml@v1.0.0\n    with:\n      build_only: true\n"
+        self.wf("image.yml", trig_wf(PUSH_MAIN, job))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+
+    def test_unclassed_workflow_push_main_not_flagged(self):
+        job = "  notify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+        self.wf("notify.yml", trig_wf(PUSH_MAIN, job))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+
+    def test_waiver_accepted(self):
+        self.wf("alerts.yml", trig_wf(PUSH_MAIN_PATHS, TEST_JOB))
+        rc, out = self.go(jobs={"alerts.yml:test": {"local": "make test"}},
+                          trigger_waivers={"alerts.yml": WAIVER_OK})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("triggers: examined 1 workflows, 0 findings", out)
+
+    def test_waiver_short_reason_rejected(self):
+        self.wf("alerts.yml", trig_wf(PUSH_MAIN_PATHS, TEST_JOB))
+        rc, out = self.go(jobs={"alerts.yml:test": {"local": "make test"}},
+                          trigger_waivers={"alerts.yml": dict(WAIVER_OK, reason="too short")})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("WAIVER_INVALID alerts.yml", out)
+        self.assertIn("PUSH_MAIN alerts.yml:test", out)
+
+    def test_waiver_bad_class_rejected(self):
+        self.wf("alerts.yml", trig_wf(PUSH_MAIN_PATHS, TEST_JOB))
+        rc, out = self.go(jobs={"alerts.yml:test": {"local": "make test"}},
+                          trigger_waivers={"alerts.yml": dict(WAIVER_OK, **{"class": "because"})})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("WAIVER_INVALID alerts.yml", out)
+
+    def test_waived_push_main_without_paths_flagged(self):
+        self.wf("alerts.yml", trig_wf(PUSH_MAIN, TEST_JOB))
+        rc, out = self.go(jobs={"alerts.yml:test": {"local": "make test"}},
+                          trigger_waivers={"alerts.yml": WAIVER_OK})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NO_PATHS alerts.yml", out)
+        self.assertIn("rule 9", out)
+
+    def test_schedule_on_local_job_flagged(self):
+        self.wf("nightly.yml", trig_wf("  schedule:\n    - cron: '0 3 * * 1'", TEST_JOB))
+        rc, out = self.go(jobs={"nightly.yml:test": {"local": "make test"}})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCHEDULE nightly.yml:test", out)
+        self.assertIn("rule 8", out)
+
+    def test_schedule_on_event_less_job_ok(self):
+        job = "  backup:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./backup.sh\n"
+        self.wf("backup.yml", trig_wf("  schedule:\n    - cron: '0 3 * * 1'", job))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+
+    def test_pr_and_push_main_together_flagged(self):
+        self.wf("ci.yml", trig_wf("  pull_request:\n" + PUSH_MAIN, TEST_JOB))
+        rc, out = self.go(jobs={"ci.yml:test": {"local": "make test"}})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PR_AND_PUSH ci.yml", out)
+        self.assertIn("rule 1", out)
+
+    def test_pr_and_push_main_unclassed_still_flagged(self):
+        job = "  notify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+        self.wf("n.yml", trig_wf("  pull_request:\n" + PUSH_MAIN_PATHS, job))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PR_AND_PUSH n.yml", out)
+
+    def test_deploy_without_test_verdict_flagged(self):
+        job = "  ship:\n    runs-on: ubuntu-latest\n    steps:\n      - run: gcloud run deploy api --image x\n"
+        self.wf("deploy.yml", trig_wf("  workflow_dispatch:", job))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("DEPLOY_NO_TEST deploy.yml:ship", out)
+        self.assertIn("rule 10", out)
+
+    def test_deploy_with_needs_on_marked_test_job_ok(self):
+        jobs = TEST_JOB + ("  mid:\n    needs: [test]\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n"
+                           "  ship:\n    needs: mid\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n")
+        self.wf("publish.yml", trig_wf("  workflow_dispatch:", jobs))
+        rc, out = self.go(test_jobs=["publish.yml:test"])
+        self.assertEqual(rc, 0, out)
+
+    def test_deploy_needs_unmarked_job_flagged(self):
+        jobs = TEST_JOB + ("  ship:\n    needs: test\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n")
+        self.wf("publish.yml", trig_wf("  workflow_dispatch:", jobs))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("DEPLOY_NO_TEST publish.yml:ship", out)
+        self.assertIn("test_jobs", out)
+
+    def test_deploy_with_await_step_ok(self):
+        job = ("  ship:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - name: Await tests on this commit\n        run: ./await-checks.sh\n"
+               "      - run: gh release create v1\n")
+        self.wf("release.yml", trig_wf("  workflow_dispatch:", job))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+
+    def test_non_deploy_file_not_checked_for_rule_10(self):
+        job = "  ship:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n"
+        self.wf("misc.yml", trig_wf("  workflow_dispatch:", job))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+
+    def test_paths_filter_on_contract_workflow_flagged(self):
+        self.wf("contract.yml", trig_wf("  pull_request:\n    paths: ['api/**']", TEST_JOB))
+        rc, out = self.go(contract_jobs=["contract.yml:test"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("CONTRACT_PATHS contract.yml:test", out)
+        self.assertIn("rule 7", out)
+
+    def test_contract_workflow_without_paths_ok(self):
+        self.wf("contract.yml", trig_wf("  pull_request:", TEST_JOB))
+        rc, out = self.go(contract_jobs=["contract.yml:test"])
+        self.assertEqual(rc, 0, out)
+
+    def test_paths_filter_on_other_workflow_ok(self):
+        self.wf("other.yml", trig_wf("  pull_request:\n    paths: ['api/**']", TEST_JOB))
+        rc, out = self.go(contract_jobs=["contract.yml:test"])
+        self.assertEqual(rc, 0, out)
+
+    def test_not_enforced_is_warning_only(self):
+        self.wf("tests.yml", trig_wf(PUSH_MAIN, TEST_JOB))
+        rc, out = self.go(enforce=False, jobs={"tests.yml:test": {"local": "make test"}})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN PUSH_MAIN tests.yml:test", out)
+        self.assertIn("triggers: examined 1 workflows, 1 findings", out)
+
+    def test_enforce_false_explicit_is_warning_only(self):
+        self.wf("tests.yml", trig_wf(PUSH_MAIN, TEST_JOB))
+        rc, out = self.go(enforce=False, jobs={"tests.yml:test": {"local": "make test"}},
+                          triggers={"enforce": False})
+        self.assertEqual(rc, 0, out)
+
+    def test_enforced_with_zero_workflows_fails(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("examined 0 workflows", out)
+
+    def test_bad_triggers_config_exit_2(self):
+        self.wf("tests.yml", trig_wf(PUSH_MAIN, TEST_JOB))
+        rc, out = self.go(enforce=False, triggers={"enforce": "yes"})
+        self.assertEqual(rc, 2, out)
+
+    def test_existing_commands_accept_new_keys(self):
+        self.wf("ci.yml", ci())
+        self.cfg(jobs={"ci.yml:test": {"local": "make test"}}, triggers={"enforce": True},
+                 trigger_waivers={}, test_jobs=[], contract_jobs=[])
+        rc, out = self.run_cli("parity")
+        self.assertEqual(rc, 0, out)
 
 
 CALLEE = """on:
@@ -1463,7 +1797,9 @@ class VendorTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         p = self.vendor("--check")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("compared 2 file(s), 0 drifted", p.stdout)
+        self.assertIn("compared 5 file(s), 0 drifted", p.stdout)
+        for f in ("laptop_status.sh", "hookaudit.py", "test_hookaudit.py"):
+            self.assertTrue((self.repo / "scripts" / f).is_file(), f)
         v = self.repo / "scripts" / "workflow_preflight.py"
         v.write_text(v.read_text() + "# tamper\n")
         p = self.vendor("--check")

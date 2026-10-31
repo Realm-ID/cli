@@ -8,3 +8,6 @@
 /dist/
 *.out
 __pycache__/
+
+# Session scratch (also in the global excludes; listed here so a push that skips the global config sees a clean tree)
+.scratch/

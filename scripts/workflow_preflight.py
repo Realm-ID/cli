@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# VENDORED from claude-config skills/workflow-preflight @ 02f6022fd009 — edit canonical, not this copy
-"""workflow-preflight: stop GitHub Actions failures before push (`lint`, `parity`, `refs`, `calls`, `dispatch-check`).
+# VENDORED from claude-config skills/workflow-preflight @ aff54ac09f12 — edit canonical, not this copy
+"""workflow-preflight: stop GitHub Actions failures before push (`lint`, `parity`, `refs`, `calls`, `dispatch-check`, `triggers`).
 
 Canonical copy lives in claude-config `skills/workflow-preflight/scripts/`; repos carry a stamped
 vendored copy (vendor.sh). Never edit a vendored copy. See SKILL.md for the codes and config.
@@ -9,6 +9,7 @@ vendored copy (vendor.sh). Never edit a vendored copy. See SKILL.md for the code
   workflow_preflight.py parity [--root R] [--config F] [--gate-log FILE]
   workflow_preflight.py refs   [--root R] [--config F] [--repo O/R] [--static] [--names-file F] [--gh P]
   workflow_preflight.py dispatch-check -R O/R <workflow.yml> --ref REF [-f k=v ...]   (reads the workflow AT REF)
+  workflow_preflight.py triggers [--root R] [--config F]   (CI trigger policy D8; warns unless enforced)
   workflow_preflight.py calls  [--root R] [--repo O/R] [--gh P]   (reusable-workflow contract: ref, inputs, secrets)
 
 Exit 0 clean (WARN lines allowed), 1 findings, 2 usage / config / parse error or a check that
@@ -37,7 +38,8 @@ except ImportError:  # pragma: no cover - exercised only where PyYAML is absent
     yaml = None
 
 CONFIG_NAME = ".workflow-preflight.json"
-TOP_KEYS = {"tools", "toolchain", "toolchain_overrides", "local_gate", "parity_mode", "jobs", "refs", "network", "adopted"}
+TOP_KEYS = {"tools", "toolchain", "toolchain_overrides", "local_gate", "parity_mode", "jobs", "refs", "network", "adopted",
+            "triggers", "trigger_waivers", "test_jobs", "contract_jobs"}
 ENTRY_KEYS_LOCAL = {"local", "marker", "paths"}
 ENTRY_KEYS_WAIVER = {"waiver", "reason"}
 WAIVER_KINDS = {"ci-only", "opt-in-slow", "release-only"}
@@ -353,6 +355,28 @@ def cmd_lint(root, cfg, args):
 
 # ---------------------------------------------------------------- parity
 
+MATRIX_REF_RE = re.compile(r"^\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}$")
+
+
+def with_values(job, v):
+    """[(value, label)] a `with:` input takes. A literal is itself. A pure `${{ matrix.KEY }}` is
+    every literal value of KEY in strategy.matrix, `include:` entries too, labelled `(matrix.KEY)`.
+    Any other expression cannot be resolved here and yields nothing."""
+    if v is None:
+        return []
+    if "${{" not in str(v):
+        return [(v, "")]
+    m = MATRIX_REF_RE.match(str(v).strip())
+    mx = (job.get("strategy") or {}).get("matrix") if m else None
+    if not isinstance(mx, dict):
+        return []
+    k = m.group(1)
+    vals = mx.get(k)
+    vals = list(vals) if isinstance(vals, list) else [] if vals is None else [vals]
+    vals += [inc[k] for inc in (mx.get("include") or []) if isinstance(inc, dict) and k in inc]
+    return [(x, f" (matrix.{k})") for x in vals if "${{" not in str(x)]
+
+
 def pin_findings(wfs, cfg):
     """(key, message) for every tool / toolchain version in a workflow that differs from config."""
     out, seen = [], set()
@@ -371,20 +395,19 @@ def pin_findings(wfs, cfg):
                 use = str(st.get("uses", "")).split("@")[0]
                 if use in SETUP_ACTIONS:
                     key, field = SETUP_ACTIONS[use]
-                    v = (st.get("with") or {}).get(field)
                     want = ov.get(key, chain.get(key))
-                    if want is not None and v is not None and "${{" not in str(v):
-                        drift(f"{w['name']}:{jid}" if key in ov else w["name"], f"{field}", v, want)
+                    for v, lbl in with_values(job, (st.get("with") or {}).get(field)) if want is not None else []:
+                        drift(f"{w['name']}:{jid}" if key in ov else w["name"], f"{field}{lbl}", v, want)
                 if use == "golangci/golangci-lint-action" and "golangci-lint" in tools:
-                    v = (st.get("with") or {}).get("version")
-                    if v is not None and "${{" not in str(v):
-                        drift(w["name"], "golangci-lint version", v, tools["golangci-lint"])
+                    for v, lbl in with_values(job, (st.get("with") or {}).get("version")):
+                        drift(w["name"], f"golangci-lint version{lbl}", v, tools["golangci-lint"])
                 # an action named for the tool (raven-actions/actionlint): its own `version` input
                 tool_action = use.rsplit("/", 1)[-1]
                 if tool_action in tools and tool_action != "golangci-lint-action":
-                    v = (st.get("with") or {}).get("version")
-                    if v is not None and "${{" not in str(v) and VERSION_RE.search(str(v)):
-                        drift(w["name"], f"{tool_action} version", VERSION_RE.search(str(v)).group(1), tools[tool_action])
+                    for v, lbl in with_values(job, (st.get("with") or {}).get("version")):
+                        if VERSION_RE.search(str(v)):
+                            drift(w["name"], f"{tool_action} version{lbl}", VERSION_RE.search(str(v)).group(1),
+                                  tools[tool_action])
                 for text in step_strings(st):
                     for tool, want in tools.items():
                         # boundaries are alphanumeric only: `shellcheck-v0.11.0` and `-shellcheck=` ARE names
@@ -398,6 +421,31 @@ def pin_findings(wfs, cfg):
                                 continue
                             drift(w["name"], f"{tool} version", m.group(1), want)
     return out
+
+
+SCRATCH_CHECK = "GIT_CONFIG_GLOBAL=/dev/null git check-ignore -q .scratch/probe"
+
+
+def scratch_ignore(root):
+    """F-036: `.scratch/` must be ignored by the repo's own .gitignore. A push run with
+    GIT_CONFIG_GLOBAL=/dev/null drops the global excludes, and laptop_status.sh then refuses the
+    push as "tree dirty". Git itself answers, so every pattern form counts. Returns (finding, note)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}  # a hook's GIT_DIR names another repo
+    env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True, env=env)
+
+    top = git("rev-parse", "--show-toplevel")
+    if top.returncode != 0 or Path(top.stdout.strip()).resolve() != Path(root).resolve():
+        return None, f"scratch-ignore: skipped, {root} is not a git repo's top level"
+    fix = f"add the line `.scratch/` to this repo's .gitignore (check: {SCRATCH_CHECK})"
+    if git("check-ignore", "-q", ".scratch/probe").returncode != 0:
+        return f"SCRATCH_NOT_IGNORED .scratch/ is not ignored without the global git config; {fix}", None
+    src = git("check-ignore", "-v", ".scratch/probe").stdout.split(":", 1)[0]
+    if Path(src).name != ".gitignore":
+        return f"SCRATCH_NOT_IGNORED .scratch/ is ignored only by {src} (this clone only); {fix}", None
+    return None, f"scratch-ignore: .scratch/ ignored by {src}"
 
 
 def cmd_parity(root, cfg, args):
@@ -493,6 +541,9 @@ def cmd_parity(root, cfg, args):
         notes.append(f"{len(not_local)} CI job(s) not run locally: {', '.join(not_local)}")
     if unverified:
         notes.append(f"markers unverified (no --gate-log): {', '.join(unverified)}")
+    finding, note = scratch_ignore(root)
+    findings += [finding] if finding else []
+    notes += [note] if note else []
     return finish(findings, warns, summary, notes=notes)
 
 
@@ -1195,6 +1246,191 @@ def cmd_calls(root, args):
     return rc
 
 
+# ---------------------------------------------------------------- triggers (ci-trigger-policy D8)
+
+TRIGGER_WAIVER_CLASSES = {"outward", "no-laptop", "cache", "release"}
+MAIN_BRANCHES = {"main", "master", "*", "**"}
+DEPLOY_FILE_RE = re.compile(r"^(deploy|publish|release)[^/]*\.ya?ml$")
+BUILD_RE = re.compile(r"\bdocker(?:\s+buildx)?\s+build\b|\bbuildx\s+build\b|\bbuild_only\b")
+BUILD_ACTIONS = ("docker/build-push-action", "docker/bake-action")
+DEPLOY_RUN_RE = re.compile(
+    r"\bgcloud\s+run\s+(?:deploy|services\s+update)\b|\bgcloud\s+(?:app|functions)\s+deploy\b"
+    r"|\bnpm\s+publish\b|\btwine\s+upload\b|\bdocker\s+push\b|\bgh\s+release\s+create\b"
+    r"|\bkubectl\s+(?:apply|set\s+image|rollout)\b|\bhelm\s+(?:upgrade|install)\b"
+    r"|\bterraform\s+apply\b|\bwrangler\s+(?:deploy|publish|pages\s+deploy)\b|\bfirebase\s+deploy\b"
+    r"|\bcdk\s+deploy\b|\bcargo\s+publish\b|\bmvn\b.*\bdeploy\b")
+DEPLOY_ACTIONS = ("pypi-publish", "google-github-actions/deploy-cloudrun", "cloudflare/wrangler-action",
+                  "cloudflare/pages-action", "softprops/action-gh-release")
+AWAIT_RE = re.compile(r"\bawait\b|wait-on-check|wait-for-check", re.I)
+RULE = {"PUSH_MAIN": "rules 3/5/9", "NO_PATHS": "rule 9", "SCHEDULE": "rule 8", "PR_AND_PUSH": "rule 1",
+        "DEPLOY_NO_TEST": "rule 10", "CONTRACT_PATHS": "rule 7", "WAIVER_INVALID": "rule 9"}
+
+
+def validate_triggers_config(cfg):
+    errors = []
+    t = cfg.get("triggers", {})
+    if not isinstance(t, dict) or set(t) - {"enforce"} or not isinstance(t.get("enforce", False), bool):
+        errors.append("triggers must be an object whose only key is 'enforce' (boolean)")
+    if not isinstance(cfg.get("trigger_waivers", {}), dict):
+        errors.append("trigger_waivers must be an object")
+    for k in ("test_jobs", "contract_jobs"):
+        v = cfg.get(k, [])
+        if not (isinstance(v, list) and all(isinstance(x, str) and ":" in x for x in v)):
+            errors.append(f"{k} must be a list of '<workflow file>:<job id>' strings")
+    return errors
+
+
+def on_events(w):
+    """The workflow's `on:` as {event: config-dict}; list/str forms and `event:` with no body give {}."""
+    on = w["doc"].get("on", w["doc"].get(True))
+    if isinstance(on, str):
+        return {on: {}}
+    if isinstance(on, list):
+        return {str(e): {} for e in on}
+    if isinstance(on, dict):
+        return {str(e): (v if isinstance(v, dict) else {}) for e, v in on.items()}
+    return {}
+
+
+def pushes_main(events):
+    if "push" not in events:
+        return False
+    p = events["push"]
+    br = p.get("branches")
+    if br is None:
+        return "tags" not in p and "tags-ignore" not in p  # bare `push:` fires on every branch, main included
+    br = [br] if isinstance(br, str) else br
+    return any(str(b) in MAIN_BRANCHES for b in br)
+
+
+def has_paths(cfgd):
+    return bool(cfgd.get("paths") or cfgd.get("paths-ignore"))
+
+
+def job_strings(job):
+    out = []
+    for st in steps_of(job):
+        out += step_strings(st)
+    if isinstance(job.get("with"), dict):
+        out += [str(v) for k, v in job["with"].items()] + [str(k) for k in job["with"]]
+    return out
+
+
+def is_build_job(job):
+    uses = [str(st.get("uses", "")) for st in steps_of(job)] + [str(job.get("uses", ""))]
+    return any(u.startswith(BUILD_ACTIONS) for u in uses) or any(BUILD_RE.search(s) for s in job_strings(job))
+
+
+def is_deploy_job(job):
+    uses = [str(st.get("uses", "")) for st in steps_of(job)]
+    return any(DEPLOY_RUN_RE.search(ln) for ln in run_lines(job)) or any(
+        d in u for u in uses for d in DEPLOY_ACTIONS)
+
+
+def has_await(job):
+    for st in steps_of(job):
+        if AWAIT_RE.search(" ".join([str(st.get("name", "")), str(st.get("uses", ""))] + step_strings(st))):
+            return True
+    return False
+
+
+def needs_of(job):
+    n = job.get("needs") if isinstance(job, dict) else None
+    return [n] if isinstance(n, str) else [str(x) for x in n] if isinstance(n, list) else []
+
+
+def reaches(jobs, jid, targets, seen=None):
+    seen = seen if seen is not None else set()
+    for n in needs_of(jobs[jid]):
+        if n in seen or n not in jobs:
+            continue
+        seen.add(n)
+        if n in targets or reaches(jobs, n, targets, seen):
+            return True
+    return False
+
+
+def check_waiver(wf, wv):
+    if not isinstance(wv, dict):
+        return f"{wf}: waiver must be an object"
+    if set(wv) - {"class", "paths", "reason"}:
+        return f"{wf}: unknown waiver key(s) {sorted(set(wv) - {'class', 'paths', 'reason'})}"
+    if wv.get("class") not in TRIGGER_WAIVER_CLASSES:
+        return f"{wf}: class must be one of {sorted(TRIGGER_WAIVER_CLASSES)}"
+    if not (isinstance(wv.get("paths"), list) and wv["paths"] and all(isinstance(p, str) for p in wv["paths"])):
+        return f"{wf}: paths must be a non-empty list of globs"
+    if len(str(wv.get("reason", "")).strip()) < MIN_REASON:
+        return f"{wf}: reason needs at least {MIN_REASON} characters"
+    return None
+
+
+def trigger_findings(wfs, cfg):
+    jobs_cfg = cfg.get("jobs", {}) if isinstance(cfg.get("jobs"), dict) else {}
+    waivers = cfg.get("trigger_waivers", {})
+    test_keys, contract_keys = set(cfg.get("test_jobs", [])), set(cfg.get("contract_jobs", []))
+    out = []
+
+    def add(code, where, msg, rule=None):
+        out.append(f"{code} {where}: {msg} ({rule or RULE[code]})")
+
+    for w in wfs:
+        name, jobs, ev = w["name"], w["jobs"], on_events(w)
+        keyed = {jid: f"{name}:{jid}" for jid in jobs}
+        local = [jid for jid in jobs if isinstance(jobs_cfg.get(keyed[jid]), dict) and "local" in jobs_cfg[keyed[jid]]]
+        classed = [jid for jid, job in jobs.items() if jid in local or (isinstance(job, dict) and is_build_job(job))]
+        push_main = pushes_main(ev)
+        waiver_ok = False
+        if name in waivers:
+            bad = check_waiver(name, waivers[name])
+            if bad:
+                add("WAIVER_INVALID", name, bad)
+            else:
+                waiver_ok = True
+        if push_main:
+            if waiver_ok:
+                if not has_paths(ev["push"]):
+                    add("NO_PATHS", name, "waived push to main has no paths:/paths-ignore: filter on the push trigger")
+            else:
+                for jid in classed:
+                    kind = "build" if jid not in local else "test/hygiene"
+                    add("PUSH_MAIN", keyed[jid], f"{kind} job runs on push to main with no covering trigger_waivers entry",
+                        "rule 3" if jid in local else "rule 5")
+            if "pull_request" in ev and not waiver_ok:
+                add("PR_AND_PUSH", name, "pull_request and push to main on one workflow; run once, on the PR")
+        if "schedule" in ev:
+            for jid in local:
+                add("SCHEDULE", keyed[jid], "scheduled run of a job with a local parity command")
+        if DEPLOY_FILE_RE.match(name.lower()):
+            for jid, job in jobs.items():
+                if not isinstance(job, dict) or not is_deploy_job(job):
+                    continue
+                tests = {t.split(":", 1)[1] for t in test_keys if t.split(":", 1)[0] == name}
+                if not (has_await(job) or reaches(jobs, jid, tests)):
+                    add("DEPLOY_NO_TEST", keyed[jid], "deploys/publishes with no needs: path to a test_jobs entry "
+                        "and no await step")
+        if any(k.split(":", 1)[0] == name for k in contract_keys):
+            filt = [e for e, c in ev.items() if has_paths(c)]
+            for k in sorted(contract_keys):
+                if k.split(":", 1)[0] == name and filt:
+                    add("CONTRACT_PATHS", k, f"contract check on a paths-filtered trigger ({', '.join(sorted(filt))})")
+    return out
+
+
+def cmd_triggers(root, cfg, args):
+    errors = validate_triggers_config(cfg)
+    if errors:
+        raise Fatal("; ".join(errors))
+    wfs = load_workflows(root)
+    found = trigger_findings(wfs, cfg)
+    enforce = cfg.get("triggers", {}).get("enforce", False)
+    summary = f"triggers: examined {len(wfs)} workflows, {len(found)} findings"
+    if enforce:
+        return finish(found, [], summary, examined=len(wfs), what="workflows")
+    warns = ["WARN " + f for f in found]
+    notes = ["triggers is not enforced for this repo (set \"triggers\": {\"enforce\": true} to fail on findings)"]
+    return finish([], warns, summary, notes, examined=1)
+
+
 # ---------------------------------------------------------------- output / CLI
 
 def finish(findings, warns, summary, notes=(), examined=1, what="uses: lines"):
@@ -1219,7 +1455,7 @@ def default_root():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="workflow-preflight", description=__doc__.split("\n")[0])
-    ap.add_argument("subcommand", choices=["lint", "parity", "refs", "calls", "dispatch-check"])
+    ap.add_argument("subcommand", choices=["lint", "parity", "refs", "calls", "dispatch-check", "triggers"])
     ap.add_argument("workflow", nargs="?", help="dispatch-check: the workflow file name")
     ap.add_argument("--root")
     ap.add_argument("--config")
@@ -1233,7 +1469,10 @@ def main(argv=None):
     ap.add_argument("--names-file", help="refs/dispatch-check: JSON names fixture instead of gh (tests)")
     ap.add_argument("--gh", help="refs/dispatch-check: path of the gh binary (default $WORKFLOW_PREFLIGHT_GH or PATH)")
     ap.add_argument("--offline", action="store_true", help="lint: skip the tag/SHA network check (prints a warning)")
-    args, extra = ap.parse_known_args(argv)
+    # Intermixed: before Python 3.13, plain parse_known_args fills the optional `workflow`
+    # positional with nothing when a flag sits between it and `subcommand`
+    # (`dispatch-check -R O/R x.yml`), leaving x.yml as an "unexpected argument".
+    args, extra = ap.parse_known_intermixed_args(argv)
     if extra:
         print(f"unexpected arguments: {extra}", file=sys.stderr)
         return 2
@@ -1246,7 +1485,7 @@ def main(argv=None):
         if args.subcommand == "calls":
             return cmd_calls(root, args)
         cfg = load_config(Path(args.config) if args.config else root / CONFIG_NAME)
-        return {"lint": cmd_lint, "parity": cmd_parity}[args.subcommand](root, cfg, args)
+        return {"lint": cmd_lint, "parity": cmd_parity, "triggers": cmd_triggers}[args.subcommand](root, cfg, args)
     except Fatal as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
