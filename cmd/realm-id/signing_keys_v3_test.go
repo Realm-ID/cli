@@ -79,6 +79,11 @@ func TestSigningKeysInit_FileShareIsASoundSplitAndTheOutputsAreRight(t *testing.
 	if strings.Contains(string(braw), "d_partner") {
 		t.Error("the RealmID-half bundle leaks d_partner")
 	}
+	// ...and the partner's share carries no RealmID half nor the whole exponent (SPEC14_14_dealer check 4).
+	sraw, _ := os.ReadFile(m.ShareFile)
+	if plain := string(openEnvelopePlain(t, sraw, m.KEK, v3Realm)); strings.Contains(plain, `"d_ri"`) || strings.Contains(plain, `"d"`) {
+		t.Errorf("the partner share leaks d_ri or d: %s", plain)
+	}
 	pubPath := strings.TrimSuffix(m.BundlePath, "bundle.json") + "public.json"
 	praw, err := os.ReadFile(pubPath)
 	if err != nil {

@@ -302,29 +302,65 @@ func emsaInt(digest []byte, k int) (*big.Int, error) {
 	return new(big.Int).SetBytes(em), nil
 }
 
+// dealt is one dealer split. p and q are kept for the SPEC14_14_dealer range check only and are
+// never serialised: no share, bundle or upload carries them.
 type dealt struct {
 	n, e, dRI, dPartner *big.Int
+	p, q                *big.Int
 }
 
-// dealKey generates a 2048-bit RSA key and splits its private exponent d = d_ri + d_partner
-// (mod phi) at random, so neither half alone signs (R5).
+// dealKey generates a 2048-bit RSA key and splits its private exponent (SPEC §14.14), so neither
+// half alone signs (R5). The CLI keeps its own dealer (console-tier client, owner 2026-11-02); it is
+// held to sdk/testdata/split-vectors by dealer_test.go, not by sharing sdk/go's code.
 func dealKey() (*dealt, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, fmt.Errorf("generating the key: %w", err)
 	}
-	phi := new(big.Int).Mul(new(big.Int).Sub(key.Primes[0], big.NewInt(1)), new(big.Int).Sub(key.Primes[1], big.NewInt(1)))
+	return dealFrom(key)
+}
+
+// dealFrom splits priv's d = d_ri + d_partner (mod lambda(n)) with d_ri uniform in [1, lambda),
+// redrawing on a zero d_partner (SPEC §14.14).
+func dealFrom(priv *rsa.PrivateKey) (*dealt, error) {
+	if len(priv.Primes) != 2 {
+		return nil, errors.New("unexpected RSA key shape")
+	}
+	p, q := priv.Primes[0], priv.Primes[1]
+	span := new(big.Int).Sub(lambdaOf(p, q), big.NewInt(1)) // d_ri = 1 + [0, lambda-1) = [1, lambda)
 	for {
-		dRI, err := rand.Int(rand.Reader, phi)
+		dRI, err := rand.Int(rand.Reader, span)
 		if err != nil {
 			return nil, err
 		}
-		dP := new(big.Int).Sub(key.D, dRI)
-		dP.Mod(dP, phi)
-		if dRI.Sign() > 0 && dP.Sign() > 0 {
-			return &dealt{n: key.N, e: big.NewInt(int64(key.E)), dRI: dRI, dPartner: dP}, nil
+		dRI.Add(dRI, big.NewInt(1))
+		// A zero d_partner (probability about 2^-2047) is redrawn: neither half alone may sign.
+		if dP, err := splitWithDRI(p, q, priv.D, dRI); err == nil {
+			return &dealt{n: priv.N, e: big.NewInt(int64(priv.E)), dRI: dRI, dPartner: dP, p: p, q: q}, nil
 		}
 	}
+}
+
+// lambdaOf is lcm(p-1, q-1). Same name and maths as sdk/go/rotation.go, so the two diff cleanly.
+func lambdaOf(p, q *big.Int) *big.Int {
+	one := big.NewInt(1)
+	p1 := new(big.Int).Sub(p, one)
+	q1 := new(big.Int).Sub(q, one)
+	return new(big.Int).Div(new(big.Int).Mul(p1, q1), new(big.Int).GCD(nil, nil, p1, q1))
+}
+
+// splitWithDRI is the pure split (SPEC §14.14): d_partner = (d - dRI) mod lambda(n), with d reduced
+// modulo lambda(n) first. It refuses dRI outside [1, lambda) and a zero d_partner.
+func splitWithDRI(p, q, d, dRI *big.Int) (*big.Int, error) {
+	lam := lambdaOf(p, q)
+	if dRI.Sign() < 1 || dRI.Cmp(lam) >= 0 {
+		return nil, errors.New("d_ri outside [1, lambda)")
+	}
+	dP := new(big.Int).Mod(new(big.Int).Sub(new(big.Int).Mod(d, lam), dRI), lam)
+	if dP.Sign() == 0 {
+		return nil, errors.New("d_partner is zero")
+	}
+	return dP, nil
 }
 
 func bigB64(x *big.Int) string { return rawB64.EncodeToString(x.Bytes()) }

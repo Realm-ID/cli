@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-37 entries. Newest first.
+38 entries. Newest first.
 
+- [2026-11-02 — Dealer splits mod λ (SPEC §14.14); the CLI keeps its own dealer, held to vendored shared vectors](#2026-11-02--dealer-splits-mod-λ-spec-1414-the-cli-keeps-its-own-dealer-held-to-vendored-shared-vectors)
 - [2026-11-01 — Hide split-signing and installation pass routes from the generated tree (re-vendor v0.144.0)](#2026-11-01--hide-split-signing-and-installation-pass-routes-from-the-generated-tree-re-vendor-v01440)
 - [2026-10-30 — R41 CLI: config set tenant answers MFA; stepUpCall adopts the verified session (RCA)](#2026-10-30--r41-cli-config-set-tenant-answers-mfa-stepupcall-adopts-the-verified-session-rca)
 - [2026-10-29 — E6: split-signing CLI built — BFF-only sessions, own crypto, exit 6/8/9](#2026-10-29--e6-split-signing-cli-built--bff-only-sessions-own-crypto-exit-689)
@@ -46,6 +47,20 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-11-02 — Dealer splits mod λ (SPEC §14.14); the CLI keeps its own dealer, held to vendored shared vectors
+
+**Problem.** `dealKey` split `d = d_ri + d_partner` modulo φ on the unreduced `key.D`, while SPEC §14.14 makes λ(n) canonical (`d` reduced mod λ, `d_ri` uniform in `[1, λ)`, redraw on a zero half). Signing was unaffected (λ divides φ), so this was conformance, not a live fault; but the CLI was the one dealer not held to the shared vectors, which is how it drifted unnoticed. The TODO item written earlier the same day said to move the CLI onto an sdk/go dealer (SPEC "owner ruling 9").
+
+**Decision (owner, 2026-11-02).** The CLI **keeps its own dealer** and does not depend on sdk/go. The CLI is a console-tier client (the terminal twin of the RI UI), not a partner backend; a console tool pinned to the partner server SDK would ride that SDK's release train and force an sdk/go export only we need. Drift is held by a shared TEST: `cmd/realm-id/dealer_test.go` runs the four `SPEC14_14_dealer` checks (vector split with `d_ri > d`, range over 20 deals, round trip, zero half refused; shape is in `signing_keys_v3_test.go`, which now also asserts the partner share carries no `d_ri` or `d`).
+
+**How the vectors arrive.** CI here cannot read `sdk/`, so the whole `vectors.json` is vendored to `cmd/realm-id/testdata/split-vectors.json`, pinned in `cmd/realm-id/SPLIT_VECTORS_CONTRACT` (sdk commit + sha256), written by `scripts/revendor-split-vectors.sh <sdk sha>` and re-hashed by `TestSplitVectorsMatchTheirPin`: the same pattern as `error-reference.md` (2026-10-14).
+
+**Implementation.** `dealKey` = `rsa.GenerateKey` + `dealFrom`; `lambdaOf` and the pure `splitWithDRI` carry sdk/go `rotation.go`'s names and maths so the two diff cleanly. `dealt` gains `p, q` for the range test; they are never serialised. stdlib only. Existing partner shares stay valid (any split that sums to `d` mod λ signs); only new deals change; no wire or bundle-format change.
+
+**Supersedes** the E6 entry's (2026-10-29) "revisit when the sdk publishes a stable crypto module": the CLI's crypto stays its own by design, not for lack of a module.
+
+**Verified.** Mutation: `lambdaOf` returning φ fails the vector, range and zero-half tests; one changed byte in the vendored file fails the pin test.
 
 ## 2026-11-01 — Hide split-signing and installation pass routes from the generated tree (re-vendor v0.144.0)
 

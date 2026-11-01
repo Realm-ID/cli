@@ -3,6 +3,24 @@
 > Closed and retired records, moved verbatim out of `TODO.md`. See
 > [`TODO.md`](TODO.md) for open, actionable work.
 
+## Split signing: dealer conformance to SPEC §14.14
+
+> **CLOSED 2026-11-02, same day it was filed, by a DIFFERENT route than the item said.** The owner
+> reversed "move the dealer onto sdk/go": the CLI is a console-tier client and keeps its own dealer,
+> now splitting mod λ (`dealFrom`/`splitWithDRI` in `cmd/realm-id/signing_keys.go`) and held to the
+> shared vectors by `cmd/realm-id/dealer_test.go` over a commit-pinned vendored copy. See
+> `DECISIONS.md` 2026-11-02. The original item, verbatim:
+
+- [ ] **Move the dealer onto sdk/go (SPEC §14.14, owner ruling 9; W11 plan item 4).**
+  `cmd/realm-id/signing_keys.go` `dealKey` still splits modulo φ on the unreduced `key.D`, while
+  SPEC §14.14 makes λ canonical and says the CLI dealer is REPLACED by the sdk/go dealer. Signing is
+  unaffected (λ divides φ), so this is conformance, not a live fault. Blocker: sdk/go exports no
+  dealer (`splitExponent` in `go/rotation.go` is unexported), so this needs an sdk/go export + go
+  release first, then the CLI drops its copy and pins sdk/go (no `replace`; the module is published
+  now, which removes the reason recorded in `DECISIONS.md` 2026-10-29 E6). Found 2026-11-02.
+
+---
+
 
 > **CLOSED 2026-09-06, same day it was filed.** The working-tree `cp`
 > re-vendor (`//go:generate cp ../../../issuer/docs/swagger.yaml openapi.yaml`)

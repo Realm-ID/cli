@@ -10,6 +10,10 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 - `verify-token` comment corrected: the MFA-challenge and session-revoke tokens are signed by a
   separate issuer-internal key that is never published (ADR-068 A7.b); refusal behaviour is
   unchanged. Base-trust wording removed from `signing-keys pin` help text and README.
+- `signing-keys init` / `rotate` now split the private exponent modulo λ(n) per SPEC §14.14 (`d`
+  reduced mod λ, `d_ri` uniform in `[1, λ)`), and the dealer is tested against the shared sdk split
+  vectors (vendored, commit-pinned; `scripts/revendor-split-vectors.sh`). No user-visible change:
+  existing partner shares stay valid and the share/bundle formats are unchanged.
 
 ## v0.6.0 — split signing v3: BFF-only CLI, `signing-keys`, key and workload sessions
 

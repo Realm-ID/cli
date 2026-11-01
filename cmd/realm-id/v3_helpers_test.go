@@ -141,6 +141,16 @@ func kekEnv(k []byte) string { return base64.RawURLEncoding.EncodeToString(k) }
 
 func openEnvelope(t *testing.T, raw []byte, kek []byte, realm string) shareBundleT {
 	t.Helper()
+	var b shareBundleT
+	if err := json.Unmarshal(openEnvelopePlain(t, raw, kek, realm), &b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// openEnvelopePlain returns the decrypted ShareBundle JSON exactly as sealed.
+func openEnvelopePlain(t *testing.T, raw []byte, kek []byte, realm string) []byte {
+	t.Helper()
 	var env struct {
 		V     int    `json:"v"`
 		Alg   string `json:"alg"`
@@ -164,11 +174,7 @@ func openEnvelope(t *testing.T, raw []byte, kek []byte, realm string) shareBundl
 	if err != nil {
 		t.Fatalf("envelope did not open under the KEK + realm AAD: %v", err)
 	}
-	var b shareBundleT
-	if err := json.Unmarshal(plain, &b); err != nil {
-		t.Fatal(err)
-	}
-	return b
+	return plain
 }
 
 type shareEntryT struct {
