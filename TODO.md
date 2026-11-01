@@ -33,6 +33,16 @@ Open work only; shipped items live in `CHANGELOG.md` / git tags.
 > Both line numbers in the old note had also drifted (`commands.go:312-317`
 > and `main.go:501-512` no longer point at either function).
 
+## Split signing
+
+- [ ] **Move the dealer onto sdk/go (SPEC §14.14, owner ruling 9; W11 plan item 4).**
+  `cmd/realm-id/signing_keys.go` `dealKey` still splits modulo φ on the unreduced `key.D`, while
+  SPEC §14.14 makes λ canonical and says the CLI dealer is REPLACED by the sdk/go dealer. Signing is
+  unaffected (λ divides φ), so this is conformance, not a live fault. Blocker: sdk/go exports no
+  dealer (`splitExponent` in `go/rotation.go` is unexported), so this needs an sdk/go export + go
+  release first, then the CLI drops its copy and pins sdk/go (no `replace`; the module is published
+  now, which removes the reason recorded in `DECISIONS.md` 2026-10-29 E6). Found 2026-11-02.
+
 
 ## Device-flow DX (Traide integration feedback, 2026-06-29)
 
