@@ -323,6 +323,8 @@ func skipPath(path string) bool {
 	switch {
 	case strings.HasPrefix(path, "/auth/"):
 		return true
+	case skipHandWritten(path):
+		return true
 	case path == "/me":
 		return true
 	case strings.Contains(path, "/.well-known/"):
@@ -423,6 +425,25 @@ func skipDestructive(method, path string) bool {
 		return true
 	}
 	return false
+}
+
+// skipHandWritten drops surfaces the generated tree must not own.
+//
+//   - The whole `/platforms/{id}/signing-keys/split` subtree (split, overlap,
+//     handshake, rotation-lease, downgrade and their sub-paths): the hand-written
+//     `realm-id signing-keys` (signing_keys.go) owns that surface, and two verbs
+//     for one surface would disagree.
+//   - /integrations/installations/{install_id}/pass (POST only in the spec): it
+//     has had no CLI exposure review; `realm-id api` still reaches it.
+//
+// Called from skipPath so the classification guard, which walks skipPath
+// survivors, never sees these paths. (`/auth/token/partial` is already dropped
+// by the /auth/ rule.)
+func skipHandWritten(path string) bool {
+	if strings.Contains(path, "/signing-keys/split") {
+		return true
+	}
+	return strings.HasPrefix(path, "/integrations/installations/") && strings.HasSuffix(path, "/pass")
 }
 
 // nearestStaticBefore returns the closest static (non-param) segment strictly

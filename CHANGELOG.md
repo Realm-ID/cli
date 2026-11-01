@@ -17,6 +17,8 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ### Added
 
+- Vendored issuer spec re-vendored at issuer v0.144.0 (spec 0.65.0); the new split-signing routes stay
+  hand-written under `signing-keys`, not generated.
 - `realm-id config set tenant <id> [--totp CODE]` answers a workspace's MFA challenge (R41): prompt or
   `--totp`, verify, adopt the new `session_token`; off a terminal with no code it exits 3. A step-up
   retry (`user-api-keys create`, `signing-keys ...`) now carries the verified session's token instead

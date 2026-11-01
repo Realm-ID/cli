@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-36 entries. Newest first.
+37 entries. Newest first.
 
+- [2026-11-01 — Hide split-signing and installation pass routes from the generated tree (re-vendor v0.144.0)](#2026-11-01--hide-split-signing-and-installation-pass-routes-from-the-generated-tree-re-vendor-v01440)
 - [2026-10-30 — R41 CLI: config set tenant answers MFA; stepUpCall adopts the verified session (RCA)](#2026-10-30--r41-cli-config-set-tenant-answers-mfa-stepupcall-adopts-the-verified-session-rca)
 - [2026-10-29 — E6: split-signing CLI built — BFF-only sessions, own crypto, exit 6/8/9](#2026-10-29--e6-split-signing-cli-built--bff-only-sessions-own-crypto-exit-689)
 - [2026-10-27 — W0b: planned CLI docs follow R60-R76 (human-only verbs, exit 6/7 for G19)](#2026-10-27--w0b-planned-cli-docs-follow-r60-r76-human-only-verbs-exit-67-for-g19)
@@ -45,6 +46,10 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-11-01 — Hide split-signing and installation pass routes from the generated tree (re-vendor v0.144.0)
+
+Re-vendored the issuer spec at issuer v0.144.0 (spec 0.65.0) so the CLI pin matches the api repo. The new split-signing routes (`/platforms/{id}/signing-keys/split` and every sub-path) are hidden from the GENERATED tree because the hand-written `realm-id signing-keys` owns that surface and two verbs for one surface would disagree. `/integrations/installations/{install_id}/pass` is hidden too: it has had no CLI exposure review, and `realm-id api` still reaches it. Both rules live in `skipHandWritten`, called from `skipPath` so the segment-classification guard never sees them. `/auth/token/partial` needed no rule (the `/auth/` skip already covers it). Generated command set is unchanged: 115 entries, 0 added, 0 removed, 0 changed. actionVerb and listOnlyCollections were deliberately not touched.
 
 ## 2026-10-30 — R41 CLI: config set tenant answers MFA; stepUpCall adopts the verified session (RCA)
 
