@@ -3,7 +3,7 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
-## Unreleased
+## v0.6.1 — dealer splits mod λ (SPEC §14.14); no user-visible change
 
 ### Changed
 
