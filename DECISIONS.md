@@ -62,7 +62,7 @@ context.
 
 Re-vendored the embedded issuer spec from tag `v0.147.0` (info.version 0.66.0, was v0.144.0) with `scripts/revendor-spec.sh`, so the CLI matches the BFF (`api` v0.47.0) pinned for the device-login release; `scripts/issuer-pin-parity.py` was failing on api=v0.147.0 vs cli=v0.144.0.
 
-What appears in the generated tree: the four `/auth/device-authorizations` routes (start, `inspect`, `approve`, `deny`; ADR-122) and the `/auth/token` request body is now a `oneOf`. No other paths changed. `go test -race ./...` passes with no golden change.
+What changed in the vendored spec: the four `/auth/device-authorizations` routes (start, `inspect`, `approve`, `deny`; ADR-122) were added and the `/auth/token` request body is now a `oneOf`. No other paths changed. `go test -race ./...` passes with no golden change. **Correction (2026-11-03, release prep for v0.6.2):** an earlier wording said these routes "appear in the generated tree"; they do NOT. A build of `bc603b3` answers `unknown command "device-authorizations"` and lists no new resource, so they are reachable only via `realm-id schema` and `realm-id api`, and v0.6.2 has no new typed command.
 
 Not done here: the CLI's own device-login flow; this is the pin only. `make check` still fails `workflow parity` (tests.yml go 1.23 vs config 1.27.2), which predates this change and is filed in TODO.md.
 

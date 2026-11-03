@@ -3,6 +3,16 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## v0.6.2 — embedded contract re-pinned to issuer v0.147.0 (spec 0.66.0)
+
+### Changed
+
+- The embedded OpenAPI contract (`realm-id schema`) is now issuer `v0.147.0` / spec `0.66.0`,
+  matching the BFF (`api` v0.47.0+). It adds the four `/auth/device-authorizations` routes
+  (start, `inspect`, `approve`, `deny`; ADR-122) and the `/auth/token` request body is now a
+  `oneOf`. **No new typed command**: these routes are reachable through `realm-id api` only.
+  Existing commands and exit codes are unchanged.
+
 ## v0.6.1 — dealer splits mod λ (SPEC §14.14); no user-visible change
 
 ### Changed
