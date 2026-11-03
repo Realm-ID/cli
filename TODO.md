@@ -98,4 +98,3 @@ warning against concurrent `auth login`); these are the code fixes.
       `v0.3.7` and `main` is 8 commits ahead, so the revendor machinery is
       FIXED-ON-MAIN-BUT-UNRELEASED. Do not read it as live.
 - [ ] `cmd/realm-id/spec.go` — Expose `realm-id messaging` (ADR-115). Owner ruling 2026-10-17: build it; the secret is read from stdin or an interactive prompt, never a flag; ships in the next cli release. Hidden via skipBFFOnly until then
-- cmd/../.github/workflows/tests.yml: workflow-parity PIN_DRIFT go-version 1.23 vs config pin 1.27.2 makes `make check` fail (found 2026-11-03)

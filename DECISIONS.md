@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-39 entries. Newest first.
+40 entries. Newest first.
 
+- [2026-11-03 — workflow-parity PIN_DRIFT: split the Go 1.23 minimum leg into its own job (RCA)](#2026-11-03--workflow-parity-pin_drift-split-the-go-123-minimum-leg-into-its-own-job-rca)
 - [2026-11-03 — Re-vendor issuer v0.147.0 / spec 0.66.0 to match api v0.47.0 (device-login release)](#2026-11-03--re-vendor-issuer-v01470--spec-0660-to-match-api-v0470-device-login-release)
 - [2026-11-02 — Dealer splits mod λ (SPEC §14.14); the CLI keeps its own dealer, held to vendored shared vectors](#2026-11-02--dealer-splits-mod-λ-spec-1414-the-cli-keeps-its-own-dealer-held-to-vendored-shared-vectors)
 - [2026-11-01 — Hide split-signing and installation pass routes from the generated tree (re-vendor v0.144.0)](#2026-11-01--hide-split-signing-and-installation-pass-routes-from-the-generated-tree-re-vendor-v01440)
@@ -48,6 +49,14 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-11-03 — workflow-parity PIN_DRIFT: split the Go 1.23 minimum leg into its own job (RCA)
+
+- **Symptom:** `make workflow-parity` (and so `make check`) failed: `PIN_DRIFT tests.yml: go-version (matrix.go) is 1.23, config pins 1.27.2`. It had been a WARN until 2026-11-03.
+- **Root cause:** the `adopted: 2026-10-20` grace window in `.workflow-preflight.json` expired, turning a latent WARN into a FAIL. `tests.yml:test` ran a two-leg matrix (Go 1.23 = go.mod minimum, 1.27.2 = fleet); the checker's `toolchain_overrides` apply to a whole JOB, so a matrix leg cannot carry one.
+- **Why it wasn't caught:** during grace the finding was only a WARN, and nothing reminded us of the expiry date.
+- **Fix:** `tests.yml` split into `test` (Go 1.27.2 only) and `test-min` ("Unit on Go 1.23 (go.mod minimum)", identical steps). `.workflow-preflight.json` gets a `toolchain_overrides` entry and an `ci-only` waiver for `tests.yml:test-min` (the laptop runs 1.27.2, so the minimum leg cannot run in the pre-push gate). The minimum-version proof is kept, not dropped. The `test` job's check name changes from `Unit (go test ./...) on Go 1.27.2` (matrix-derived) to the same literal text, and the 1.23 check is renamed to `Unit on Go 1.23 (go.mod minimum)`; `release.yml` consumes the whole called workflow, so it is unaffected.
+- **Prevention:** when a config carries a grace date, treat the expiry as a dated TODO. Filed for devops (not done here): the canonical checker could support per-matrix-leg toolchain overrides, which would let a minimum-version leg stay a matrix leg.
 
 ## 2026-11-03 — Re-vendor issuer v0.147.0 / spec 0.66.0 to match api v0.47.0 (device-login release)
 

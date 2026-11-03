@@ -52,24 +52,19 @@ defaults:
 
 jobs:
   test:
-    name: Unit (go test ./...) on Go ${{ matrix.go }}
+    name: Unit (go test ./...) on Go 1.27.2
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # 1.23 proves the go.mod minimum (what goreleaser ships); 1.27 is the
-        # fleet toolchain, so a result on the dev host agrees with CI.
-        go: ['1.23', '1.27.2']
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The 1.23 leg matches `release.yml` and go.mod, deliberately: the gate
-      # must compile what goreleaser ships. The 1.27 leg tracks the fleet
-      # toolchain (the minimum leg is kept, not replaced).
+      # The fleet toolchain, so a result on the dev host agrees with CI. The
+      # go.mod minimum is proved by the `test-min` job below: a separate job,
+      # not a matrix leg, because the workflow-parity toolchain override is
+      # per JOB (DECISIONS.md 2026-11-03).
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: ${{ matrix.go }}
+          go-version: '1.27.2'
           cache: true
 
       # A gate, not hygiene. `gofmt -l` derives the file list from the tree,
@@ -97,5 +92,38 @@ jobs:
       # package, 21.2s), and that is the whole argument for adding it AT that
       # moment — the ratchet is one line while it is green, and an open-ended
       # debugging session once it is not.
+      - name: Test
+        run: go test -race ./...
+
+  # Same steps as `test`, on the go.mod minimum (what goreleaser ships via
+  # `release.yml`): the gate must compile what is released.
+  test-min:
+    name: Unit on Go 1.23 (go.mod minimum)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l cmd)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reports unformatted files:"
+            echo "$unformatted"
+            gofmt -d cmd
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - name: Build + vet
+        run: |
+          go build ./...
+          go vet ./...
+
       - name: Test
         run: go test -race ./...

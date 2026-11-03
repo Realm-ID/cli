@@ -2,12 +2,14 @@
   "tools": {"actionlint": "1.7.12", "shellcheck": "0.11.0"},
   "toolchain": {"go": "1.27.2"},
   "toolchain_overrides": {
-    "release.yml:goreleaser": {"go": "1.23", "reason": "builds the release at the go.mod minimum (go 1.23), which is what goreleaser ships; DECISIONS.md 2026-10-21"}
+    "release.yml:goreleaser": {"go": "1.23", "reason": "builds the release at the go.mod minimum (go 1.23), which is what goreleaser ships; DECISIONS.md 2026-10-21"},
+    "tests.yml:test-min": {"go": "1.23", "reason": "go.mod minimum leg, matches goreleaser; DECISIONS.md 2026-11-03"}
   },
   "local_gate": "make check",
   "adopted": "2026-10-20",
   "jobs": {
     "tests.yml:test": {"local": "go test -race ./...", "marker": "go-test"},
+    "tests.yml:test-min": {"waiver": "ci-only", "reason": "proves the go.mod minimum (Go 1.23); the laptop runs the fleet toolchain 1.27.2 so this leg cannot run in the pre-push gate; tests.yml:test is the mapped job and make check runs the same suite"},
     "changelog-hygiene.yml:order": {"local": "./scripts/changelog-hygiene.sh order", "marker": "changelog-order"},
     "workflow-hygiene.yml:lint": {"local": "make workflow-lint"},
     "workflow-hygiene.yml:pinned": {"local": "make workflow-parity", "marker": "workflow-parity"},
