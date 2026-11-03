@@ -181,7 +181,17 @@ info:
     `actor_required` (403), `login_grant_removed` (400), `split_signing_required`,
     `realm_not_split`, `platform_key_not_a_user_key`, `idempotency_key_reused`,
     `idempotency_in_progress` and the others named on the operations below.
-  version: 0.65.0
+
+    **0.66.0 (additive, ADR-122; BUILT, unreleased).** Generic device
+    authorization (RFC 8628): `POST /auth/device-authorizations` (start, no
+    actor), `/inspect`, `/approve`, `/deny` (carried actor required), and the
+    grant `urn:ietf:params:oauth:grant-type:device_code` on `POST /auth/token`
+    and `POST /auth/token/partial`. New error codes: `authorization_pending`,
+    `slow_down`, `access_denied`, `expired_token` (400, the poll),
+    `device_code_attempts_exceeded` (429), `subject_suspended`,
+    `device_authorization_not_pending`, `device_authorization_collected`
+    (409), `revoke_existing_sessions_required`, `invalid_client_id` (400).
+  version: 0.66.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -755,8 +765,11 @@ components:
         OTP login (ADR-071; direct cutover from the former
         `otp` grant). Under ADR-071 this authenticates a
         **service account** (`users.kind=service`) via a `view_bff` OTP
-        an owner/admin minted for it (`POST /auth/otp/issue`
-        `purpose=login`). The `kind × mode` gate rejects a `kind=human`
+        the tenant OWNER minted for it (`POST /auth/otp/issue`
+        `purpose=login`; owner-only since ADR-091 D6.1, an admin gets
+        `403 forbidden`). Since 0.66.0 a service account has a second login
+        method, the ADR-122 device grant; this one is unchanged and not
+        deprecated. The `kind × mode` gate rejects a `kind=human`
         subject here (humans elevate via TOTP, never an owner-minted OTP)
         — failure collapses to `invalid_credentials` (no enumeration).
         Gated by `realms.config.otp_login_enabled`. Inbound bearer:
@@ -1047,9 +1060,16 @@ components:
       properties:
         grant_type:
           type: string
-          enum: [refresh_token, api_key, user_api_key, platform_api_key, 'urn:ietf:params:oauth:grant-type:token-exchange', integration_installation, otp]
+          enum: [refresh_token, api_key, user_api_key, platform_api_key, 'urn:ietf:params:oauth:grant-type:token-exchange', integration_installation, otp, 'urn:ietf:params:oauth:grant-type:device_code']
           description: |
             Omitted means `refresh_token`.
+
+            `urn:ietf:params:oauth:grant-type:device_code` (ADR-122 D6, 0.66.0,
+            built, unreleased): the RFC 8628 poll, `device_code` in the body. Bot case:
+            `TokenResponse` / `TokenPartialResponse` plus `service_account_id`
+            and `device_authorization_id`; self case: `DeviceLoginResponse` on
+            either route. Pending answers are `400` `authorization_pending` |
+            `slow_down` | `access_denied` | `expired_token`.
 
             `otp` (split-signing plan § 3.1, "SA OTP" row) is for a **service
             account only**: `identifier` + `presented` + `tenant_id` (REQUIRED for
@@ -1066,6 +1086,9 @@ components:
         api_key:
           type: string
           description: The raw key, for the three api-key grants.
+        device_code:
+          type: string
+          description: "For the device-code grant (ADR-122): the opaque `device_code` returned by `POST /auth/device-authorizations`."
         subject_token:
           type: string
           description: The workload OIDC JWT, for the token exchange (ADR-057).
@@ -1230,6 +1253,157 @@ components:
             multi-org key mints in one org and is refused in another — the error
             names the org, or it reads as "the key is broken".
 
+    DeviceAuthorizationStartRequest:
+      type: object
+      description: |
+        ADR-122 D1/D4 start body. Carries NO account (T1): only the optional
+        app (`client_id`, N5), device name and subject hint. The realm is the
+        platform token's.
+      properties:
+        client_id:
+          type: string
+          maxLength: 64
+          description: |
+            RFC 8628 `client_id`: an opaque, partner-chosen app name. Stored,
+            returned by inspect, audited. Confers NO authority (N5).
+        device_name:
+          type: string
+          maxLength: 64
+          description: Client-declared; shown labelled as typed by the device.
+        subject_hint:
+          type: string
+          maxLength: 256
+          description: Optional, opaque, never trusted; the approve call names the account (T1).
+
+    DeviceAuthorizationStartResponse:
+      type: object
+      required: [device_authorization_id, device_code, user_code, expires_in, interval, expires_at]
+      properties:
+        device_authorization_id: { type: string, format: uuid }
+        device_code:
+          type: string
+          description: 32 random bytes, base64url. Only its hash is stored.
+        user_code:
+          type: string
+          description: 8 characters from a 28-character alphabet, shown `XXXX-XXXX`. Only its hash is stored.
+        expires_in: { type: integer, description: Seconds; 600. }
+        interval: { type: integer, description: Seconds between polls; 5. }
+        expires_at: { type: string, format: date-time }
+
+    DeviceAuthorizationCodeRequest:
+      type: object
+      required: [user_code]
+      description: Inspect and deny body (ADR-122 D4). The dash and case of `user_code` are ignored.
+      properties:
+        user_code: { type: string }
+
+    DeviceAuthorizationApproveRequest:
+      type: object
+      required: [user_code, subject_ref, revoke_existing_sessions]
+      description: |
+        ADR-122 D1/D4. Has NO token fields: the approver is the carried actor,
+        and fresh MFA is the partner BFF's ADR-096 step-up (Q5).
+      properties:
+        user_code: { type: string }
+        subject_ref:
+          type: string
+          description: |
+            `self` (the approver's own identity) or `user:<id>` of a
+            `kind=service` account in the actor's pinned tenant, which the actor
+            must OWN (ADR-091 D6.1). Anything else is the indistinguishable `403`.
+        tenant_id:
+          type: string
+          format: uuid
+          description: |
+            Self case only (R41): pin the device's session to one of the
+            approver's memberships. Absent: pinned when the approver has one
+            membership, unpinned otherwise.
+        revoke_existing_sessions:
+          type: boolean
+          description: |
+            REQUIRED (Q3, stated never inferred). `true` ends every other session
+            of the subject's identity in the realm, except the approving session,
+            when the device COLLECTS its tokens; the count is audited.
+
+    DeviceAuthorizationApproveResponse:
+      type: object
+      required: [device_authorization_id, status, subject_ref, subject_type, expires_at]
+      properties:
+        device_authorization_id: { type: string, format: uuid }
+        status: { type: string, enum: [approved] }
+        subject_ref: { type: string }
+        subject_type: { type: string, enum: [user, service] }
+        expires_at: { type: string, format: date-time }
+
+    DeviceAuthorizationDenyResponse:
+      type: object
+      required: [device_authorization_id, status]
+      properties:
+        device_authorization_id: { type: string, format: uuid }
+        status: { type: string, enum: [denied] }
+
+    DeviceAuthorization:
+      type: object
+      required: [device_authorization_id, status, device_name_source, reported_ip_source, observed_ip, created_at, expires_at]
+      description: |
+        Inspect answer (ADR-122 D4). The device IP is the partner's report,
+        trusted and labelled (Q6); it is never compared with the approver's
+        browser IP. A bound request stays inspectable by its eligible actors
+        until 10 minutes after collection or `expires_at`, whichever is later.
+      properties:
+        device_authorization_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending, approved, denied, collected, failed, expired]
+        client_id: { type: string }
+        device_name: { type: string }
+        device_name_source: { type: string, enum: [client_declared] }
+        subject_hint: { type: string }
+        reported_ip: { type: string }
+        reported_ip_source: { type: string, enum: [partner] }
+        observed_ip: { type: string }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        subject_ref: { type: string, description: Present once approved. }
+        subject_type: { type: string, enum: [user, service] }
+        collected_session_id:
+          type: string
+          description: Present once collected; the session "Not you? Sign it out" ends (Q7, DQ1).
+        failure_reason:
+          type: string
+          description: The code of the last refused approve, or of a terminal failure at collection (R-CLI2).
+
+    DeviceLoginResponse:
+      type: object
+      required: [status, subject_type, refresh_token, user, tenants, session_id, device_authorization_id]
+      description: |
+        Device-code grant, SELF case (ADR-122 D6, R-CLI1): the `LoginResponse`
+        fields plus `tenant_id` when the approver pinned one, `session_id` and
+        `device_authorization_id`. No access token (login authenticates a
+        person, R44), so the shape is the same on `POST /auth/token` and
+        `POST /auth/token/partial`.
+      properties:
+        status: { type: string, enum: [ok] }
+        subject_type: { type: string, enum: [user] }
+        user:
+          type: object
+          required: [id]
+          properties:
+            id: { type: string, format: uuid }
+        refresh_token: { type: string }
+        refresh_exp: { type: integer, format: int64 }
+        idle_ttl: { type: integer, format: int64 }
+        tenants:
+          type: array
+          items: { type: object, additionalProperties: true }
+          description: The approver's memberships, as on `LoginResponse.tenants`.
+        tenant_id:
+          type: string
+          format: uuid
+          description: Present only when the session is pinned.
+        session_id: { type: string }
+        device_authorization_id: { type: string, format: uuid }
+
     TokenResponse:
       type: object
       required: [status, token_type, subject_type, access_token, expires_in]
@@ -1280,6 +1454,14 @@ components:
         role:
           type: string
           description: User refresh only.
+        service_account_id:
+          type: string
+          format: uuid
+          description: Device-code grant, bot case only (ADR-122 D6, 0.66.0).
+        device_authorization_id:
+          type: string
+          format: uuid
+          description: Device-code grant only (ADR-122 D6, 0.66.0).
       example:
         status: ok
         token_type: Bearer
@@ -1333,6 +1515,8 @@ components:
         idle_ttl: { type: integer, format: int64 }
         tenant_id: { type: string, format: uuid, description: User refresh only. }
         role: { type: string, description: User refresh only. }
+        service_account_id: { type: string, format: uuid, description: "Device-code grant, bot case only (ADR-122 D6, 0.66.0)." }
+        device_authorization_id: { type: string, format: uuid, description: "Device-code grant only (ADR-122 D6, 0.66.0)." }
 
     MFAVerifyRequest:
       type: object
@@ -1458,10 +1642,11 @@ components:
             Opaque tenant-scoped purpose label. Examples: `"login"`,
             `"delivery"`, `"payout_approval"`. Pattern
             `^[a-z][a-z0-9_]{0,63}$`. `purpose: "login"` is the
-            **mint-gate** (ADR-071 §5): the effective caller must be
-            owner/admin of the tenant and the target `subject_ref` must
-            reference a `kind=service` account in that tenant — else
-            `403`. Other purposes keep the open-to-any-tenant-member
+            **mint-gate** (ADR-071 §5): for `delivery_mode: view_bff` the effective
+            caller must be the tenant OWNER (ADR-091 D6.1; an admin gets `403`),
+            and the target `subject_ref` must reference a `kind=service`
+            account in that tenant — else `403` (code `otp.go:230-231`,
+            `:250-251`; the `sms` login mode of ADR-103 is not owner-gated). Other purposes keep the open-to-any-tenant-member
             behavior of the partner OTP primitive.
         delivery_mode:
           type: string
@@ -2315,21 +2500,22 @@ components:
           type: integer
           minimum: 0
           description: |
-            ADR-092 D1/D2. Live tenant-scoped sessions allowed per membership;
-            `0` means unlimited. A DEFAULT, not a cap — `realm_roles.
-            concurrent_session_limit` overrides it in BOTH directions.
+            ADR-092 D1/D2, as amended 2026-11-02. Live tenant-scoped sessions
+            allowed per membership; `0` means unlimited. The limit is a
+            per-REALM setting only: the per-role override was dropped by
+            ADR-101.
 
             **The login mechanism does not decide concurrency.** The gate sits
             in `mintAccessTokenWithBroker`, the single choke point every
             tenant-scoped access token passes through, so it applies to
-            `grant_type=otp` and service-account logins exactly as it does to
-            provider-token logins. There is no per-grant exemption.
+            `grant_type=otp` logins exactly as it does to provider-token
+            logins. There is no per-grant exemption.
 
-            Machine principals are handled at CONFIG time, not exempted at mint
-            time: setting a limit on a role whose `assignable_to` includes
-            `service` is refused with `session_limit_not_allowed_for_service_role`,
-            because N pods logging in as one bot are one user row and a limit
-            there turns a rolling deploy into an outage.
+            **The limit counts PEOPLE only.** A `kind=service` principal is
+            never counted and never refused: a bot running on N pods, or
+            mid rolling-deploy, is N legitimate sessions of one user row, and
+            a cap there turns a deploy into an outage. Only `kind=human`
+            principals are gated.
 
             A renewal is never refused — the check asks whether admitting this
             session would push the membership over, so a refresh of an existing
@@ -3003,7 +3189,8 @@ components:
           type: integer
           description: |
             See `RealmConfigPatch.concurrent_session_limit`. Applies to every
-            tenant-scoped mint regardless of grant type; `0` is unlimited.
+            tenant-scoped mint of a `kind=human` principal regardless of grant
+            type; `kind=service` principals are exempt; `0` is unlimited.
         single_tenant_membership: { type: boolean }
         invitation_acceptance: { type: string, enum: [auto, explicit] }
         session_eviction_policy: { type: string }
@@ -4845,7 +5032,10 @@ paths:
           description: OK
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/TokenResponse' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/TokenResponse'
+                  - $ref: '#/components/schemas/DeviceLoginResponse'
         '409':
           description: |
             split_signing_required — the realm is split and the grant is not
@@ -4875,7 +5065,17 @@ paths:
             `user_api_keys.max_permission_strings` /
             `max_permission_string_len`)
             | scope_not_supported (this session class mints no `scope`)
-            | bad_json.
+            | bad_json
+            | device-code grant (ADR-122 D6, 0.66.0): `authorization_pending`
+            (not approved yet, or an approve was refused) | `slow_down` (polled
+            sooner than `interval`; the interval grows by 5 s) | `access_denied`
+            (denied, or the bot was suspended or deactivated before collection)
+            | `expired_token` (unknown, already collected or expired: one
+            answer) | `session_limit_reached` (self case, a race past the realm
+            limit at collection; no revocation token, the device is not the
+            approver). Any other terminal collection failure answers with its
+            own login code (e.g. `403 user_suspended`) and repeats it until
+            expiry (R-CLI2).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -4982,10 +5182,17 @@ paths:
             schema: { $ref: '#/components/schemas/TokenRequest' }
       responses:
         '200':
-          description: OK — half-signed.
+          description: |
+            OK — half-signed. The ADR-122 device-code grant's SELF case answers
+            `DeviceLoginResponse` here too (it mints no access token, so nothing
+            is signed); its bot case answers `TokenPartialResponse` with
+            `service_account_id` and `device_authorization_id`.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/TokenPartialResponse' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/TokenPartialResponse'
+                  - $ref: '#/components/schemas/DeviceLoginResponse'
         '400':
           description: |
             platform_grant_not_partial (R49) | platform_key_not_a_user_key (R24)
@@ -5263,6 +5470,217 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/device-authorizations:
+    post:
+      tags: [Auth]
+      x-realmid-no-actor: true
+      security:
+        - BearerPlatformToken: []
+      parameters:
+        - name: X-On-Behalf-Of-IP
+          in: header
+          required: false
+          schema: { type: string }
+          description: |
+            The device's IP as the partner's backend saw it. Seated only from a
+            verified platform-class bearer; trusted as the partner's report and
+            labelled `reported_ip_source: partner` (ADR-122 D3, Q6).
+      summary: Start a device authorization (RFC 8628), ADR-122
+      description: |
+        A device asks to log in, carrying NO account (T1): only the realm (the
+        platform token's), an optional app `client_id` (N5), device name and
+        subject hint. No actor: this is a front-door route (ADR-121 D2, as
+        amended by ADR-122; the `x-realmid-no-actor` mark lands with the
+        handler, because the drift test requires the route in `noActorAllowed`).
+        Only hashes of the codes are stored. 10-minute expiry, 5-second poll
+        interval. Audited as `auth.device.requested`. No realm switch (Q4): a
+        partner opts in by mounting the route behind its own backend.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceAuthorizationStartRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceAuthorizationStartResponse' }
+        '400':
+          description: invalid_client_id (over 64 characters or not printable) | invalid_request (`device_name` or `subject_hint` over its limit) | bad_json.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: platform_bearer_required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /auth/device-authorizations/inspect:
+    post:
+      tags: [Auth]
+      security:
+        - BearerPlatformToken: []
+          ActorToken: []
+      parameters:
+        - $ref: '#/components/parameters/XUserToken'
+      summary: Inspect a device authorization by user code, ADR-122
+      description: |
+        Only an actor who could approve the request may inspect it (Q2): for a
+        PENDING request any `kind=human` member of the realm (they could approve
+        it as themselves; the partner's `CanApprove` narrows this), for a BOUND
+        request the subject itself (self case) or the owner of the bot's tenant.
+        Anyone else and any unknown code get the same `403 forbidden`. Each such
+        `403` counts against the actor: 10 in a fixed 15-minute window answers
+        `429 device_code_attempts_exceeded` with `Retry-After` on inspect,
+        approve and deny alike.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceAuthorizationCodeRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceAuthorization' }
+        '403':
+          description: forbidden (unknown code, or a request this actor cannot act on; byte-identical) | actor_required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: device_code_attempts_exceeded — the per-actor wrong-code cap; see `Retry-After`.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /auth/device-authorizations/approve:
+    post:
+      tags: [Auth]
+      security:
+        - BearerPlatformToken: []
+          ActorToken: []
+      parameters:
+        - $ref: '#/components/parameters/XUserToken'
+      summary: Approve a device authorization and name its account, ADR-122
+      description: |
+        The actor names the account the device becomes (T1): `self`, or
+        `user:<id>` of a `kind=service` account in the actor's pinned tenant,
+        which the actor must OWN (ADR-091 D6.1; code `otp.go:230-231`). The
+        body carries no token fields; the issuer requires no MFA here (Q5, the
+        partner BFF's ADR-096 step-up does). Nothing is minted: the device
+        collects at its next poll. SELF case: the MFA satisfaction the
+        APPROVING session actually holds at this moment (its per-tenant proofs
+        and provider-native proof, exactly as a login or `/auth/mfa/verify`
+        records them) is stored on the request and applied, unchanged, to the
+        person session the device collects, so the realm/org MFA floor is judged
+        at every tenant mint against what was really done (ADR-122 D4 MFA
+        amendment). A refused approve leaves the request pending
+        and records the code (R-CLI2). Audited as `auth.device.approved`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceAuthorizationApproveRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceAuthorizationApproveResponse' }
+        '400':
+          description: revoke_existing_sessions_required | invalid_subject_ref (neither `self` nor `user:<id>`) | tenant_not_member (self case `tenant_id` is not one of the approver's memberships) | bad_json.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: forbidden (unknown code; a request or subject this actor cannot act on, including a human `user:` subject, one outside the pinned tenant, or a tenant the actor does not own; byte-identical) | actor_required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            subject_suspended (DQ2: the bot is suspended or deactivated; the
+            request stays pending, approving never reactivates the bot) |
+            device_authorization_not_pending (already approved, denied,
+            collected, failed or expired).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '412':
+          description: |
+            session_limit_reached (self case, Q3): one more session would pass
+            the realm's `concurrent_session_limit` (counting
+            `revoke_existing_sessions`). Returned to the APPROVER in the existing
+            device-list shape; free a slot and approve again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PreconditionSessionLimit' }
+        '429':
+          description: device_code_attempts_exceeded — the per-actor wrong-code cap; see `Retry-After`.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /auth/device-authorizations/deny:
+    post:
+      tags: [Auth]
+      security:
+        - BearerPlatformToken: []
+          ActorToken: []
+      parameters:
+        - $ref: '#/components/parameters/XUserToken'
+      summary: Refuse a device authorization, ADR-122
+      description: |
+        Works on a pending AND on an approved-but-not-collected request (Q7);
+        the device's next poll answers `access_denied`. Same eligibility, `403`
+        and per-actor cap as inspect. Idempotent. After collection use the
+        sign-out (ADR-122 D8): `POST /tenants/{id}/service-accounts/{said}/revoke`
+        for a bot, `DELETE /auth/sessions/{id}` for the self case. Audited as
+        `auth.device.denied`; collection is audited as `auth.device.redeemed`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceAuthorizationCodeRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceAuthorizationDenyResponse' }
+        '403':
+          description: forbidden (byte-identical, as on inspect) | actor_required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: device_authorization_collected — too late to refuse; sign the session out instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: device_code_attempts_exceeded — the per-actor wrong-code cap; see `Retry-After`.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   /auth/refresh:
     post:
@@ -5689,8 +6107,8 @@ paths:
         '403':
           description: |
             forbidden — ADR-071 §5 login-OTP mint-gate: a
-            `purpose=login` OTP may be minted only by an owner/admin,
-            only for a `kind=service` subject in the caller's own
+            `purpose=login` `view_bff` OTP may be minted only by the tenant
+            OWNER (ADR-091 D6.1), only for a `kind=service` subject in the caller's own
             tenant (a missing / cross-tenant / non-service subject
             collapses to the same code — no oracle).
           content:
@@ -8542,9 +8960,11 @@ paths:
                 lease_id: { type: string, description: 'The `lease_id` returned by `.../split/rotation-lease`. Optional, but REQUIRED while an unexpired lease is held (a rotation lease is a ticket, enforced here): absent or different answers `409 rotation_lease_held`. With no lease held an upload without one is accepted. Ignored on the FIRST upload (realm still `normal`).' }
       responses:
         '200': { description: Uploaded; awaiting handshake. }
-        '400': { description: split_key_size_unsupported }
-        '409': { description: split_kid_in_use | rotation_lease_held }
+        '400': { description: split_key_size_unsupported | split_key_invalid | overlap_cap_exceeded }
+        '403': { description: actor_required | owner_required }
+        '409': { description: split_kid_in_use | rotation_lease_held | split_upload_not_allowed }
         '404': { description: platform_not_found }
+        '501': { description: split_custody_unavailable }
 
   /platforms/{id}/signing-keys/split/{kid}/handshake:
     parameters:

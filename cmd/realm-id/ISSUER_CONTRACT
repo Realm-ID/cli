@@ -8,9 +8,9 @@
 #
 # issuer_tag is the IDENTITY (a deployment); spec_info_version is what the spec
 # calls itself and does NOT uniquely name a release.
-issuer_tag=v0.144.0
+issuer_tag=v0.147.0
 issuer_repo=Realm-ID/issuer
 spec_path=docs/swagger.yaml
-spec_info_version=0.65.0
-spec_sha256=d082b01d1b9bd36913921917bd9a7eccc2d83f6b31b7996729ca795e3555d779
-vendored_at=2026-11-01
+spec_info_version=0.66.0
+spec_sha256=76b3df88faa977982c5c7e27c6cbacb1199085bd63cb605bbb3c7679a404cc38
+vendored_at=2026-11-03

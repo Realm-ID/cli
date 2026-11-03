@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-38 entries. Newest first.
+39 entries. Newest first.
 
+- [2026-11-03 — Re-vendor issuer v0.147.0 / spec 0.66.0 to match api v0.47.0 (device-login release)](#2026-11-03--re-vendor-issuer-v01470--spec-0660-to-match-api-v0470-device-login-release)
 - [2026-11-02 — Dealer splits mod λ (SPEC §14.14); the CLI keeps its own dealer, held to vendored shared vectors](#2026-11-02--dealer-splits-mod-λ-spec-1414-the-cli-keeps-its-own-dealer-held-to-vendored-shared-vectors)
 - [2026-11-01 — Hide split-signing and installation pass routes from the generated tree (re-vendor v0.144.0)](#2026-11-01--hide-split-signing-and-installation-pass-routes-from-the-generated-tree-re-vendor-v01440)
 - [2026-10-30 — R41 CLI: config set tenant answers MFA; stepUpCall adopts the verified session (RCA)](#2026-10-30--r41-cli-config-set-tenant-answers-mfa-stepupcall-adopts-the-verified-session-rca)
@@ -47,6 +48,14 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-11-03 — Re-vendor issuer v0.147.0 / spec 0.66.0 to match api v0.47.0 (device-login release)
+
+Re-vendored the embedded issuer spec from tag `v0.147.0` (info.version 0.66.0, was v0.144.0) with `scripts/revendor-spec.sh`, so the CLI matches the BFF (`api` v0.47.0) pinned for the device-login release; `scripts/issuer-pin-parity.py` was failing on api=v0.147.0 vs cli=v0.144.0.
+
+What appears in the generated tree: the four `/auth/device-authorizations` routes (start, `inspect`, `approve`, `deny`; ADR-122) and the `/auth/token` request body is now a `oneOf`. No other paths changed. `go test -race ./...` passes with no golden change.
+
+Not done here: the CLI's own device-login flow; this is the pin only. `make check` still fails `workflow parity` (tests.yml go 1.23 vs config 1.27.2), which predates this change and is filed in TODO.md.
 
 ## 2026-11-02 — Dealer splits mod λ (SPEC §14.14); the CLI keeps its own dealer, held to vendored shared vectors
 
