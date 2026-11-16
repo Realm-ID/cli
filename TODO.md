@@ -98,3 +98,10 @@ warning against concurrent `auth login`); these are the code fixes.
       `v0.3.7` and `main` is 8 commits ahead, so the revendor machinery is
       FIXED-ON-MAIN-BUT-UNRELEASED. Do not read it as live.
 - [ ] `cmd/realm-id/spec.go` — Expose `realm-id messaging` (ADR-115). Owner ruling 2026-10-17: build it; the secret is read from stdin or an interactive prompt, never a flag; ships in the next cli release. Hidden via skipBFFOnly until then
+
+## Tracked privately
+
+Some items for this repo are tracked in a private tracker.
+
+
+- [ ] `cli/cmd/realm-id/step_up.go` — the step-up flow cannot enrol: `stepUpCall` treats any 412 with a token as a TOTP challenge and never branches on `mfa_registration_required`, so an administrator with no second factor is asked for a code they cannot have; enrol via the console first (opened 2026-11-14, doc-review 3 finding 4).

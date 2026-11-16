@@ -3,6 +3,31 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
+## Unreleased — security-release notes (pairs with issuer v0.151.0; tag not yet cut)
+
+### Changed
+
+- **A user API key is refused on the device-authorization routes, `PUT /me/password` and
+  `POST /auth/otp/issue` (`403`).** This is the issuer (v0.151.0). `realm-id api` sends the path
+  exactly as typed to the BFF base URL with no `/api` prefix, so it reaches the BFF's own routes
+  and only a path you write as `/api/auth/...` reaches the passthrough. The passthrough now
+  denies the device routes and the other platform-token-only `/auth/*` routes for every caller
+  (`404`, a session included); the typed commands never call those `/auth/*` routes. `realm-id me
+  set-password` (`PUT /me/password`) with a user API key (`REALM_ID_API_KEY`) now answers `403`;
+  sign in with `realm-id auth login` to use it.
+- **Known gap:** the CLI cannot complete a step-up for an administrator with no second factor enrolled. A
+  gated operation answers a step-up `412` and the CLI prompts for a TOTP code; enrol in the
+  console first.
+- **`login_confined_to_tenant` now surfaces and is explained.** A sign-in confined to one
+  organisation (a device sign-in made before the release, or one proven through a single
+  organisation's identity provider) answers `403 login_confined_to_tenant` when it reaches another
+  organisation. Sign in again with `realm-id auth login` to reach it; `realm-id explain
+  login_confined_to_tenant` prints this (error reference re-vendored from sdk `0d68bb2`).
+  CLI sessions created before the release are confined to their own organisation, so a
+  multi-organisation user must sign in again to switch.
+- The embedded OpenAPI contract is NOT yet re-vendored: it stays at issuer `v0.147.0` until the
+  issuer `v0.151.0` tag exists (`scripts/revendor-spec.sh` accepts a release tag only).
+
 ## v0.6.2 — embedded contract re-pinned to issuer v0.147.0 (spec 0.66.0)
 
 ### Changed

@@ -25,7 +25,7 @@ These fire from `realm.verify(token)`.
 | `malformed`           | Token isn't 3 dot-separated parts, or header/payload aren't JSON.   | Reject the request with 401. Don't retry.                                                |
 | `wrong_algorithm`     | Header `alg` is not `RS256`.                                        | Reject. A non-RS256 token did not come from RealmID.                                     |
 | `bad_signature`       | Signature did not verify against the realm's JWKS.                  | Reject. May indicate token forgery or a network-corrupted token.                         |
-| `wrong_issuer`        | `iss` claim does not start with `${baseUrl}/${realmId}`.            | Reject. Either misconfigured `baseUrl` or token from a different realm.                  |
+| `wrong_issuer`        | `iss` claim does not start with `${issuerUrl}/${realmId}` (`issuerUrl` defaults to `baseUrl`). | Reject. Either misconfigured `baseUrl`/`issuerUrl` (reach the issuer on an internal URL? set `issuerUrl` to the public one) or token from a different realm.                  |
 | `wrong_audience`      | `aud` claim does not equal the realm's audience (auto or override). | Reject. Tokens minted for a different audience cannot replay against your service.       |
 | `expired`             | `exp` is in the past beyond leeway.                                 | Return 401. Client should refresh and retry.                                             |
 | `not_yet_valid`       | `nbf` is in the future beyond leeway.                               | Reject. Likely clock skew if seen often.                                                 |
@@ -39,7 +39,7 @@ These fire from `realm.auth.*` calls.
 | Code                      | When                                                                                         | What to do                                                                                                |
 |---------------------------|----------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
 | `provider_token_invalid`  | Upstream IdP rejected the token (Firebase / Google).                                         | Surface to user. Often means the IdP session expired client-side.                                         |
-| `mfa_required`            | Login or refresh succeeded as far as identity, but MFA step-up is required.                  | Read `details.mfa_challenge_token` and `details.methods`; prompt user for code; call `auth.mfaVerify`.    |
+| `mfa_required`            | Login or refresh succeeded as far as identity, but MFA step-up is required.                  | Read `details.mfa_challenge_token` and `details.methods`; prompt user for code; call `auth.mfaVerify`. **An EMPTY or absent token means no challenge can be answered** (a service principal, or the SDK middleware's fallback when the issuer's mint failed): do not prompt, and do not assume a token is present. |
 | `session_limit_reached`   | The user has too many active sessions for the realm's policy.                                | Read `details.revocation_token` + `details.active_sessions`; let user pick one to revoke; retry login.    |
 | `tenant_required`         | `auth.token` was called without a `tenantId` and the user belongs to multiple.               | Surface a tenant picker; supply `tenantId` to `auth.token`.                                                |
 | `tenant_invalid`          | `tenantId` is not a tenant the user belongs to in this realm.                                | Reject; the picker shouldn't have offered it.                                                              |
@@ -91,6 +91,7 @@ as `code`. HTTP status is in brackets.
 | `x_user_token_realm_mismatch` | [401] `X-User-Token` belongs to a different realm than the bearer. | Pair tokens from the same realm. |
 | `insufficient_scope` | [401] A revocation token was presented where it may not bulk-revoke sessions. | Use the user's access token. |
 | `not_a_member` | [403] The user is not a member of the requested tenant. | Offer only tenants the user belongs to. |
+| `login_confined_to_tenant` | [403] This sign-in is confined to one organisation (a device approval, or a sign-in proven through one organisation's identity provider) and the request reaches another. | Tell the user to sign in again (for the CLI, `realm-id auth login`) to reach the other organisation. |
 | `no_permissions_in_org` | [403] A key's permission cap and the holder's role in the key's org have nothing in common. | Re-issue the key with a cap the holder's role covers. |
 | `user_not_invited` | [403] Sign-in by someone with no membership anywhere, in a realm that does not allow open sign-up. | Ask an org owner for an invitation. |
 | `signup_domain_not_allowed` | [403] The email domain is not allowed to sign up. | Use an address on an allowed domain. |
@@ -99,15 +100,20 @@ as `code`. HTTP status is in brackets.
 | `contact_admin_required` | [409] The identifier is managed by the user's organization and is bound to a different provider. | Tell the user to contact their organization's admin. |
 | `no_verified_email` | [409] A reset link was requested for a member with no verified email. | Have the member verify an address first. |
 | `reset_token_invalid` | [400] The password-reset link is not valid. | Ask for a new link. |
+| `realm_unresolved` | [400] The realm of the request could not be resolved (the session names no tenant the issuer can place in a realm). | Sign in again; if it repeats, report the request id to support. |
+| `custom_claims_not_accepted` | [400] The SDK middleware refused a request on `/auth/login`, `/auth/refresh` or the other routes it mounts because the body carried `custom_claims`. Claims come only from the server-side `customClaims` handler, never from a browser. | Remove `custom_claims` from the client request; supply claims in the `customClaims` handler. |
+| `invalid_path` | [400] (go, java) The request path contains a raw `%2F`, `%5C` or `%25` escape, or a dot segment, so the middleware cannot match it to a route rule safely. | Send the canonical path; do not percent-encode separators or use `.` / `..` segments. |
 | `reset_token_expired` | [410] The reset link has expired. | Ask for a new link. |
 | `reset_token_used` | [410] The reset link was already used. | Ask for a new link if the password still needs resetting. |
 | `reset_token_superseded` | [410] A newer link was sent, or the password changed since. | Use the newest link. |
 | `realm_suspended` | [410] The realm is suspended or deactivated. | Surface a service-unavailable message; do not retry. |
-| `mfa_registration_required` | [412] Sign-in is blocked until the user enrols an authenticator; the envelope carries a challenge token. | Run the first-login enrolment flow with `details.mfa_challenge_token`. |
+| `mfa_registration_required` | [412] Sign-in, or an MFA-protected route behind the SDK middleware or `POST /auth/mfa/challenge`, is blocked until the user has a usable second factor; the envelope carries an enroll-scoped challenge token. **From the SDK middleware since go `0.77.0` / ts `0.64.0` / java `0.61.0`; read the token with the error's `MFAChallenge()` / `mfaChallenge()` / `getMfaChallenge()` accessor (SPEC §3.2):** go `v0.76.0` / ts `0.63.0` / java `0.60.0` middlewares still answer `mfa_required` with an empty token. | The token does not enrol by itself: `POST /auth/mfa/enroll` (refresh-token authed) writes the secret, then confirm a code on `/auth/mfa/verify` with an enroll-scoped token. |
 | `first_login_pending_approval` | [412] First sign-in on a recently vacated contact awaits the tenant owner's approval. | Tell the user to wait for the owner; nothing to retry. |
-| `mfa_too_many_fails` | [429] Too many wrong MFA codes for this challenge. | Back off; the user may need to restart sign-in. |
+| `mfa_too_many_fails` | [429] This user's MFA is locked: 10 wrong codes (verify, recovery-code redeem, or `DELETE /auth/mfa`) within a rolling 24 hours lock the membership for 15 minutes, doubling on each repeat up to 24 hours. A correct code clears the count. The lock spans sessions, so restarting sign-in does not lift it. | Back off until the lock expires; do not retry in a loop and do not restart sign-in. |
 | `login_throttled` | [429] Too many attempts for this identifier; counted on the identifier as sent, so unknown and known ones throttle alike. | Wait before retrying. |
 | `reset_throttled` | [429] Too many reset links were sent for this member in the last hour. | Wait before sending another. |
+| `store_unavailable` | [503] The issuer could not count the realm's sign-in methods, so it changed nothing (fail closed). | Retry shortly; nothing was written. |
+| `internal_key_unavailable` | [503] The issuer's internal signing key (used for the MFA challenge and session revoke) is unavailable; it never falls back to a realm key. | Retry shortly. |
 
 ## One-time-code (OTP) codes (`/auth/otp/*`)
 
@@ -383,6 +389,7 @@ Signing in with a workload's OIDC token, and managing trust bindings
 | `missing_subject_token` | [400] A federated sign-in had no `subject_token`. | Send the workload's token. |
 | `bad_subject_token_type` | [400] `subject_token_type` is set and is not the JWT token type. | Omit it, or send the JWT type. |
 | `unknown_issuer` | [400] A binding's `issuer` is not a supported federation provider. | Use a supported provider. |
+| `invalid_target` | [400] A federation binding's `target` has no `kind` (but sets `tenant_id` or `user_id`), an unknown `kind`, or `service_account` without `tenant_id` / `user_id`. | Send `target.kind` (`service_account`) with its `tenant_id` and `user_id`, or omit `target`. |
 | `unconstrained_binding` | [400] `match_claims` is empty; it must constrain the issuer's mandatory claim. | Add the claim. |
 | `missing_mandatory_claim` | [400] `match_claims` does not constrain the issuer's mandatory claim. | Add it, with a non-empty value. |
 | `invalid_mapped_role` | [400] The role a binding maps to does not exist, is disabled, or cannot be held by a service principal (or the realm's role catalog cannot be resolved). | Map to an enabled role that service accounts may hold. |
@@ -495,21 +502,26 @@ phone-proof flows. HTTP status is in brackets. The 409 bodies carry their offend
 | `missing_source_org_id` | [400] `POST /integrations/installations/{install_id}/pass` without `source_org_id`, the acting org of the source platform. It is the only attribution the target org gets for the acting call (R54b). Added in spec 0.65.0 (unreleased). | Send `source_org_id` in the request body. |
 | `invalid_installation_id` | [400] The `install_id` on the install-pass mint is malformed. Added in spec 0.65.0 (unreleased). | Use the id returned when the integration was installed. |
 | `invalid_integration_endpoint` | [400] The registered `integration_token_endpoint` is not an https URL. Added in spec 0.65.0 (unreleased). | Register an https URL. |
-| `integration_endpoint_unverified` | [422] The registration test-call to the endpoint failed; the message names what the call got back. Added in spec 0.65.0 (unreleased). | Fix the handler (the SDK's ready-made handler answers the canary), then register again. |
+| `integration_endpoint_unsupported` | [501] `PATCH /platforms/{id}` with an `integration_token_endpoint` on a deployment whose realm store cannot hold one. Checked before any write, so the rename is not applied either. Added in spec 0.65.0 (unreleased). | A server configuration fault, not a transient one; do not retry. Contact the operator. |
 
 ### Split-key custody, handshake and rotation (`/platforms/{id}/signing-keys/split/...`)
 
 | Code | When | What to do |
 | --- | --- | --- |
+| `split_custody_unavailable` | [501] Any `/platforms/{id}/signing-keys/split/...` route on a server with no split-custody service wired. Added in spec 0.65.0 (unreleased). | A server configuration fault, not a transient one; do not retry. Contact the operator. |
 | `split_key_size_unsupported` | [400] Upload of a key that is not RSA-2048. Added in spec 0.65.0 (unreleased). | Generate an RSA-2048 key. |
 | `split_kid_in_use` | [409] Upload with a `kid` the realm already has. The caller chooses the kid. Added in spec 0.65.0 (unreleased). | Choose an unused `kid`. |
-| `rotation_lease_held` | [409] Another holder has the 5-minute rotation lease (one holder at a time). Added in spec 0.65.0 (unreleased). | Wait for the lease to end or the other pod to finish; do not rotate from two pods. |
+| `split_key_invalid` | [400] Upload of a key that is not a well-formed RSA key: the modulus is even, the public exponent is not 65537, the private half is out of range, or the `kid` is empty. Added in spec 0.65.0 (unreleased). | Generate a standard RSA-2048 key (exponent 65537) and send its `kid`, `n`, `e` and the RealmID half. |
+| `split_upload_not_allowed` | [409] Upload in a custody state that refuses it: `overlap` (the handshaken key is live, replacing it would invalidate every token it signed). `normal` accepts only the first upload and only from a realm-owner person; `overlap_pending` replaces the never-handshaken key; `split` and `downgrade_pending` accept a rotation upload. Added in spec 0.65.0 (unreleased). | In `overlap`, cancel the overlap (audited) and then upload, or wait for it to finish. |
+| `overlap_cap_exceeded` | [400] An upload whose overlap `D` is negative or over 7 days, or an overlap extension that would take the total (`D` plus all extensions) past 7 days. Added in spec 0.65.0 (unreleased). | Choose a smaller overlap, or finish the rotation instead of extending again. |
+| `rotation_lease_held` | [409] A rotation lease is held and the upload carries no `lease_id`, or a different one (the lease is a ticket, C5#1); also answers a second `rotation-lease` request while one is held. The lease lasts 5 minutes with one holder at a time; with no lease held an upload without one is accepted. Added in spec 0.65.0 (unreleased). | Take the lease with `POST .../split/rotation-lease` and send its `lease_id` on the upload, or wait for the lease to end; do not rotate from two pods. |
 | `emergency_rotation_cap_reached` | [429] Emergency rotations are counted per realm per UTC day; this is past the cap (R39). Added in spec 0.65.0 (unreleased). | Stop and alert a human; the cap exists to bound a runaway loop. |
 | `split_key_not_found` | [404] A handshake or challenge for a split key the realm does not have. Added in spec 0.65.0 (unreleased). | Upload the key first. |
 | `handshake_failed` | [401] The completed signature over the challenge did not verify. A failure stops and alerts, it never loops (G16). Added in spec 0.65.0 (unreleased). | Check the share and its version; fix before retrying. The key does not become active. |
 | `not_in_overlap` | [409] Extend or cancel while the key is not in the overlap window (R36). Added in spec 0.65.0 (unreleased). | Read the key's status first. |
 | `downgrade_already_pending` | [409] Start a return to normal custody while one is under way. Added in spec 0.65.0 (unreleased). | Wait for it or cancel it. |
 | `no_pending_downgrade` | [404] Cancel with no downgrade pending. Added in spec 0.65.0 (unreleased). | Nothing to cancel. |
+| `split_realm_rotation_is_a_ceremony` | [409] `POST /platforms/{id}/signing-keys/rotate` (or the staff route `POST /admin/platforms/{id}/signing-keys/rotate`) on a realm that is not in full custody: a split realm rotates by the split-signing ceremony, not by the one-call rotate. Added in spec 0.65.0 (unreleased). | Rotate with the split routes (`.../signing-keys/split/rotation-lease`, then the upload and handshake); the SDK's `RotateSplit` does this. |
 | `not_available_to_api_keys` | [403] A downgrade call made with an API key. Only a human realm-owner session may start one (R55: API keys are refused the never-via-key operations). Added in spec 0.65.0 (unreleased). | Use an owner session. |
 
 ### Idempotency-Key (G11; parameter `IdempotencyKey` on 14 mutating operations)
@@ -521,6 +533,128 @@ phone-proof flows. HTTP status is in brackets. The 409 bodies carry their offend
 
 Swagger 0.65.0 lists these two only in the parameter description, not on the operations'
 responses (critic finding #6, unresolved at the issuer). A request without the header behaves as before.
+
+## Device authorization codes (`/auth/device-authorizations/*` and the device-code grant, issuer spec 0.66.0, ADR-122)
+
+> **Added in spec 0.66.0.** RFC 8628 device authorization: the device starts a request
+> (`POST /auth/device-authorizations`), a signed-in person inspects and approves or denies it, and
+> the device polls `POST /auth/token` (or `/auth/token/partial`) with
+> `grant_type=urn:ietf:params:oauth:grant-type:device_code`. HTTP status is in brackets. Issuer
+> ADR-122; the partner-side wiring is SPEC section 15.
+
+### The device's poll (`POST /auth/token`, device-code grant)
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `authorization_pending` | [400] The request is not approved yet, or an approve attempt was refused (the request stays pending). | Keep polling at the current interval. Not a failure. |
+| `slow_down` | [400] The device polled sooner than the interval (RFC 8628 section 3.5). The request's interval grows by 5 seconds. | Add 5 seconds to your poll interval and continue. |
+| `access_denied` | [400] The request was denied; the bot became suspended or deactivated after approval and before collection; the session of the person who approved it was signed out or revoked before the device collected (the approval was withdrawn); or the approval can no longer be honoured (for example, the approved account is gone). Every later poll answers the same. | Stop polling and tell the user the sign-in was refused. Start a new request to try again. |
+| `expired_token` | [400] The device code is unknown, it was already collected, or the request expired (10 minutes); or the approval lapsed because the session of the person who approved it expired or no longer exists before the device collected. Every later poll answers the same. | Stop polling. Start a new request if the user still wants to sign in. |
+
+### Starting and acting on a request
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `invalid_client_id` | [400] Start: `client_id` is over 64 characters or not printable. | Send a shorter, printable `client_id`, or omit it. |
+| `invalid_request` | [400] Start: `device_name` or `subject_hint` is over its length limit. | Shorten the field. |
+| `device_authorization_unavailable` | [503] Device authorization is not available on this deployment. (Status is from the issuer's emitting code; swagger 0.66.0 does not list it.) | Treat as unavailable; do not retry in a loop. Use another sign-in method. |
+| `device_code_attempts_exceeded` | [429] Inspect, approve or deny: the acting person entered too many wrong user codes (10 in a fixed 15-minute window). Carries `Retry-After` (seconds left in the window). | Stop and wait `Retry-After` seconds, then ask the person to re-read the code from the device. |
+| `revoke_existing_sessions_required` | [400] Approve: the `revoke_existing_sessions` field is absent. Its value is stated, never inferred. | Send `revoke_existing_sessions` explicitly as `true` or `false`. |
+| `tenant_not_member` | [400] Approve (self case): the given `tenant_id` is not one of the approver's memberships. | Offer only the approver's own organizations. |
+| `subject_suspended` | [409] Approve: the target `kind=service` account is suspended or deactivated. The request stays pending; approving never reactivates a bot. | Unsuspend the account, then approve again within the request's 10 minutes. |
+| `device_authorization_not_pending` | [409] Approve: the request is already approved, denied, collected, failed or expired. | Start a new request. |
+| `device_authorization_collected` | [409] Deny: the device already collected its session, so it is too late to deny. | Sign the session out instead (the whole-account sign-out route). |
+
+## Errors that carry a refresh token (`auth.token`, `TokenManager`; SPEC §4.2, §4.2.1)
+
+A refresh rotates the token, and a `Token` call that loses to a concurrent
+refresh of the same session is *handed over* to the winner's rotated token and
+retries on it (up to three hand-overs). From that point the token you presented
+is SPENT. Two error types therefore carry the newest live token for your next
+call; read it, and never retry with the token you passed in.
+
+| Type (Go · ts · java) | When | Code / status | What to do |
+|---|---|---|---|
+| `*RefreshSupersededError` · `RefreshSupersededError` · `RefreshSupersededException` | The give-up: three hand-overs and still no result. | `server_error`, 503 ("refresh superseded, retry") | Retry with `RefreshToken()` / `refreshToken()`. |
+| `*RefreshHandedOverError` · `RefreshHandedOverError` · `RefreshHandedOverException` (since go `0.75.0` · ts `0.62.0` · java `0.59.0`) | ANY other error after at least one hand-over to a different token: a session-store failure, "refresh in progress", a cancelled call, a 403 for this request's tenant, a 5xx, a timeout. NOT a token-level error (`refresh_invalid` or any 401): that one is returned as itself and carries nothing, because the newer token is dead too. | The ORIGINAL error's code and status (see below). | Handle the original error as you would have; when you retry, use `RefreshToken()` / `refreshToken()`. |
+
+An error before any hand-over is unchanged: you still hold the token you sent.
+`TokenManager` adopts the carried token from both types itself (it replaces its
+in-memory token and hands it to your `refreshSink`), so a manager user needs no
+code for this. If your sink fails while saving it, you still get the same carrying
+error (same code, status and token), with the save failure attached: Go appends it
+to the error message, ts sets it on `e.persistError`, java adds it to
+`e.getSuppressed()` (since go `0.75.0` · ts `0.62.0` · java `0.59.0`; before
+that, ts threw a new `server_error` instead and java dropped the save failure).
+A save failure means a restart would present a spent token, so treat it as you
+would any failed sink write.
+
+**The token is redacted.** It is never in the message, `String(e)` / `toString()`,
+`%v` / `%+v` / `%#v`, JSON, `util.inspect` or a stack trace. Only the accessor
+returns it. Do not copy it into a log yourself.
+
+**Reading the original error** from a `RefreshHandedOver…` error:
+
+```go
+_, err := realm.Auth.Token(ctx, req)
+var ho *realmid.RefreshHandedOverError
+if errors.As(err, &ho) {
+    store(ho.RefreshToken()) // the live token for the next call
+}
+// Unwrap() returns the original, so these still match exactly as before:
+var rerr *realmid.RealmError
+_ = errors.As(err, &rerr)                  // the original *RealmError
+_ = realmid.IsCode(err, realmid.ErrCodeServerError)
+_ = errors.Is(err, context.Canceled)        // a cancelled ctx on hop 1+
+```
+
+```ts
+try {
+  await realm.auth.token(req);
+} catch (e) {
+  if (e instanceof RefreshHandedOverError) {
+    store(e.refreshToken());     // the live token for the next call
+    const original = e.cause;    // the error the hop actually hit
+  }
+  if (e instanceof RealmError && e.code === "server_error") { /* still matches */ }
+}
+```
+
+```java
+try {
+    realm.auth().token(req);
+} catch (RefreshHandedOverException e) {
+    store(e.refreshToken());           // the live token for the next call
+    Throwable original = e.getCause(); // the exception the hop actually hit
+    ErrorCode code = e.getCode();      // copied from the original
+}
+```
+
+**Breaking in ts and java (not Go).** On a post-hand-over failure the thrown
+object is the wrapper, not the original. `code`, `message`, `httpStatus`,
+`details` and `retryAfterSeconds` (ts) / `getCode()`, `getMessage()`,
+`getHttpStatus()`, `getDetails()` and `getRetryAfter()` (java) are copied from the
+original, and the wrapper extends `RealmError` / `RealmException`, so a check on
+the base type or on the code keeps working. A check on a SUBCLASS of the base type
+(`e instanceof SomeSpecificError`, `catch (SomeSpecificException e)`) no longer
+matches; test `e.cause` / `getCause()` instead. When the original is not an SDK
+error, the wrapper's code is `server_error` with no HTTP status (ts `undefined`,
+java `0`) and the original's message. Go is unaffected: the wrapper unwraps to
+the original, so `errors.As` and `IsCode` see straight through it.
+
+## Emailed sign-in codes and lockout guards (issuer ADR-123, ADR-124)
+
+Five codes from the owner opt-in for emailed sign-in codes and the guards that stop a realm locking itself out. All five are registered in go, ts and java. HTTP status is in brackets.
+
+| Code | When | What to do |
+| --- | --- | --- |
+| `acknowledgement_required` | [400] `PATCH /platforms/{id}/config` set `email_otp_login_enabled: true` without `acknowledge_mailbox_risk: true`. Nothing in the patch was written. | Show the owner the risk (anyone who can read a member's mailbox can sign in as that member), and resend with the acknowledgement on an explicit yes (web-admin `updateConfig(…, { acknowledgeMailboxRisk: true })`). |
+| `email_otp_requires_identifying_email` | [409] The patch would leave `email_otp_login_enabled` on while `email` is not in `contacts.unique_kinds`. | Add `email` to `contacts.unique_kinds` in the same patch, or leave emailed codes off. |
+| `email_otp_rate_limited` | [429] This email address has used the realm's `email_otp.max_per_window` emailed sign-in codes within `email_otp.window_seconds` (default 5 per 15 minutes; its own counter, not `phone_otp`'s). The `Retry-After` header gives the seconds to wait. The per-IP refusal is `sign_in_ip_rate_limited`, against `email_otp.sign_in_per_ip_per_hour`. | Show "try again in a few minutes" and wait. The realm owner can raise the limit with `email_otp` in realm config, up to RealmID's ceiling (20 per 3600s). |
+| `last_browser_sign_in` | [409] The change would leave the realm with no browser sign-in method: deleting or disabling its last realm-level web identity provider (or the source carrying it), or turning off its last of `password_login_enabled`, `otp_login_enabled`, `email_otp_login_enabled`. There is no override. | Enable another sign-in method first, then repeat the change. |
+| `last_machine_credential` | [409] The API key or workload binding being revoked is the credential that minted this request's bearer AND is the realm's last active one. | Mint the replacement first, then revoke the old one with the new credential (a rotation). |
+
+Emailed codes are the partner realm owner's opt-in, per realm. They are never available on RealmID's own realm, and `delivery_mode: "email"` on `auth.sendLoginCode` for a realm that has not opted in is `403 method_not_enabled`.
 
 ## Management / generic codes
 
