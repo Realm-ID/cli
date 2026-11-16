@@ -3,7 +3,7 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
-## Unreleased — security-release notes (pairs with issuer v0.151.0; tag not yet cut)
+## v0.6.3 — embedded contract re-pinned to issuer v0.151.0 (spec 0.68.0) (2026-11-16)
 
 ### Changed
 
