@@ -182,7 +182,18 @@ info:
     `realm_not_split`, `platform_key_not_a_user_key`, `idempotency_key_reused`,
     `idempotency_in_progress` and the others named on the operations below.
 
-    **0.66.0 (additive, ADR-122; BUILT, unreleased).** Generic device
+    **0.67.0 (ADR-123, ADR-124).** Emailed sign-in codes, owner opt-in: the
+    realm config gains `email_otp_login_enabled`, the `email_otp` limits and the
+    write-only `acknowledge_mailbox_risk`; `POST /auth/otp/send-login` and
+    `POST /auth/otp/issue` accept `delivery_mode: email`; `credential_methods`
+    can list `otp_email`. Turning it on is owner-only and refused to API-key
+    sessions; new error codes `400 acknowledgement_required` and
+    `409 email_otp_requires_identifying_email`. An emailed code is never an MFA
+    second factor. Lockout guards (ADR-124): a write that would leave a realm
+    with no browser sign-in or no machine credential answers
+    `409 last_browser_sign_in` / `409 last_machine_credential`.
+
+    **0.66.0 (additive, ADR-122).** Generic device
     authorization (RFC 8628): `POST /auth/device-authorizations` (start, no
     actor), `/inspect`, `/approve`, `/deny` (carried actor required), and the
     grant `urn:ietf:params:oauth:grant-type:device_code` on `POST /auth/token`
@@ -191,7 +202,19 @@ info:
     `device_code_attempts_exceeded` (429), `subject_suspended`,
     `device_authorization_not_pending`, `device_authorization_collected`
     (409), `revoke_existing_sessions_required`, `invalid_client_id` (400).
-  version: 0.66.0
+
+    **0.68.0 (behaviour change, ADR-096 amendment).** `POST /auth/mfa/challenge`
+    now answers `412 mfa_registration_required`, carrying an enroll-scoped
+    `mfa_challenge_token`, when the caller has no usable second factor (no
+    confirmed TOTP authenticator and no OTP second factor; it used to answer
+    `200` with a verify challenge nobody could pass). A user whose second factor
+    is OTP gets the `200` verify challenge with `methods: [otp]`.
+
+    **Also 0.68.0 (behaviour change, `GET /auth/sessions`).** Called with the
+    session-limit revocation token, the list now holds only the sessions that
+    count toward the limit that refused you (see that operation). A normal
+    signed-in caller's list is unchanged.
+  version: 0.68.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -416,7 +439,7 @@ components:
     PreconditionMFA:
       type: object
       description: 412 response when target tenant requires MFA.
-      required: [code, mfa_challenge_token, tenant_id]
+      required: [code]
       properties:
         code:
           type: string
@@ -425,8 +448,20 @@ components:
           type: array
           items: { type: string }
           example: [mfa]
-        mfa_challenge_token: { type: string }
-        tenant_id: { type: string, format: uuid }
+        mfa_challenge_token:
+          type: string
+          description: >
+            Present on every `mfa_registration_required` (an enroll-scoped challenge) and on
+            `mfa_required` for a caller who can answer one. ABSENT on the `POST /auth/mfa/challenge`
+            `412 mfa_required` for a service principal, which cannot enroll (ADR-096 D4): never
+            assume it is there.
+        tenant_id:
+          type: string
+          format: uuid
+          description: >
+            Optional. Emitted by the `POST /auth/token` tenant-mint 412 only; the step-up gate and
+            `POST /auth/mfa/challenge` 412s do not carry it (they bind the tenant inside the
+            challenge token). No SDK reads it from a 412.
 
     SessionSummary:
       type: object
@@ -772,7 +807,11 @@ components:
         deprecated. The `kind × mode` gate rejects a `kind=human`
         subject here (humans elevate via TOTP, never an owner-minted OTP)
         — failure collapses to `invalid_credentials` (no enumeration).
-        Gated by `realms.config.otp_login_enabled`. Inbound bearer:
+        Gated by `realms.config.otp_login_enabled`; ADR-123 D10:
+        a code delivered by EMAIL is gated instead by
+        `realms.config.email_otp_login_enabled`, checked against the matched
+        code's delivery mode (off: `invalid_credentials`, so turning the switch
+        off kills emailed codes already sent). Inbound bearer:
         platform access JWT.
       properties:
         grant_type: { type: string, enum: [otp] }
@@ -1021,6 +1060,20 @@ components:
             timeout disabled for this realm (the default).
         tenants:
           type: array
+          description: >
+            The workspaces the caller may pick between (the picker list).
+
+
+            **The base realm's admin tenant is listed ONLY for its owner**, the
+            same rule `GET /me` applies. A non-owner's membership of it exists
+            (open signup lands every new person there) but is not offered, so
+            the picker never offers a workspace that login would then drop. The
+            hiding applies only while at least one other workspace remains: a
+            brand-new signup holds that one membership, which is returned
+            unchanged. When hiding leaves exactly one entry, `tenants` has
+            exactly one entry and the client auto-mints it, as for any
+            single-membership login. Ownership is the `tenants.owner_user_id`
+            pointer (ADR-076).
           items: { $ref: '#/components/schemas/TenantMembership' }
       example:
         status: ok
@@ -1064,8 +1117,8 @@ components:
           description: |
             Omitted means `refresh_token`.
 
-            `urn:ietf:params:oauth:grant-type:device_code` (ADR-122 D6, 0.66.0,
-            built, unreleased): the RFC 8628 poll, `device_code` in the body. Bot case:
+            `urn:ietf:params:oauth:grant-type:device_code` (ADR-122 D6, 0.66.0):
+            the RFC 8628 poll, `device_code` in the body. Bot case:
             `TokenResponse` / `TokenPartialResponse` plus `service_account_id`
             and `device_authorization_id`; self case: `DeviceLoginResponse` on
             either route. Pending answers are `400` `authorization_pending` |
@@ -1603,10 +1656,15 @@ components:
       properties:
         identifier:
           type: string
-          description: The phone number, strict E.164 (e.g. `+919999000011`).
+          description: |
+            For `sms` | `whatsapp`: the phone number, strict E.164 (e.g.
+            `+919999000011`). For `email` (ADR-123): one email address (e.g.
+            `ana@acme.example`), looked up as typed.
         delivery_mode:
           type: string
-          enum: [sms, whatsapp]
+          enum: [sms, whatsapp, email]
+          description: |
+            `email` only when the realm has `email_otp_login_enabled` (ADR-123).
         tenant_id:
           type: string
           format: uuid
@@ -2022,10 +2080,13 @@ components:
           items: { $ref: '#/components/schemas/PublicIdentityProvider' }
         credential_methods:
           type: array
-          items: { type: string, enum: [password, otp] }
+          items: { type: string, enum: [password, otp, otp_email] }
           description: |
             The NON-IdP login methods this realm can actually complete:
-            `password` (ADR-104) and `otp` (ADR-103).
+            `password` (ADR-104), `otp` (ADR-103; a code by SMS or WhatsApp) and
+            `otp_email` (ADR-123: a code by email; present exactly when
+            `email_otp_login_enabled` is on, `email` is an identifying kind and the
+            deployment has a real email transport).
 
             ⚠️ **They cannot ride in `providers`**, and this is not a stylistic
             choice. That array is `identity_providers` rows, whose `type` is a
@@ -2040,7 +2101,10 @@ components:
             the deployment has a credential store wired AND the realm's
             `password_login_enabled` is set (missing either,
             `grant_type=password` answers `400 unknown_method`); `otp` only when
-            the realm's `otp_login_enabled` is set. Offering a method the
+            the realm's `otp_login_enabled` is set; `otp_email` (ADR-123 D11, 0.67.0)
+            only when `email_otp_login_enabled` is set, `email` is an
+            identifying kind and the deployment has a real email transport.
+            Offering a method the
             deployment cannot finish is the "coming soon" failure — a user picks
             it and nothing happens.
 
@@ -2781,6 +2845,54 @@ components:
             OTP" flow — see `LoginRequestOTP`). `grant_type` is the
             RFC 6749 credential-exchange parameter; the OTP login has
             no `method` field. Default false.
+        email_otp_login_enabled:
+          type: boolean
+          description: |
+            ADR-123. Sign-in by a code sent by EMAIL
+            (`POST /auth/otp/send-login` with `delivery_mode: email`, verified by
+            `grant_type=otp`). Independent of `otp_login_enabled` (phone codes).
+            Default false. **Only the realm owner may turn it ON** (owner
+            2026-11-04, R10: the single human in `X-User-Token` who holds the
+            ADR-076 owner pointer of the realm's admin tenant); a `platform:config`
+            holder who is not the owner, and RealmID staff, get `403 forbidden`, a
+            user API key session is refused (R14), and the whole PATCH is refused.
+            The realm owner, any `platform:config` holder and RealmID staff may turn
+            it OFF (R11). Only a change of the stored value is checked. Turning it
+            on requires `acknowledge_mailbox_risk: true` in the same body, else
+            `400 acknowledgement_required`, and `email` among
+            `contacts.unique_kinds`, else `409 email_otp_requires_identifying_email`
+            (R12). An emailed code is never accepted as an MFA second factor (R13).
+            Audited as
+            `realm.email_otp_login.enabled` / `realm.email_otp_login.disabled`.
+            Turning it off also invalidates emailed codes already sent.
+            The acknowledgement is a request field of the PATCH body, not a config
+            key (see `PATCH /platforms/{id}/config`).
+        email_otp:
+          type: object
+          description: |
+            ADR-123 D6. Limits for emailed SIGN-IN codes, separate from
+            `phone_otp`. **PATCH semantics are MERGE**, as for `phone_otp`. The
+            per-address pair obeys the same RealmID ceiling as phone: a rate of at
+            most 20 codes per 3600s, and `window_seconds` at most 3600.
+            Out of range: `400 invalid_config_value`.
+          properties:
+            max_per_window:
+              type: integer
+              minimum: 1
+              maximum: 20
+              description: Emailed sign-in codes per address per window. Default 5.
+            window_seconds:
+              type: integer
+              minimum: 60
+              maximum: 3600
+              description: Window for `max_per_window`, in seconds. Default 900.
+            sign_in_per_ip_per_hour:
+              type: integer
+              minimum: 1
+              maximum: 60
+              description: |
+                Emailed sign-in codes per end-user IP (`X-On-Behalf-Of-IP`) per
+                hour. Default 10. Cannot be turned off.
         otp_mfa_enabled:
           type: boolean
           description: |
@@ -3208,6 +3320,14 @@ components:
         otp_length: { type: integer }
         otp_ttl_seconds: { type: integer }
         otp_login_enabled: { type: boolean }
+        email_otp_login_enabled: { type: boolean, description: 'ADR-123. Default false.' }
+        email_otp:
+          type: object
+          description: ADR-123 D6. Filled in with the defaults when unset.
+          properties:
+            max_per_window: { type: integer }
+            window_seconds: { type: integer }
+            sign_in_per_ip_per_hour: { type: integer }
         otp_mfa_enabled: { type: boolean }
         password_login_enabled: { type: boolean }
         password_policy:
@@ -5065,13 +5185,23 @@ paths:
             `user_api_keys.max_permission_strings` /
             `max_permission_string_len`)
             | scope_not_supported (this session class mints no `scope`)
+            | bad_tenant_id (a `tenant_id` that is not a tenant of the realm,
+            ADR-046 AF-046.1 / ADR-097 AF-097.5) | realm_unresolved (the body
+            has no `tenant_id` but carries `custom_claims` or `scope`, and the
+            refresh session exists but its realm row does not; ADR-097
+            AF-097.5. An unknown or revoked refresh token is still `401`)
             | bad_json
             | device-code grant (ADR-122 D6, 0.66.0): `authorization_pending`
             (not approved yet, or an approve was refused) | `slow_down` (polled
             sooner than `interval`; the interval grows by 5 s) | `access_denied`
-            (denied, or the bot was suspended or deactivated before collection)
+            (denied, or the bot was suspended or deactivated before collection,
+            or the session that approved it was revoked: ADR-122 AF-122.4, from
+            0.151.0; before that a `401 invalid_credentials`)
             | `expired_token` (unknown, already collected or expired: one
-            answer) | `session_limit_reached` (self case, a race past the realm
+            answer; also, from 0.151.0, the session that approved it expired
+            or no longer exists, ADR-122 AF-122.4. A lapsed or withdrawn
+            approval repeats its code on every later poll, AF-122.5)
+            | `session_limit_reached` (self case, a race past the realm
             limit at collection; no revocation token, the device is not the
             approver). Any other terminal collection failure answers with its
             own login code (e.g. `403 user_suspended`) and repeats it until
@@ -5096,7 +5226,24 @@ paths:
         '403':
           description: |
             not_a_member | user_suspended | tenant_disabled |
-            no_permissions_in_org. `tenant_disabled`: the organisation the
+            no_permissions_in_org | login_confined_to_tenant (the session's login
+            was proven through a tenant-scoped IdP row, or is a confined
+            pre-release session, and the requested tenant is another one; no
+            token is issued; ADR-099 AF-099.6. On the device-code grant it is
+            answered ONLY when the approving access token named a row outside
+            the approving session's confinement, and the device authorization
+            is then failed, so the user approves again; a pinned `tenant_id`
+            outside the device's memberships stays `400 tenant_not_member`, and
+            a device session's own later mint for another tenant answers it like
+            any confined session. ADR-093 AF-093.1). On the device-code grant,
+            `not_a_member` is also answered when the approving token named a row
+            the approver's login does not reach (ADR-093 AF-093.1, anchor
+            reachability), and also when the approved row is another row than
+            the approving session's anchor and holds MORE THAN ONE tuple of the
+            approver's selection (ADR-099 AF-099.6 / ADR-093 AF-093.1): the
+            device row cannot name one provider uid, so nothing is issued.
+            `login_confined_to_tenant` and `not_a_member` are therefore the
+            mint refusals of the device-code grant. `tenant_disabled`: the organisation the
             refresh would mint for is suspended or deactivated; the session is
             NOT ended and the same refresh token works again once the
             organisation is reactivated. `no_permissions_in_org` is
@@ -5521,6 +5668,7 @@ paths:
 
   /auth/device-authorizations/inspect:
     post:
+      x-realmid-human-only: true
       tags: [Auth]
       security:
         - BearerPlatformToken: []
@@ -5565,6 +5713,7 @@ paths:
 
   /auth/device-authorizations/approve:
     post:
+      x-realmid-human-only: true
       tags: [Auth]
       security:
         - BearerPlatformToken: []
@@ -5637,6 +5786,7 @@ paths:
 
   /auth/device-authorizations/deny:
     post:
+      x-realmid-human-only: true
       tags: [Auth]
       security:
         - BearerPlatformToken: []
@@ -5832,7 +5982,7 @@ paths:
         '401':
           description: refresh_invalid — refresh token missing, expired, or revoked
         '403':
-          description: not_a_member / user_suspended
+          description: not_a_member / user_suspended / login_confined_to_tenant (ADR-099 AF-099.6)
         '409':
           description: already_enrolled — reset before re-enrolling
         '503': { $ref: '#/components/responses/StoreUnavailable' }
@@ -5895,6 +6045,12 @@ paths:
           description: missing_code | not_enrolled
         '401':
           description: invalid code, or bearer is not a user JWT
+        '429':
+          description: |
+            `mfa_too_many_fails` — the caller's per-membership MFA limit is locked (design.md
+            § MFA, "Per-membership MFA fail counter", MFA-P1..P9). A wrong `code` here counts
+            toward the same total as `/auth/mfa/verify` and `/auth/mfa/recovery`; while locked,
+            a correct code is refused too.
 
   /auth/mfa/verify:
     post:
@@ -5917,6 +6073,12 @@ paths:
         the MFA challenge token in the body is the credential, so it is a front
         door route that takes no actor (`x-realmid-no-actor`, R61); the
         platform token is the `Authorization` bearer (R60).
+
+        **One mailbox is never both factors (ADR-123 D10.2, owner 2026-11-04
+        R13).** A one-time code whose delivery mode was `email` is
+        never accepted here, whatever the realm's switches say: it answers as a
+        wrong code. After an emailed-code sign-in, MFA is TOTP, a phone code or
+        a recovery code.
       requestBody:
         required: true
         content:
@@ -5929,9 +6091,23 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/MFAVerifyResponse' }
         '401':
-          description: Invalid challenge token or code
+          description: |
+            Invalid challenge token or code. A `method=otp` code for a user to whom OTP MFA does
+            not apply (`otp` not in the offered method set) answers here as a wrong code
+            (design.md § MFA, MFA-G1); so does any `method=otp` code on an enrolment-scoped
+            challenge (MFA-G2). A TOTP code on an enrolment challenge is still the ADR-061
+            confirm path and succeeds.
+        '403':
+          description: |
+            `login_confined_to_tenant` — the challenge's session is confined to another tenant
+            (ADR-099 AF-099.6); no token is issued.
         '429':
-          description: mfa_too_many_fails
+          description: |
+            `mfa_too_many_fails` — either the per-session counter (5 misses on this session and
+            tenant) or the per-membership counter (10 misses in a 24h window on the challenged
+            `users` row, across every session; 15 min lock, doubling to 24h) is locked. The lock
+            is read before the code is checked, so a correct code is refused too. design.md
+            § MFA, MFA-P1..P9.
 
   /auth/mfa/recovery:
     post:
@@ -5977,8 +6153,15 @@ paths:
             `MFAVerifyResponse`.
         '401':
           description: Invalid challenge token or recovery code
+        '403':
+          description: |
+            `login_confined_to_tenant` — the challenge's session is confined to another tenant
+            (ADR-099 AF-099.6); no token is issued.
         '429':
-          description: mfa_too_many_fails
+          description: |
+            `mfa_too_many_fails` — the per-session or the per-membership MFA counter is locked. A
+            wrong recovery code counts toward the same per-membership total as `/auth/mfa/verify`
+            (design.md § MFA, MFA-P2).
 
   /auth/mfa/authenticators:
     get:
@@ -6053,11 +6236,30 @@ paths:
               schema: { $ref: '#/components/schemas/MFAChallengeResponse' }
         '401':
           description: Missing, expired, or invalid bearer access token
+        '412':
+          description: |
+            mfa_registration_required — the caller has no usable second factor, so there is
+            nothing to verify a challenge against (ADR-096 D4). "Usable" is the set login offers:
+            a confirmed TOTP authenticator, or an enrolled OTP second factor in a realm with
+            `otp_mfa_enabled`. A user with either gets the `200` verify challenge (its `methods`
+            lists them), never this answer; an unconfirmed TOTP enrolment counts as none. The body
+            carries an ENROLL-scoped `mfa_challenge_token`, the same envelope the login gate emits.
+            The token does not enrol by itself. To enrol, the client first calls
+            `POST /auth/mfa/enroll` with the user's refresh token, which writes an unconfirmed
+            secret and returns it (secret, QR, and its own enroll-scoped challenge); the client then
+            confirms with a code via `POST /auth/mfa/verify` using an enroll-scoped challenge (this
+            one or the one `/auth/mfa/enroll` returned). That confirm is a verify: it stamps `mfa_at`
+            for the session and tenant and satisfies the step-up. With no secret written, an enroll
+            token cannot pass a verify, and it never passes an OTP verify. A browser client without
+            the refresh token (BFF mode) needs its backend to make the enroll call. Same flow as
+            login's `412 mfa_registration_required`. A service principal, which cannot enrol, is
+            refused `412 mfa_required` with no token.
 
   # ---------------------------------------------------------------- Partner OTP primitive (v0.6.0)
 
   /auth/otp/issue:
     post:
+      x-realmid-human-only: true
       tags: [Auth]
       security:
         - BearerPlatformToken: []
@@ -6091,7 +6293,11 @@ paths:
           description: |
             invalid_purpose | invalid_subject_ref | invalid_scope |
             unsupported_delivery_mode (a `delivery_mode` outside
-            view_bff | email | sms | whatsapp, or `email` on a login OTP) |
+            view_bff | email | sms | whatsapp, or `email` on a login OTP in a
+            realm whose `email_otp_login_enabled` is off; ADR-123 D9:
+            with the switch on, an emailed login code is accepted, goes only to the
+            subject's proven identifying email, and is limited by `email_otp`
+            (`429 email_otp_rate_limited`)) |
             no_delivery_address (the subject has no address of the requested
             kind, or the provider says the phone number cannot receive on the
             channel).
@@ -6132,7 +6338,9 @@ paths:
             transport. For `sms` and `whatsapp` the body carries `channel`
             (`sms` | `whatsapp`): the realm has no operational channel of its own
             for it, or the provider could not give a clear answer (`Retry-After`
-            when known). No `id` is returned. ADR-115.
+            when known). No `id` is returned. ADR-115. For an emailed LOGIN code
+            (ADR-123 D9) with no real email transport in the
+            deployment, `channel` is `email`.
           headers:
             Retry-After: { schema: { type: integer }, description: Seconds to wait }
           content:
@@ -6142,7 +6350,7 @@ paths:
                   - $ref: '#/components/schemas/Error'
                   - type: object
                     properties:
-                      channel: { type: string, enum: [sms, whatsapp] }
+                      channel: { type: string, enum: [sms, whatsapp, email], description: '`email` is ADR-123: no real email transport in this deployment.' }
 
   /auth/otp/send-login:
     post:
@@ -6169,6 +6377,16 @@ paths:
         `phone_otp.window_seconds`. Both are charged before the person is looked
         up, and both are separate from the counters for codes sent to signed-in
         users (`POST /auth/otp/issue`, MFA, contact verification).
+
+        **By email (ADR-123).** `delivery_mode: email` with
+        an email `identifier` is accepted only when the realm has
+        `email_otp_login_enabled` (else `403 method_not_enabled`). The code goes
+        only to a PROVEN email contact of an identifying kind (ADR-117); anything
+        else is the same `202` and nothing is sent. Email has its own counters,
+        `email_otp.sign_in_per_ip_per_hour` per IP and `email_otp.max_per_window`
+        per `email_otp.window_seconds` per address, never the `phone_otp` ones.
+        The issuer has no bot check: the caller puts one at its edge (RealmID's
+        BFF uses Turnstile) and should pass `X-On-Behalf-Of-IP`.
       parameters:
         - $ref: '#/components/parameters/XUserTokenOptional'
         - in: header
@@ -6193,9 +6411,12 @@ paths:
               schema: { $ref: '#/components/schemas/SendLoginCodeResponse' }
         '400':
           description: |
-            invalid_identifier (missing, or not strict E.164 — refused, never
-            rewritten, ADR-103 D5) | unsupported_delivery_mode (missing, or not
-            `sms` | `whatsapp`) | invalid_on_behalf_of_ip (`X-On-Behalf-Of-IP`
+            invalid_identifier (missing; or, for `sms` | `whatsapp`, not strict
+            E.164 — refused, never rewritten, ADR-103 D5; or, for `email`, not one
+            address — exactly one `@` with text on both sides, no whitespace, at
+            most 254 characters; or the identifier's kind does not match
+            `delivery_mode`) | unsupported_delivery_mode (missing, or not
+            `sms` | `whatsapp` | `email`) | invalid_on_behalf_of_ip (`X-On-Behalf-Of-IP`
             is present but is not a parseable IPv4 or IPv6 address; nothing is
             counted or sent).
           content:
@@ -6209,7 +6430,11 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: method_not_enabled — the realm has `otp_login_enabled = false`.
+          description: |
+            method_not_enabled — for `sms` | `whatsapp`, the realm has
+            `otp_login_enabled = false`; for `email`, the realm has
+            `email_otp_login_enabled = false` (ADR-123; before ADR-123 an emailed
+            request was `400 unsupported_delivery_mode`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6218,6 +6443,9 @@ paths:
             sign_in_ip_rate_limited — this end-user IP has used the realm's
             `phone_otp.sign_in_per_ip_per_hour` | phone_otp_rate_limited — this
             phone number has used the realm's sign-in per-phone allowance |
+            email_otp_rate_limited — this email address has used the realm's
+            `email_otp.max_per_window` (ADR-123 D6; for `email`, the per-IP refusal
+            is `sign_in_ip_rate_limited` against `email_otp.sign_in_per_ip_per_hour`) |
             rate_limited — the per-replica burst limiter on `/auth/otp/*`.
             `Retry-After` is the seconds until a send is allowed again.
           headers:
@@ -6233,7 +6461,9 @@ paths:
         '503':
           description: |
             delivery_unavailable — the realm has no `operational` channel for
-            `delivery_mode`; the body carries `channel` (`sms` | `whatsapp`) |
+            `delivery_mode`; the body carries `channel` (`sms` | `whatsapp` |
+            `email`; `email` when the deployment has no real email transport, so a
+            code is never written to a log instead of sent, ADR-123 D5) |
             store_unavailable — a datastore needed for the limits is
             unreachable; nothing was sent (fails closed).
           headers:
@@ -6245,7 +6475,7 @@ paths:
                   - $ref: '#/components/schemas/Error'
                   - type: object
                     properties:
-                      channel: { type: string, enum: [sms, whatsapp] }
+                      channel: { type: string, enum: [sms, whatsapp, email], description: '`email` is ADR-123: no real email transport in this deployment.' }
   /auth/otp/{id}:
     get:
       tags: [Auth]
@@ -6272,6 +6502,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OTPViewResponse' }
+        '403':
+          description: '`permission_cap_exceeded` (ADR-084 AF-084.7) — the caller is a CAPPED user API-key session. This route names no catalog permission, so a capped key is refused before any OTP is read. A signed-in person and an uncapped key are not refused by this rule.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: otp_not_found (row missing, expired, or cross-tenant)
           content:
@@ -6317,6 +6552,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`permission_cap_exceeded` (ADR-084 AF-084.7) — the caller is a CAPPED user API-key session. This route names no catalog permission, so a capped key is refused before any OTP is read or consumed, and the lockout counter is not touched. A signed-in person and an uncapped key are not refused by this rule.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '410':
           description: otp_expired (matched row exists but is expired)
           content:
@@ -6338,6 +6578,24 @@ paths:
           ActorToken: []
       x-realmid-human-only: true
       summary: List active sessions for this (user, realm)
+      description: |
+        Lists the caller's live sessions. When called with the session-limit
+        revocation token (the one a `412 session_limit_reached` hands out), the
+        list holds only the sessions that currently count toward the limit that
+        refused you, as the `412` body's `active_sessions` does: those with a live,
+        unexpired access-token mint for that organization membership. A session
+        with no mint (including the caller's own pending sign-in), one whose last
+        mint has expired (idle past the access-token TTL), and one minted only for
+        another organization are left out, because revoking them cannot lower the
+        count. Where the refusal came from `POST /auth/token` the pending
+        sign-in is not deleted, so after revoking an old session the caller
+        retries `POST /auth/token` with the same refresh token and is admitted; a
+        sign-in that mints in the same call (OTP, device, API key) discards its
+        row when refused, so there the user signs in again. Unlike the `412` body,
+        which falls back to the unfiltered list, a failure reading the mint
+        ledger answers `503` (or `500`), never a shorter or unfiltered list. A
+        normal signed-in caller's list is unchanged and still includes every
+        live session.
       parameters:
         - $ref: '#/components/parameters/XUserToken'
         - in: query
@@ -6700,6 +6958,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            login_confined_to_tenant — the caller's session was proven through a
+            tenant-scoped identity provider (or is a pre-release session the release
+            migration confined), so its login cannot be copied onto the new platform's
+            owner, which is outside that tenant (ADR-099 AF-099.6, `createPlatformCore`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '412':
           description: |
             domain_not_verified — a custom `domain` was supplied but the
@@ -7079,6 +7346,7 @@ paths:
         required: true
         schema: { type: string, format: uuid }
     post:
+      x-realmid-step-up-candidate: true
       tags: [User API Keys]
       security:
         - BearerPlatformToken: []
@@ -7255,6 +7523,7 @@ paths:
         required: true
         schema: { type: string, format: uuid }
     put:
+      x-realmid-step-up-candidate: true
       tags: [User API Keys]
       security:
         - BearerPlatformToken: []
@@ -7349,6 +7618,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
     delete:
+      x-realmid-step-up-candidate: true
       tags: [User API Keys]
       security:
         - BearerPlatformToken: []
@@ -7411,6 +7681,7 @@ paths:
         required: true
         schema: { type: string, format: uuid }
     post:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -7521,6 +7792,7 @@ paths:
         required: true
         schema: { type: string, format: uuid }
     delete:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -7541,6 +7813,17 @@ paths:
               schema: { $ref: '#/components/schemas/StatusOK' }
         '404':
           description: api_key_not_found
+        '409':
+          description: |
+            last_machine_credential (ADR-124 D2, owner 2026-11-04 R17)
+            — the request's bearer was minted from THIS key (`azp`) and it is the
+            realm's only credential that can get its platform token today (usable
+            platform API keys while platform-key login is on, plus active workload
+            bindings whose target is `platform` or `platform_mgmt`). Create
+            another first; rotation (mint B, then revoke A while calling with A)
+            is allowed. No override.
+        '503':
+          description: store_unavailable — the ADR-124 count could not be taken; nothing was revoked.
 
   /platforms/{id}/config:
     get:
@@ -7619,6 +7902,7 @@ paths:
         '404':
           description: realm_not_found
     patch:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -7642,7 +7926,20 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/RealmConfigPatch' }
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/RealmConfigPatch'
+                - type: object
+                  properties:
+                    acknowledge_mailbox_risk:
+                      type: boolean
+                      description: |
+                        ADR-123 D3. A REQUEST field, never stored and
+                        never returned by `GET /platforms/{id}/config`. Must be
+                        `true` when the body sets `email_otp_login_enabled: true`:
+                        the owner confirms that anyone who can read a member's
+                        mailbox will be able to sign in as them. Otherwise
+                        `400 acknowledgement_required`. No effect in any other body.
       responses:
         '200':
           description: OK
@@ -7653,15 +7950,41 @@ paths:
             `access_token_custom_claim_keys` entry names a reserved JWT claim
             such as `sid`, `events`, `scope` or `role`; the message names every
             offending key) | unique_kinds_requires_password (ADR-117 D8: an
-            empty `contacts.unique_kinds` while password sign-in is off)
+            empty `contacts.unique_kinds` while password sign-in is off) |
+            acknowledgement_required (ADR-123 D3: the body sets
+            `email_otp_login_enabled: true` without `acknowledge_mailbox_risk: true`;
+            nothing in the PATCH is written)
+        '403':
+          description: |
+            forbidden — the caller lacks `platform:config` (and is not RealmID
+            staff), OR the body turns `email_otp_login_enabled` from false to true
+            and the actor is not the realm owner (ADR-123 D2, owner 2026-11-04 R10:
+            staff and non-owner `platform:config` holders cannot turn it
+            on; the whole PATCH is refused). Turning it on from a user API key
+            session is refused with the existing never-via-key refusal (R14), a
+            check on that change only, not on the route. Turning it OFF needs only
+            this route's ordinary gate (R11). A body that does not change the
+            stored value is not checked. RealmID's BFF additionally answers `412`
+            (ADR-096 step-up) to its console until the person has a fresh MFA
+            before turning it on (R14; enforced at the BFF, not here).
         '409':
           description: |
+            email_otp_requires_identifying_email (ADR-123 D8, owner 2026-11-04
+            R12: the result would have `email_otp_login_enabled` on
+            while `email` is not in `contacts.unique_kinds`) |
+            last_browser_sign_in (ADR-124 D1, owner 2026-11-04 R16:
+            turning off `password_login_enabled`, `otp_login_enabled` or
+            `email_otp_login_enabled`, or a `contacts.unique_kinds` change, would
+            leave the realm with no browser sign-in method; judged on the
+            post-patch config; no override) |
             ADR-117 D8, all from a change to `contacts.unique_kinds`
             (see `RealmConfigPatch.contacts`): unique_kind_lockout
             (`{kind, locked_out, mfa_locked_out}`; escaped by
             `?confirm_lockout=true`) | unique_kind_duplicates
             (`{kind, conflicting_values}`) | email_keyed_signin_enabled
-            (`{identity_providers, sso_domains}`) |
+            (`{identity_providers, sso_domains, email_otp_login}`; ADR-123 D8 adds
+            `email_otp_login: true` when `email_otp_login_enabled` is on, which
+            also blocks removing `email`, with no override) |
             require_verified_email_conflict | password_login_required.
             Also active_api_keys_exist (existing).
         '501':
@@ -7669,7 +7992,9 @@ paths:
         '503':
           description: |
             unique_kind_lockout_check_failed (a count could not be taken;
-            refused whatever `confirm_lockout` says)
+            refused whatever `confirm_lockout` says) | store_unavailable (ADR-123
+            owner check or ADR-124 count could not be taken; nothing written; NOT
+            BUILT)
 
   /platforms/{id}/messaging/{channel}:
     parameters:
@@ -7682,6 +8007,7 @@ paths:
         required: true
         schema: { type: string, enum: [sms, whatsapp] }
     put:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -7769,6 +8095,7 @@ paths:
         '404':
           description: channel_not_configured
     delete:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -7794,6 +8121,13 @@ paths:
           description: missing or invalid bearer
         '403':
           description: forbidden - missing permission `platform:config`
+        '409':
+          description: |
+            last_browser_sign_in (ADR-124 D1, owner 2026-11-04 R16) —
+            this is the realm's last operational phone channel and phone codes
+            are its last browser sign-in method. No override.
+        '503':
+          description: store_unavailable — the ADR-124 count could not be taken; nothing was deleted.
 
   /platforms/{id}/federation-bindings:
     parameters:
@@ -7839,6 +8173,7 @@ paths:
           description: realm_not_found | federation_disabled
         '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -7948,6 +8283,7 @@ paths:
 
   /platforms/{id}/federation-bindings/{bid}:
     delete:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -7991,6 +8327,16 @@ paths:
           description: not_authorized (caller is not a realm admin / owner)
         '404':
           description: binding_not_found | federation_disabled
+        '409':
+          description: |
+            last_machine_credential (ADR-124 D2, owner 2026-11-04 R17)
+            — the request's bearer was minted by THIS binding (`azp` =
+            `apikey:fed:<bid>`) and it is the realm's only credential that can get
+            its platform token today (usable platform API keys while platform-key
+            login is on, plus active bindings whose target is `platform` or
+            `platform_mgmt`). No override.
+        '503':
+          description: store_unavailable — the ADR-124 count could not be taken; nothing was revoked.
 
   /platforms/{id}/permissions:
     parameters:
@@ -8844,6 +9190,7 @@ paths:
         required: true
         schema: { type: string, format: uuid }
     post:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -8921,6 +9268,7 @@ paths:
                   last_handshake: { type: string, format: date-time, nullable: true }
         '404': { description: platform_not_found }
     post:
+      x-realmid-step-up-candidate: true
       tags: [Platform Admin]
       x-realmid-no-actor: true
       security:
@@ -9573,7 +9921,9 @@ paths:
           description: |
             idp_requires_identifying_email | idp_requires_identifying_phone
             (only when the patch sets `enabled=true`; same rules as the
-            create, ADR-117)
+            create, ADR-117) | last_browser_sign_in (ADR-124 D1: the
+            patch sets `enabled=false` or changes `app_id` on a realm-level web
+            row and the realm would be left with no browser sign-in method)
     delete:
       tags: [Platform Admin]
       security:
@@ -9590,6 +9940,14 @@ paths:
               schema: { $ref: '#/components/schemas/StatusOK' }
         '404':
           description: provider_not_found
+        '409':
+          description: |
+            last_browser_sign_in (ADR-124 D1) — this is the realm's last
+            enabled REALM-level web identity provider and the realm has no other
+            browser sign-in method (password; phone codes with an operational
+            channel; emailed codes). Tenant-owned rows do not count.
+        '503':
+          description: store_unavailable — the ADR-124 count could not be taken; nothing was removed.
 
   # ---------------------------------------------------------------- Sources (ADR-072)
 
@@ -9764,6 +10122,13 @@ paths:
           description: forbidden
         '404':
           description: source_not_found
+        '409':
+          description: |
+            last_browser_sign_in (ADR-124 D1) — the patch sets
+            `enabled=false` or narrows `allowed_methods` so the realm's last
+            browser sign-in method stops working.
+        '503':
+          description: store_unavailable — the ADR-124 count could not be taken; nothing was changed.
     delete:
       tags: [Platform Admin]
       security:
@@ -9782,6 +10147,12 @@ paths:
           description: forbidden
         '404':
           description: source_not_found
+        '409':
+          description: |
+            last_browser_sign_in (ADR-124 D1) — removing this source
+            would leave the realm with no browser sign-in method.
+        '503':
+          description: store_unavailable — the ADR-124 count could not be taken; nothing was removed.
 
   # ---------------------------------------------------------------- Tenants
 
@@ -9844,6 +10215,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Tenant' }
     patch:
+      x-realmid-step-up-candidate: true
       tags: [Tenants]
       security:
         - BearerPlatformToken: []
@@ -9863,6 +10235,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Tenant' }
     delete:
+      x-realmid-step-up-candidate: true
       tags: [Tenants]
       security:
         - BearerPlatformToken: []
@@ -9904,6 +10277,7 @@ paths:
 
   /tenants/{id}/owner:
     put:
+      x-realmid-step-up-candidate: true
       tags: [Tenants]
       security:
         - BearerPlatformToken: []
@@ -10070,11 +10444,16 @@ paths:
           ActorToken: []
       summary: Bulk-import pre-provisioned active users (ADR-073 Release B)
       description: |
-        Provisions a batch of pre-trusted, **active** human users into one
-        tenant. Distinct from the invite flow (ADR-017): imported users are
-        `status='active'` with **verified** contacts, bound to their provider
-        identity on first SSO (by `provider_uid` when supplied, else by
-        email/phone match). Gated on
+        Provisions a batch of **active** human users into one tenant. Distinct
+        from the invite flow (ADR-017). **What an import asserts is not a proof
+        (ADR-073 § B.1 Amendment 2026-11-14):** imported contacts are written
+        **unverified**, so an imported address is never a correlation key until
+        its holder proves it; a supplied `provider` + `provider_uid` is written as
+        an unproven **pre-seed** that carries no authority and is approved only
+        when a login in THIS tenant has its IdP assert exactly that login. A
+        pre-seed may name a login already active elsewhere in the realm, and the
+        import neither refuses nor reports that. Rows imported before `v0.151.0`
+        were downgraded to the same state by migration. Gated on
         `requireTenantPermission(id, "users:manage")` (ADR-074): the
         tenant's own owner, the realm's own M2M token, or a member whose
         realm role grants `users:manage`.
@@ -10157,6 +10536,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/User' }
     patch:
+      x-realmid-step-up-candidate: true
       tags: [Tenants]
       security:
         - BearerPlatformToken: []
@@ -10866,6 +11246,7 @@ paths:
         required: true
         schema: { type: string, format: uuid }
     post:
+      x-realmid-step-up-candidate: true
       tags: [Service Accounts]
       security:
         - BearerPlatformToken: []
@@ -11228,6 +11609,7 @@ paths:
         '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{id}/contact-verifications/{cvId}/approve:
     post:
+      x-realmid-step-up-candidate: true
       tags: [Contact Verifications]
       security:
         - BearerPlatformToken: []
@@ -11283,6 +11665,7 @@ paths:
 
   /tenants/{tenantId}/users/{uid}/mfa/enroll:
     post:
+      x-realmid-step-up-candidate: true
       tags: [MFA Admin]
       security:
         - BearerPlatformToken: []
@@ -11312,6 +11695,7 @@ paths:
 
   /tenants/{tenantId}/users/{uid}/mfa/confirm:
     post:
+      x-realmid-step-up-candidate: true
       tags: [MFA Admin]
       security:
         - BearerPlatformToken: []
@@ -11339,6 +11723,7 @@ paths:
 
   /tenants/{tenantId}/users/{uid}/mfa:
     delete:
+      x-realmid-step-up-candidate: true
       tags: [MFA Admin]
       security:
         - BearerPlatformToken: []
@@ -11371,6 +11756,8 @@ paths:
             forbidden — the caller lacks `users:manage` and is not the direct
             parent, or the target is the tenant owner and the caller is an
             in-tenant admin rather than the owner
+            | mfa_reset_self — `uid` is the caller's own row; remove your own
+            factor with `DELETE /auth/mfa` and a current code (ADR-077 AF-077.1)
 
   # ---- ADR-047 §3: GET /me ----
   /me:
@@ -11505,10 +11892,28 @@ paths:
                             decision outstanding, and offering accept/decline on
                             either answers `not_invited` / `not_pending`. Absent
                             means false.
+                        outside_session_confinement:
+                          type: boolean
+                          description: >-
+                            ADR-099 AF-099.8 — this membership is outside the
+                            confinement of the session that called (AF-099.6:
+                            a session proven through an organization's own
+                            identity provider acts only in that organization).
+                            It is listed so the person sees all their
+                            organizations, but `POST /auth/token` for it from
+                            this session answers `403 login_confined_to_tenant`.
+                            Render it as present but not switchable and offer
+                            "sign in again to switch". Orthogonal to
+                            `pending_first_signin` and `invitation_pending`.
+                            Absent means false.
         '401':
           description: unauthorized
         '404':
           description: user_not_found
+        '503':
+          description: >-
+            The session's confinement could not be read (ADR-099 AF-099.8); never
+            an unflagged list.
 
   # ---- ADR-049 §A.7: domain CRUD ----
 
@@ -11670,6 +12075,7 @@ paths:
             leaving, or `already_left` — the membership is already ended.
   /me/password:
     put:
+      x-realmid-human-only: true
       tags: [Auth]
       security:
         - BearerPlatformToken: []
@@ -11780,6 +12186,7 @@ paths:
 
   /tenants/{tid}/users/{uid}/credentials:
     put:
+      x-realmid-step-up-candidate: true
       tags: [Users]
       security:
         - BearerPlatformToken: []
