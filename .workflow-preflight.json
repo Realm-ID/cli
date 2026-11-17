@@ -15,6 +15,7 @@
     "workflow-hygiene.yml:pinned": {"local": "make workflow-parity", "marker": "workflow-parity"},
     "release.yml:changelog": {"waiver": "release-only", "reason": "runs on a pushed tag only; make release-check VERSION=x.y.z is the pre-tag equivalent, not part of the pre-push gate"},
     "release.yml:test": {"waiver": "release-only", "reason": "workflow_call of tests.yml on the tagged tree; tests.yml:test is the mapped job and make check runs the same suite"},
-    "release.yml:goreleaser": {"waiver": "release-only", "reason": "builds and publishes release artefacts from a pushed tag; needs GITHUB_TOKEN and network, cannot run in a pre-push gate"}
+    "release.yml:goreleaser": {"waiver": "release-only", "reason": "builds and publishes release artefacts from a pushed tag; needs GITHUB_TOKEN and network, cannot run in a pre-push gate"},
+    "release.yml:pin": {"waiver": "release-only", "reason": "commits the release's sha256 pin to main from a pushed tag; needs the build artifact and a write token; pin.sh itself is covered by scripts/setup-pin_test.sh in make self-test"}
   }
 }

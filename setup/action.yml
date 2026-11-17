@@ -1,6 +1,6 @@
 name: 'Realm-ID CLI setup'
 description: >-
-  Installs a pinned, checksum-verified realm-id CLI release on a Linux runner and, by default,
+  Installs a realm-id CLI release, verified against a sha256 committed in this repository, on a Linux runner and, by default,
   signs the job in as a workload by workload identity federation (realm-id auth workload).
   The calling job needs `permissions: id-token: write` for the sign-in. Use as
   `uses: Realm-ID/cli/setup@<full commit SHA> # vX.Y.Z` (R25).
@@ -58,11 +58,9 @@ runs:
         dir="${RUNNER_TEMP}/realm-id-setup"
         mkdir -p "${dir}/bin"
         curl -fsSL --retry 3 -o "${dir}/${name}" "${base}/${name}"
-        curl -fsSL --retry 3 -o "${dir}/checksums.txt" "${base}/checksums.txt"
-        # The checksum file names the asset; verify exactly that line and require that it was found.
-        grep -F " ${name}" "${dir}/checksums.txt" > "${dir}/expected.txt" \
-          || { echo "::error::${name} is not listed in checksums.txt"; exit 1; }
-        (cd "${dir}" && sha256sum -c expected.txt)
+        # The expected sha256 is committed beside this action (setup/pins/<version>.sha256); nothing
+        # that verifies the tarball is fetched from the release that serves it.
+        "${GITHUB_ACTION_PATH}/verify.sh" "${GITHUB_ACTION_PATH}/pins" "${ver}" "${name}" "${dir}/${name}"
         tar -xzf "${dir}/${name}" -C "${dir}/bin" realm-id
         echo "${dir}/bin" >> "${GITHUB_PATH}"
         reported="$("${dir}/bin/realm-id" --version)"

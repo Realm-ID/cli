@@ -106,5 +106,6 @@ install-hooks:
 self-test:
 	./scripts/preflight-parity_test.sh
 	./scripts/revendor-spec.sh selftest
+	./scripts/setup-pin_test.sh
 	python3 scripts/test_workflow_preflight.py
 	python3 scripts/test_todo_hygiene.py
