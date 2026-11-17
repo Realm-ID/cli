@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VENDORED from claude-config skills/workflow-preflight @ 8dc177f4a676 — edit canonical, not this copy
+# VENDORED from claude-config skills/workflow-preflight @ 9355a932c490 — edit canonical, not this copy
 """Tests for workflow_preflight.py (W1: lint + parity) — stdlib + PyYAML, no runner to install.
 
 Fixtures are synthetic repos built in temp dirs (no checked-in tree, so the vendored copy of
@@ -818,6 +818,83 @@ class TriggersTests(Base):
         base.update(kw)
         self.cfg(**base)
         return self.run_cli("triggers")
+
+    # SCHEDULE_INPUTS (github-actions 3f): dispatch input defaults do not apply on schedule/push.
+    SCHED = "  schedule:\n    - cron: '0 3 * * *'\n"
+
+    def _si(self, on, job_if="${{ inputs.run_e2e }}", default="        default: true\n", step=False):
+        d = "  workflow_dispatch:\n    inputs:\n      run_e2e:\n        type: boolean\n" + default
+        if step:
+            job = (f"  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - name: pw\n        if: {job_if}\n"
+                   "        run: make e2e\n")
+        else:
+            job = f"  e2e:\n    if: {job_if}\n    runs-on: ubuntu-latest\n    steps:\n      - run: make e2e\n"
+        return trig_wf(d + on, job)
+
+    def test_schedule_inputs_job_if_flagged(self):
+        self.wf("test.yml", self._si(self.SCHED))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCHEDULE_INPUTS test.yml:e2e", out)
+        self.assertIn("inputs.run_e2e", out)
+        self.assertIn("triggers: examined 1 workflows, 1 findings", out)
+
+    def test_schedule_inputs_event_name_not_flagged(self):
+        self.wf("test.yml", self._si(self.SCHED, "${{ github.event_name != 'workflow_dispatch' || inputs.run_e2e }}"))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+
+    def test_schedule_inputs_push_flagged(self):
+        self.wf("test.yml", self._si("  push:\n    tags: ['v*']\n"))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCHEDULE_INPUTS test.yml:e2e", out)
+
+    def test_schedule_inputs_dispatch_only_not_flagged(self):
+        self.wf("test.yml", self._si(""))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+
+    def test_schedule_inputs_no_default_not_flagged(self):
+        self.wf("test.yml", self._si(self.SCHED, default=""))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+
+    def test_schedule_inputs_empty_like_default_not_flagged(self):
+        # '' off-dispatch behaves exactly like a false/empty/0 default: nothing differs, nothing to flag.
+        # NOT the string 'false': it is truthy in an expression, so '' does differ from it.
+        for dflt in ("false", "''", "0"):
+            with self.subTest(default=dflt):
+                self.wf("test.yml", self._si(self.SCHED, default=f"        default: {dflt}\n"))
+                rc, out = self.go()
+                self.assertEqual(rc, 0, out)
+
+    def test_schedule_inputs_string_default_flagged(self):
+        self.wf("test.yml", self._si(self.SCHED, job_if="${{ inputs.run_e2e == 'prod' }}",
+                                     default="        default: prod\n"))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCHEDULE_INPUTS test.yml:e2e", out)
+
+    def test_schedule_inputs_step_if_flagged(self):
+        self.wf("test.yml", self._si(self.SCHED, step=True))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCHEDULE_INPUTS test.yml:e2e:step pw", out)
+
+    def test_schedule_inputs_uses_job_if_flagged(self):
+        d = "  workflow_dispatch:\n    inputs:\n      run_e2e:\n        default: true\n" + self.SCHED
+        job = "  call:\n    if: ${{ inputs.run_e2e }}\n    uses: o/r/.github/workflows/x.yml@v1.0.0\n"
+        self.wf("test.yml", trig_wf(d, job))
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SCHEDULE_INPUTS test.yml:call", out)
+
+    def test_schedule_inputs_unenforced_warns(self):
+        self.wf("test.yml", self._si(self.SCHED))
+        rc, out = self.go(enforce=False)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN SCHEDULE_INPUTS test.yml:e2e", out)
 
     def test_push_main_on_test_workflow_flagged(self):
         self.wf("tests.yml", trig_wf(PUSH_MAIN, TEST_JOB))
@@ -1818,6 +1895,258 @@ class VendorTests(unittest.TestCase):
         v.write_text("".join(lines))
         p = self.vendor("--check")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+
+
+def rn_wf(*jobs):
+    """jobs: (id, runs_on or None, [run lines], needs or None). runs_on is written verbatim as YAML."""
+    out = ["name: t", "on: workflow_dispatch", "jobs:"]
+    for jid, ro, runs, needs in jobs:
+        out.append(f"  {jid}:")
+        if ro is not None:
+            out.append(f"    runs-on: {ro}")
+        if needs:
+            out.append(f"    needs: [{', '.join(needs)}]")
+        out.append("    steps:")
+        for r in runs:
+            out.append(f"      - run: {r}")
+    return "\n".join(out) + "\n"
+
+
+SAVE, LOAD, INSPECT_ID = "docker save -o x.tar img", "docker load -i x.tar", "docker image inspect --format '{{.Id}}' img"
+
+
+class RunnersTests(Base):
+    """`runners`: ubuntu-latest / Playwright / docker image-ID guard. Report-only unless enforced."""
+
+    def go(self, enforce=False, waivers=None, **kw):
+        r = {"enforce": enforce}
+        if waivers is not None:
+            r["waivers"] = waivers
+        self.cfg(runners=r, **kw)
+        return self.run_cli("runners")
+
+    def codes(self, out):
+        return sorted(re.findall(r"^(?:WARN )?([A-Z_]+) \S+:", out, re.M))
+
+    def test_latest_playwright(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-latest", ["npx playwright install --with-deps chrome"], None)))
+        rc, out = self.go()
+        self.assertEqual(self.codes(out), ["LATEST_PLAYWRIGHT"], out)
+        self.assertIn("WARN LATEST_PLAYWRIGHT a.yml:e2e", out)
+        self.assertEqual(rc, 0, out)
+
+    def test_latest_playwright_via_uses_and_env(self):
+        self.wf("a.yml", "on: push\njobs:\n  e2e:\n    runs-on: ubuntu-latest\n    steps:\n"
+                         "      - uses: microsoft/playwright-github-action@v1\n")
+        self.wf("b.yml", "on: push\njobs:\n  e2e:\n    runs-on: ubuntu-latest\n    steps:\n"
+                         "      - run: make e2e\n        env:\n          RUNNER: playwright\n")
+        rc, out = self.go()
+        self.assertIn("LATEST_PLAYWRIGHT a.yml:e2e", out)
+        self.assertIn("LATEST_PLAYWRIGHT b.yml:e2e", out)
+
+    def test_latest_playwright_when_runs_on_unset(self):
+        self.wf("a.yml", rn_wf(("e2e", None, ["npx playwright test"], None)))
+        rc, out = self.go()
+        self.assertIn("LATEST_PLAYWRIGHT a.yml:e2e", out)
+
+    def test_latest_image_io_each_verb(self):
+        self.wf("a.yml", rn_wf(("s", "ubuntu-latest", [SAVE], None)))
+        self.wf("b.yml", rn_wf(("l", "ubuntu-latest", [LOAD], None)))
+        self.wf("c.yml", rn_wf(("i", "ubuntu-latest", ["docker image inspect img"], None)))
+        rc, out = self.go()
+        for k in ("a.yml:s", "b.yml:l", "c.yml:i"):
+            self.assertIn(f"LATEST_IMAGE_IO {k}", out)
+
+    def test_lone_pull_on_latest_is_allowed(self):
+        self.wf("a.yml", rn_wf(("apply", "ubuntu-latest", ["docker pull img"], None)))
+        rc, out = self.go()
+        self.assertEqual(self.codes(out), [], out)
+        self.assertIn("examined 1 jobs", out)
+
+    def test_runner_split(self):
+        self.wf("a.yml", rn_wf(("images", "ubuntu-24.04", [SAVE], None),
+                               ("smoke", "ubuntu-22.04", [LOAD], ["images"])))
+        rc, out = self.go()
+        self.assertEqual(self.codes(out), ["RUNNER_SPLIT"], out)
+        self.assertIn("RUNNER_SPLIT a.yml:smoke", out)
+
+    def test_runner_split_checks_every_loader(self):
+        # the release-gate case: a third job downloads+loads the tarball on a different label
+        self.wf("a.yml", rn_wf(("images", "ubuntu-24.04", [SAVE], None),
+                               ("e2e", "ubuntu-24.04", [LOAD], ["images"]),
+                               ("push", "ubuntu-22.04", [LOAD, INSPECT_ID], ["e2e"])))
+        rc, out = self.go()
+        self.assertIn("RUNNER_SPLIT a.yml:push", out)
+        self.assertNotIn("RUNNER_SPLIT a.yml:e2e", out)  # push reaches images only transitively, via e2e
+
+    def test_runner_split_needs_must_link(self):
+        self.wf("a.yml", rn_wf(("images", "ubuntu-24.04", [SAVE], None),
+                               ("smoke", "ubuntu-22.04", [LOAD], None)))
+        rc, out = self.go()
+        self.assertNotIn("RUNNER_SPLIT", out)
+
+    def test_runner_split_list_label_set(self):
+        self.wf("a.yml", rn_wf(("images", "[self-hosted, linux]", [SAVE], None),
+                               ("smoke", "[linux, self-hosted]", [LOAD], ["images"])))
+        self.wf("b.yml", rn_wf(("images", "[self-hosted, linux]", [SAVE], None),
+                               ("smoke", "[self-hosted, arm64]", [LOAD], ["images"])))
+        rc, out = self.go()
+        self.assertNotIn("RUNNER_SPLIT a.yml", out)
+        self.assertIn("RUNNER_SPLIT b.yml:smoke", out)
+
+    def test_id_compare_after_load(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-24.04", [LOAD, INSPECT_ID], None)))
+        rc, out = self.go()
+        self.assertEqual(self.codes(out), ["ID_COMPARE"], out)
+        self.assertIn("ID_COMPARE a.yml:e2e", out)
+
+    def test_id_read_without_load_is_fine(self):
+        self.wf("a.yml", rn_wf(("images", "ubuntu-24.04", [INSPECT_ID, SAVE], None)))
+        rc, out = self.go()
+        self.assertEqual(self.codes(out), [], out)
+
+    def test_id_before_load_is_fine(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-24.04", [INSPECT_ID, LOAD], None)))
+        rc, out = self.go()
+        self.assertNotIn("ID_COMPARE", out)
+
+    def test_unresolved_expression(self):
+        self.wf("a.yml", rn_wf(("e2e", "${{ inputs.runner }}", ["npx playwright test"], None)))
+        self.wf("b.yml", rn_wf(("echo", "${{ inputs.runner }}", ["echo hi"], None)))
+        rc, out = self.go()
+        self.assertIn("UNRESOLVED a.yml:e2e", out)
+        self.assertNotIn("b.yml:echo", out)
+        self.assertEqual(rc, 0)
+
+    def test_unresolved_saver_loader_pair(self):
+        self.wf("a.yml", rn_wf(("images", "${{ inputs.r }}", [SAVE], None),
+                               ("smoke", "ubuntu-24.04", [LOAD], ["images"])))
+        rc, out = self.go()
+        self.assertIn("UNRESOLVED a.yml:images", out)
+        self.assertNotIn("RUNNER_SPLIT", out)
+
+    def test_unresolved_stays_a_finding_when_enforced(self):
+        self.wf("a.yml", rn_wf(("e2e", "${{ inputs.runner }}", ["npx playwright test"], None)))
+        rc, out = self.go(enforce=True)
+        self.assertEqual(rc, 1, out)
+
+    def test_negative_pinned_both(self):
+        self.wf("a.yml", rn_wf(("images", "ubuntu-24.04", [SAVE], None),
+                               ("smoke", "ubuntu-24.04", ["docker load -i x.tar", "docker image inspect img"], ["images"])))
+        rc, out = self.go()
+        self.assertEqual(self.codes(out), [], out)
+        self.assertIn("examined 2 jobs in 1 workflows, 0 findings", out)
+
+    def test_negative_playwright_no_docker_pinned(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-24.04", ["npx playwright test"], None)))
+        rc, out = self.go(enforce=True)
+        self.assertEqual((rc, self.codes(out)), (0, []), out)
+
+    def test_reusable_call_job_examined_not_flagged(self):
+        self.wf("a.yml", "on: push\njobs:\n  call:\n    uses: o/r/.github/workflows/x.yml@v1\n"
+                         "    with:\n      browser: playwright\n")
+        rc, out = self.go()
+        self.assertEqual((rc, self.codes(out)), (0, []), out)
+        self.assertIn("examined 1 jobs", out)
+
+    def test_enforce_off_warns_exit_0(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-latest", ["npx playwright test"], None)))
+        rc, out = self.go(enforce=False)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN LATEST_PLAYWRIGHT", out)
+        self.assertIn("runners: examined 1 jobs in 1 workflows, 1 findings", out)
+
+    def test_enforce_default_is_off(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-latest", ["npx playwright test"], None)))
+        self.cfg()
+        rc, out = self.run_cli("runners")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARN LATEST_PLAYWRIGHT", out)
+
+    def test_enforce_on_exit_1(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-latest", ["npx playwright test"], None)))
+        rc, out = self.go(enforce=True)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("WARN LATEST_PLAYWRIGHT", out)
+        self.assertIn("LATEST_PLAYWRIGHT a.yml:e2e", out)
+
+    def test_zero_jobs_exit_2(self):
+        for enforce in (False, True):
+            self.wf("a.yml", "on: push\njobs: {}\n")
+            rc, out = self.go(enforce=enforce)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("examined 0 jobs", out)
+
+    def test_valid_waiver_suppresses_only_its_finding(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-latest", ["npx playwright test", LOAD, INSPECT_ID], None)))
+        wv = [{"job": "a.yml:e2e", "code": "LATEST_PLAYWRIGHT", "reason": "waiting on upstream playwright 26.04"}]
+        rc, out = self.go(enforce=True, waivers=wv)
+        self.assertNotIn("LATEST_PLAYWRIGHT", out)
+        self.assertIn("LATEST_IMAGE_IO a.yml:e2e", out)
+        self.assertIn("ID_COMPARE a.yml:e2e", out)
+        self.assertEqual(rc, 1)
+
+    def test_short_reason_waiver_invalid_and_covers_nothing(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-latest", ["npx playwright test"], None)))
+        wv = [{"job": "a.yml:e2e", "code": "LATEST_PLAYWRIGHT", "reason": "too short"}]
+        rc, out = self.go(enforce=True, waivers=wv)
+        self.assertIn("WAIVER_INVALID", out)
+        self.assertIn("LATEST_PLAYWRIGHT a.yml:e2e", out)
+        self.assertEqual(rc, 1)
+
+    def test_bad_waiver_shapes_invalid(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-24.04", ["echo"], None)))
+        long = "a reason that is long enough"
+        for wv in ({"job": "a.yml:e2e", "code": "NOPE", "reason": long},
+                   {"job": "nocolon", "code": "ID_COMPARE", "reason": long},
+                   {"job": "a.yml:e2e", "code": "ID_COMPARE", "reason": long, "extra": 1}, "str"):
+            rc, out = self.go(waivers=[wv])
+            self.assertIn("WAIVER_INVALID", out, wv)
+            self.assertEqual(rc, 0)
+
+    def test_bad_runners_config_exit_2(self):
+        self.wf("a.yml", rn_wf(("e2e", "ubuntu-24.04", ["echo"], None)))
+        for bad in ({"enforce": "yes"}, {"nope": 1}, "x", {"waivers": "x"}):
+            self.cfg(runners=bad)
+            rc, out = self.run_cli("runners")
+            self.assertEqual(rc, 2, (bad, out))
+
+    # --- ported from a consumer's prior-art guard (check-runner-labels.py) ---
+    def test_prior_art_ports(self):
+        cases = [  # (jobs, expected codes) -- the table, not the prior art, decides
+            ([("e2e", "ubuntu-24.04", ["npx playwright test"], None)], []),
+            ([("images", "ubuntu-latest", [SAVE], None), ("smoke", "ubuntu-24.04", [LOAD], ["images"])],
+             ["LATEST_IMAGE_IO", "RUNNER_SPLIT"]),
+            ([("images", "ubuntu-latest", [SAVE], None), ("smoke", "ubuntu-latest", [LOAD], ["images"])],
+             ["LATEST_IMAGE_IO", "LATEST_IMAGE_IO"]),
+            ([("images", "ubuntu-24.04", ["docker image inspect img"], None),
+              ("smoke", "ubuntu-24.04", [LOAD], ["images"]), ("other", "ubuntu-latest", ["echo x"], None)], []),
+            ([("apply", "ubuntu-latest", ["docker pull img"], None)], []),
+            ([("call", None, [LOAD], None)], ["LATEST_IMAGE_IO"]),  # differs: unset runs-on counts as latest
+        ]
+        for i, (jobs, want) in enumerate(cases):
+            self.wf(f"c{i}.yml", rn_wf(*jobs))
+            rc, out = self.go()
+            got = sorted(re.findall(rf"^WARN ([A-Z_]+) c{i}\.yml:", out, re.M))
+            self.assertEqual(got, want, (i, out))
+
+    # --- real consumer workflows (fixtures copied from two commits of one repo) ---
+    def real(self, fixture):
+        src = HERE / "fixtures" / fixture
+        if not src.is_file():
+            self.skipTest("fixtures/ not vendored")
+        self.wf("e2e.yml", src.read_text())
+        return self.go()
+
+    def test_real_pre_fix_split(self):
+        rc, out = self.real("consumer-e2e-split.yml")
+        self.assertEqual(self.codes(out), ["ID_COMPARE", "LATEST_IMAGE_IO", "RUNNER_SPLIT"], out)
+        self.assertIn("LATEST_IMAGE_IO e2e.yml:images", out)
+        self.assertIn("RUNNER_SPLIT e2e.yml:e2e", out)
+
+    def test_real_post_fix_only_id_compare(self):
+        rc, out = self.real("consumer-e2e-pinned.yml")
+        self.assertEqual(self.codes(out), ["ID_COMPARE"], out)
 
 
 if __name__ == "__main__":
