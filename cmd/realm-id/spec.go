@@ -345,9 +345,15 @@ func skipPath(path string) bool {
 // guide both name revocation as the primary control for an end-user key, so a
 // binary that cannot revoke one contradicts the advice we ship with it.
 //
+// federation-bindings is included on the same reasoning: a binding revoke is a
+// soft delete (status=revoked, the row stays readable) and a replacement is one
+// `create` away. Without it, replacing a name-only binding with an id-pinned one
+// cannot finish from the CLI, and a token matching both is refused as ambiguous.
+//
 // Everything else stays filtered. The test in spec_test.go pins both halves.
 func isRevocable(path string) bool {
 	return strings.HasPrefix(path, "/platforms/") && strings.Contains(path, "/api-keys/") ||
+		strings.HasPrefix(path, "/platforms/") && strings.Contains(path, "/federation-bindings/") ||
 		strings.Contains(path, "/user-api-keys/") ||
 		// ADR-115: removing a realm's own phone-delivery credentials is reversible
 		// the way a key revoke is (a PUT saves them again), and a partner who cannot

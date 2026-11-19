@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-40 entries. Newest first.
+41 entries. Newest first.
 
+- [2026-11-19 — federation-bindings revoke allowed through the delete filter](#2026-11-19--federation-bindings-revoke-allowed-through-the-delete-filter)
 - [2026-11-03 — workflow-parity PIN_DRIFT: split the Go 1.23 minimum leg into its own job (RCA)](#2026-11-03--workflow-parity-pin_drift-split-the-go-123-minimum-leg-into-its-own-job-rca)
 - [2026-11-03 — Re-vendor issuer v0.147.0 / spec 0.66.0 to match api v0.47.0 (device-login release)](#2026-11-03--re-vendor-issuer-v01470--spec-0660-to-match-api-v0470-device-login-release)
 - [2026-11-02 — Dealer splits mod λ (SPEC §14.14); the CLI keeps its own dealer, held to vendored shared vectors](#2026-11-02--dealer-splits-mod-λ-spec-1414-the-cli-keeps-its-own-dealer-held-to-vendored-shared-vectors)
@@ -49,6 +50,14 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-11-19 — federation-bindings revoke allowed through the delete filter
+
+Owner ruling: `realm-id federation-bindings revoke` passes the ADR-062 §5 delete filter, on the same reasoning that admitted key revokes (ADR-085 §8). It is a soft delete (`status=revoked`, the row stays readable) and a replacement is one `create` away.
+
+Why it is needed: replacing a name-only binding with an id-pinned one must end by revoking the old one, because a token matching both bindings is refused as ambiguous (401). Without the verb that step cannot be done from the CLI.
+
+Rule: `isRevocable` allows `DELETE /platforms/{id}/federation-bindings/{bid}`; every other DELETE stays filtered. `spec_test.go` pins the new verb and keeps the exact-allowlist check for all other DELETEs. Invocation: `realm-id federation-bindings revoke --platform <id> --bid <binding id>`.
 
 ## 2026-11-03 — workflow-parity PIN_DRIFT: split the Go 1.23 minimum leg into its own job (RCA)
 

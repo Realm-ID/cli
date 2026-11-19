@@ -43,6 +43,9 @@ func TestDeriveCommand(t *testing.T) {
 		// binary never implies the row is gone.
 		{"DELETE", "/platforms/{id}/api-keys/{keyId}", "api-keys", "revoke", true},
 		{"DELETE", "/tenants/{tid}/users/{uid}/user-api-keys/{id}", "user-api-keys", "revoke", true},
+		// A federation binding revoke is a soft delete (status=revoked); a
+		// replacement is one `create` away.
+		{"DELETE", "/platforms/{id}/federation-bindings/{bid}", "federation-bindings", "revoke", true},
 		// destructive + non-CLI surfaces skip entirely
 		{"DELETE", "/tenants/{id}", "", "", false},
 		{"PUT", "/tenants/{id}/owner", "", "", false},
@@ -87,6 +90,7 @@ func TestBuildCommandsTree(t *testing.T) {
 		{"api-keys", "revoke"}, {"user-api-keys", "revoke"},
 		// ADR-115 messaging: describe/update/revoke --channel sms|whatsapp.
 		{"messaging", "describe"}, {"messaging", "update"}, {"messaging", "revoke"},
+		{"federation-bindings", "revoke"},
 	} {
 		find(t, tr, want.group, want.verb)
 	}
@@ -94,7 +98,8 @@ func TestBuildCommandsTree(t *testing.T) {
 	// exempts. Pinned as an exact allowlist rather than a `revoke`-name skip:
 	// a future DELETE that happened to derive the verb `revoke` would otherwise
 	// walk into the binary unnoticed.
-	softRevokes := map[string]bool{"api-keys revoke": true, "user-api-keys revoke": true, "messaging revoke": true}
+	softRevokes := map[string]bool{"api-keys revoke": true, "user-api-keys revoke": true, "messaging revoke": true,
+		"federation-bindings revoke": true}
 	for g, verbs := range tr.byGroup {
 		for v, c := range verbs {
 			if c.Method == "DELETE" && !softRevokes[g+" "+v] {
