@@ -98,6 +98,7 @@ warning against concurrent `auth login`); these are the code fixes.
       `v0.3.7` and `main` is 8 commits ahead, so the revendor machinery is
       FIXED-ON-MAIN-BUT-UNRELEASED. Do not read it as live.
 - [ ] `cmd/realm-id/spec.go` — Expose `realm-id messaging` (ADR-115). Owner ruling 2026-10-17: build it; the secret is read from stdin or an interactive prompt, never a flag; ships in the next cli release. Hidden via skipBFFOnly until then
+- [ ] `.github/workflows/release.yml` (`pin` job): the pin commit is pushed to `main` AFTER goreleaser has published the release. If that push fails, the release has no pin, so `setup/` and `install.sh` refuse it while `latest` already points at it, and nothing retries or alerts. Write the pin before publishing (draft release, pin on main, then publish), or fail the job loudly and retry the push.
 
 ## Tracked privately
 
