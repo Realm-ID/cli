@@ -79,4 +79,4 @@ runs:
           echo "::error::no OIDC token available: the calling job needs 'permissions: id-token: write'"
           exit 1
         fi
-        realm-id auth workload --provider "${INPUT_PROVIDER}" --audience "${INPUT_AUDIENCE}"
+        realm-id auth workload --audience "${INPUT_AUDIENCE}"

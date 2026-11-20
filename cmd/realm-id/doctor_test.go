@@ -87,7 +87,8 @@ func (f *fakeIssuer) serve(t *testing.T) *httptest.Server {
 			_ = json.NewEncoder(w).Encode(jwksFor("k1", &f.jwksKey.PublicKey))
 		})
 	}
-	mux.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusGone) })
+	mux.HandleFunc("/auth/token", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if !f.keyOK || body["grant_type"] != "platform_api_key" || body["api_key"] != "rk_live_good" {

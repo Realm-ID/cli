@@ -369,38 +369,11 @@ func cmdUserAPIKeysCreate(args []string) int {
 	if tenant == "" || f.vals["label"] == "" {
 		return failCode(errors.New("usage: realm-id user-api-keys create --tenant <id> --label <text> (--permissions a:b,c:d | --uncapped) [--user <id>] [--totp <code>]"), exitUsage)
 	}
-	body := map[string]any{"label": f.vals["label"]}
-	switch {
-	case f.bools["uncapped"] && f.vals["permissions"] != "":
-		return failCode(errors.New("--uncapped and --permissions contradict each other"), exitUsage)
-	case f.bools["uncapped"]:
-		body["uncapped"] = true
-	case f.vals["permissions"] != "":
-		body["uncapped"] = false
-		body["permissions_cap"] = strings.Split(f.vals["permissions"], ",")
-	default:
-		return failCode(errors.New("state the key's authority: --permissions a:b,c:d or --uncapped (ADR-100)"), exitUsage)
+	body, berr := userKeyBody(f)
+	if berr != nil {
+		return failCode(berr, exitUsage)
 	}
-	if t := f.vals["ttl-seconds"]; t != "" {
-		n, perr := strconv.Atoi(t)
-		if perr != nil {
-			return failCode(fmt.Errorf("--ttl-seconds: %w", perr), exitUsage)
-		}
-		body["ttl_seconds"] = n
-	}
-	user := f.vals["user"]
-	if user == "" { // the key is self-service: {uid} must be the caller
-		var me struct {
-			UserID string `json:"user_id"`
-		}
-		if mst, _, merr := bffCallInto(cfg, http.MethodGet, "/me", &me); merr == nil && mst/100 == 2 {
-			user = me.UserID
-		}
-		if user == "" {
-			user = "me"
-		}
-	}
-	path := "/tenants/" + url.PathEscape(tenant) + "/users/" + url.PathEscape(user) + "/user-api-keys"
+	path := "/tenants/" + url.PathEscape(tenant) + "/users/" + url.PathEscape(keyOwner(cfg, f.vals["user"])) + "/user-api-keys"
 	st, raw, abort := stepUpCall(cfg, http.MethodPost, path, body, f.vals["totp"])
 	if abort >= 0 {
 		return abort
@@ -408,13 +381,52 @@ func cmdUserAPIKeysCreate(args []string) int {
 	return printBody(st, raw)
 }
 
-// cmdPlatformKeys mints a platform key (R72: a person, or the platform_mgmt_api workload actor).
-func cmdPlatformKeys(args []string) int {
-	if len(args) == 0 || args[0] != "create" {
-		fmt.Fprintln(os.Stderr, "usage: realm-id platform-keys create --realm <id> --label <text> [--totp <code>]")
-		return exitUsage
+// userKeyBody builds the write body shared by the user-key mint and update: the label, the
+// key's STATED authority (ADR-100: --permissions or --uncapped, never neither) and an optional TTL.
+func userKeyBody(f *verbFlags) (map[string]any, error) {
+	body := map[string]any{"label": f.vals["label"]}
+	switch {
+	case f.bools["uncapped"] && f.vals["permissions"] != "":
+		return nil, errors.New("--uncapped and --permissions contradict each other")
+	case f.bools["uncapped"]:
+		body["uncapped"] = true
+	case f.vals["permissions"] != "":
+		body["uncapped"] = false
+		body["permissions_cap"] = strings.Split(f.vals["permissions"], ",")
+	default:
+		return nil, errors.New("state the key's authority: --permissions a:b,c:d or --uncapped (ADR-100)")
 	}
-	f, err := parseVerbFlags(args[1:], []string{"realm", "label", "totp"}, nil)
+	if t := f.vals["ttl-seconds"]; t != "" {
+		n, perr := strconv.Atoi(t)
+		if perr != nil {
+			return nil, fmt.Errorf("--ttl-seconds: %w", perr)
+		}
+		body["ttl_seconds"] = n
+	}
+	return body, nil
+}
+
+// keyOwner resolves {uid} for the user-key routes: --user, else the caller (the key is self-service).
+func keyOwner(cfg *Config, user string) string {
+	if user != "" {
+		return user
+	}
+	var me struct {
+		UserID string `json:"user_id"`
+	}
+	if mst, _, merr := bffCallInto(cfg, http.MethodGet, "/me", &me); merr == nil && mst/100 == 2 {
+		user = me.UserID
+	}
+	if user == "" {
+		user = "me"
+	}
+	return user
+}
+
+// cmdUserAPIKeysUpdate replaces a user API key's label, authority and TTL (ADR-119 § 6.2). A
+// person's session only; the same flags as the mint, so `uncapped` is always stated.
+func cmdUserAPIKeysUpdate(args []string) int {
+	f, err := parseVerbFlags(args, []string{"tenant", "user", "id", "label", "permissions", "totp", "ttl-seconds"}, []string{"uncapped"})
 	if err != nil {
 		return failCode(err, exitUsage)
 	}
@@ -422,20 +434,126 @@ func cmdPlatformKeys(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	if code := needsHuman(cfg, "platform-keys create", true); code != 0 {
+	if code := needsHuman(cfg, "user-api-keys update", false); code != 0 {
+		return code
+	}
+	tenant := f.vals["tenant"]
+	if tenant == "" {
+		tenant = cfg.Tenant
+	}
+	if tenant == "" || f.vals["id"] == "" || f.vals["label"] == "" {
+		return failCode(errors.New("usage: realm-id user-api-keys update --tenant <id> --id <key id> --label <text> (--permissions a:b,c:d | --uncapped) [--user <id>] [--ttl-seconds <n>] [--totp <code>]"), exitUsage)
+	}
+	body, berr := userKeyBody(f)
+	if berr != nil {
+		return failCode(berr, exitUsage)
+	}
+	path := "/tenants/" + url.PathEscape(tenant) + "/users/" + url.PathEscape(keyOwner(cfg, f.vals["user"])) +
+		"/user-api-keys/" + url.PathEscape(f.vals["id"])
+	st, raw, abort := stepUpCall(cfg, http.MethodPut, path, body, f.vals["totp"])
+	if abort >= 0 {
+		return abort
+	}
+	return printBody(st, raw)
+}
+
+// cmdPlatformKeys mints or revokes a platform key (R72: a person, or the platform_mgmt_api
+// workload actor).
+func cmdPlatformKeys(args []string) int {
+	if len(args) == 0 || (args[0] != "create" && args[0] != "revoke") {
+		fmt.Fprintln(os.Stderr, "usage: realm-id platform-keys create --realm <id> --label <text> [--out <path>] [--totp <code>]\n"+
+			"       realm-id platform-keys revoke --realm <id> --keyId <id> [--totp <code>]")
+		return exitUsage
+	}
+	verb := args[0]
+	valueFlags := []string{"realm", "label", "totp", "out"}
+	if verb == "revoke" {
+		valueFlags = []string{"realm", "keyId", "totp"}
+	}
+	f, err := parseVerbFlags(args[1:], valueFlags, nil)
+	if err != nil {
+		return failCode(err, exitUsage)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return fail(err)
+	}
+	if code := needsHuman(cfg, "platform-keys "+verb, true); code != 0 {
 		return code
 	}
 	realm := f.vals["realm"]
 	if realm == "" {
 		realm = cfg.Platform
 	}
+	base := "/platforms/" + url.PathEscape(realm) + "/api-keys"
+	if verb == "revoke" {
+		if realm == "" || f.vals["keyId"] == "" {
+			return failCode(errors.New("usage: realm-id platform-keys revoke --realm <id> --keyId <id>"), exitUsage)
+		}
+		st, raw, abort := stepUpCall(cfg, http.MethodDelete, base+"/"+url.PathEscape(f.vals["keyId"]), nil, f.vals["totp"])
+		if abort >= 0 {
+			return abort
+		}
+		return printBody(st, raw)
+	}
 	if realm == "" || f.vals["label"] == "" {
-		return failCode(errors.New("usage: realm-id platform-keys create --realm <id> --label <text>"), exitUsage)
+		return failCode(errors.New("usage: realm-id platform-keys create --realm <id> --label <text> [--out <path>]"), exitUsage)
 	}
-	st, raw, abort := stepUpCall(cfg, http.MethodPost, "/platforms/"+url.PathEscape(realm)+"/api-keys",
-		map[string]any{"label": f.vals["label"]}, f.vals["totp"])
-	if abort >= 0 {
-		return abort
+	out := f.vals["out"]
+	var outFile *os.File
+	if out != "" {
+		// Claim the path before anything is sent: an existing file is never overwritten.
+		outFile, err = os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return failCode(fmt.Errorf("--out: %w", err), exitUsage)
+		}
 	}
-	return printBody(st, raw)
+	st, raw, abort := stepUpCall(cfg, http.MethodPost, base, map[string]any{"label": f.vals["label"]}, f.vals["totp"])
+	if outFile == nil {
+		if abort >= 0 {
+			return abort
+		}
+		return printBody(st, raw)
+	}
+	if abort >= 0 || st/100 != 2 {
+		_ = outFile.Close()
+		_ = os.Remove(out)
+		if abort >= 0 {
+			return abort
+		}
+		return printBody(st, raw)
+	}
+	return writeKeyFile(outFile, out, raw)
+}
+
+// writeKeyFile stores a minted key's whole response body in the --out file and prints the same
+// object without `value`, plus where it went. The key value never reaches stdout or stderr.
+func writeKeyFile(f *os.File, path string, raw []byte) int {
+	var id string
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) == nil {
+		if s, ok := obj["id"].(string); ok {
+			id = s
+		} else if d, ok := obj["data"].(map[string]any); ok {
+			id, _ = d["id"].(string)
+		}
+	}
+	_, werr := f.Write(append(bytes.TrimRight(raw, "\n"), '\n'))
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return failCode(fmt.Errorf("the key %q was created but could not be written to %s: %v", id, path, werr), exitErr)
+	}
+	if obj == nil {
+		obj = map[string]any{}
+	}
+	delete(obj, "value")
+	if d, ok := obj["data"].(map[string]any); ok {
+		delete(d, "value")
+	}
+	obj["written_to"] = path
+	b, _ := json.Marshal(obj)
+	fmt.Fprintln(os.Stdout, string(b))
+	return exitOK
 }

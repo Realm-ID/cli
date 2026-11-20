@@ -71,6 +71,9 @@ func run(args []string) int {
 		if len(args) > 1 && args[1] == "create" {
 			return cmdUserAPIKeysCreate(args[2:])
 		}
+		if len(args) > 1 && args[1] == "update" {
+			return cmdUserAPIKeysUpdate(args[2:])
+		}
 		return cmdResource(args)
 	case "plan-import":
 		return cmdPlanImport(args[1:])
@@ -112,7 +115,9 @@ Usage:
   realm-id auth workload           Sign in from CI with the runner's OIDC token (WIF)
   realm-id signing-keys <verb>     Split signing: init|upload|status|pin|extend|cancel|rotate|recover|downgrade
   realm-id user-api-keys create    Mint a user API key (a person's session; --totp on step-up)
+  realm-id user-api-keys update    Replace a user API key's label, authority and TTL (a person's session)
   realm-id platform-keys create    Mint a platform key (a person, or the platform_mgmt_api workload actor)
+  realm-id platform-keys revoke    Revoke a platform key (same sessions as create); --out PATH on create writes the key 0600
   realm-id config set <key> <val>  Set platform | tenant | bff_url | issuer_url
                                    (tenant: --totp CODE if the workspace needs MFA)
   realm-id config get <key>        Print a config value

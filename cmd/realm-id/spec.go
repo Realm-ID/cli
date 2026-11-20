@@ -361,68 +361,33 @@ func isRevocable(path string) bool {
 		strings.HasPrefix(path, "/platforms/") && strings.Contains(path, "/messaging/")
 }
 
-// skipBFFOnly drops surfaces that require a PLATFORM bearer escorting a user
-// token (ADR-050's Authorization: platform + X-User-Token shape). This binary
-// holds a USER token from the ADR-062 device flow and cannot produce one, so
-// such a verb would generate cleanly, appear in `--help`, and 401 at runtime —
-// which is worse than not existing, because the operator has no way to tell a
-// missing capability from a broken one.
+// skipBFFOnly drops the user-API-key MINT from the generated tree: it is
+// hand-written (`realm-id user-api-keys create`) so that a key's authority is
+// always stated and a person's session is always required (ADR-100, ADR-119 §6).
 //
-// Two operations today, both on the user-API-key collection:
+// `GET` and `DELETE` on the same collection are generated and stay available
+// (ADR-084 §9: revocation is the primary control for an end-user key), and the
+// update (`PUT …/user-api-keys/{id}`) is hand-written under the same rules
+// (`realm-id user-api-keys update`, ADR-119 §6.2).
 //
-//   - POST …/user-api-keys — the mint, put behind the escort by ADR-097 §E.
-//   - PUT  …/user-api-keys/{id} — the ADR-100 D12 replace, put behind the SAME
-//     escort for the same reason. It shares the mint's write schema and can
-//     WIDEN a key (`uncapped` false→true, `org_scope` selected→all, a longer
-//     TTL), so an unescorted update would be the mint's hole reached by two
-//     calls instead of one.
-//
-// `GET` and `DELETE` on the same collection are NOT escorted and stay available
-// — ADR-084 §9 and the partner guide both name revocation as the primary
-// control for an end-user key, so a binary that cannot revoke one would
-// contradict the advice shipped with it.
-//
-// ⚠️ THE METHOD IS PART OF THE TEST, and must stay so. It is tempting to
-// simplify this to "any path containing /user-api-keys", and that would filter
-// `DELETE …/user-api-keys/{id}` — the revoke — which is the same path shape as
-// the PUT and must pass through. `spec_test.go` pins both directions.
-//
-// These are filtered here rather than removed from the spec: they still exist,
-// for BFFs. If RealmID staff later want CLI minting or updating, the fix is for
-// the CLI to obtain a base-realm platform token — separate work, not smuggled in
-// through this list.
+// THE METHOD IS PART OF THE TEST: the POST and the PUT/DELETE share a path
+// prefix. `spec_test.go` pins each direction.
 func skipBFFOnly(method, path string) bool {
-	if method == "POST" && strings.HasSuffix(path, "/user-api-keys") {
-		return true
-	}
-	return method == "PUT" && strings.Contains(path, "/user-api-keys/")
+	return method == "POST" && strings.HasSuffix(path, "/user-api-keys")
 }
 
-// skipDestructive enforces ADR-062 §5: no delete, no signing-key rotate, no
-// suspend/unsuspend, no ownership/domain transfer (PUT …/owner). These are
-// absent from the binary until machine-2FA exists. Key revocation is the one
-// documented exemption (see isRevocable).
-//
-// # The ADR-097 §G scope-removal amendment is RETIRED, because its subject is
-//
-// A long note used to sit here justifying `realm-id scopes remove`: §5 read on
-// its own terms would have filtered it (irreversible by its own spec text, with
-// an opt-in `?dry_run` — the soft-gate shape §5 rejects), and it was exposed
-// anyway by an explicit owner decision on 2026-08-25, recorded as an amendment
-// to §5.
-//
-// ADR-100 D10 then deleted `POST /platforms/{id}/scopes/remove` outright:
-// retiring a scope is self-healing once the partner supplies `role_permissions`
-// at every token mint. There is no operation left for the amendment to cover, so
-// §5 is back to having no exceptions beyond revocation. The reasoning is kept in
-// `git log` and in `DECISIONS.md` rather than here, because a filter that
-// documents an endpoint nobody can call stops being readable.
+// tenantPath is the one DELETE the generated tree exposes outside isRevocable:
+// the org delete, whose verb is `delete` (ADR-119 §6.2).
+const tenantPath = "/tenants/{id}"
+
+// skipDestructive filters the verbs the generated tree does not expose: DELETEs
+// other than key/binding/messaging revocation and the org delete, signing-key
+// rotate, and suspend/unsuspend. Owner transfer (`PUT …/owner`) and the org
+// delete are generated and take the ADR-119 §6 policy (person only, step-up;
+// see runCommand). Key revocation is the documented exemption (see isRevocable).
 func skipDestructive(method, path string) bool {
 	if method == "DELETE" {
-		return !isRevocable(path)
-	}
-	if method == "PUT" && strings.HasSuffix(path, "/owner") {
-		return true
+		return !isRevocable(path) && path != tenantPath
 	}
 	switch {
 	case strings.HasSuffix(path, "/signing-keys/rotate"),
@@ -513,6 +478,10 @@ func deriveCommand(method, path string) (group []string, verb string, ok bool) {
 		case "PATCH", "PUT":
 			verb = "update"
 		case "DELETE":
+			if path == tenantPath {
+				verb = "delete" // ADR-119 § 6.2: the org itself is deleted, not revoked
+				break
+			}
 			// Only reachable for the ADR-085 §8 exemptions — skipDestructive
 			// filters every other DELETE before this runs. `revoke`, not
 			// `delete`: the row survives, and naming it delete would tell a

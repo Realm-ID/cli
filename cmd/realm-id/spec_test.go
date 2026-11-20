@@ -47,8 +47,9 @@ func TestDeriveCommand(t *testing.T) {
 		// replacement is one `create` away.
 		{"DELETE", "/platforms/{id}/federation-bindings/{bid}", "federation-bindings", "revoke", true},
 		// destructive + non-CLI surfaces skip entirely
-		{"DELETE", "/tenants/{id}", "", "", false},
-		{"PUT", "/tenants/{id}/owner", "", "", false},
+		// ADR-119 §6.2: the org delete and owner transfer are generated verbs.
+		{"DELETE", "/tenants/{id}", "tenants", "delete", true},
+		{"PUT", "/tenants/{id}/owner", "tenants", "set-owner", true},
 		{"POST", "/admin/platforms/{id}/signing-keys/rotate", "", "", false},
 		{"POST", "/admin/platforms/{id}/suspend", "", "", false},
 	}
@@ -88,6 +89,8 @@ func TestBuildCommandsTree(t *testing.T) {
 		{"roles", "rename"}, {"audit-events", "list"},
 		// ADR-085 §8 — the only two DELETEs the binary carries.
 		{"api-keys", "revoke"}, {"user-api-keys", "revoke"},
+		// ADR-119 §6.2 verbs.
+		{"tenants", "delete"}, {"tenants", "set-owner"},
 		// ADR-115 messaging: describe/update/revoke --channel sms|whatsapp.
 		{"messaging", "describe"}, {"messaging", "update"}, {"messaging", "revoke"},
 		{"federation-bindings", "revoke"},
@@ -99,13 +102,14 @@ func TestBuildCommandsTree(t *testing.T) {
 	// a future DELETE that happened to derive the verb `revoke` would otherwise
 	// walk into the binary unnoticed.
 	softRevokes := map[string]bool{"api-keys revoke": true, "user-api-keys revoke": true, "messaging revoke": true,
-		"federation-bindings revoke": true}
+		"federation-bindings revoke": true,
+		"tenants delete":             true} // ADR-119 §6.2: the org delete, behind the person-only step-up policy
 	for g, verbs := range tr.byGroup {
 		for v, c := range verbs {
 			if c.Method == "DELETE" && !softRevokes[g+" "+v] {
 				t.Errorf("DELETE leaked into tree: %s %s", g, v)
 			}
-			if strings.Contains(v, "delete") || v == "rotate" || v == "suspend" {
+			if (strings.Contains(v, "delete") && g+" "+v != "tenants delete") || v == "rotate" || v == "suspend" {
 				t.Errorf("destructive verb in tree: %s %s", g, v)
 			}
 		}
@@ -323,29 +327,20 @@ func TestScopeRemoveIsGoneAndRenameSurvives(t *testing.T) {
 	for _, p := range []string{
 		"/platforms/{id}/signing-keys/rotate",
 		"/platforms/{id}/suspend",
-		"/tenants/{id}/owner",
 	} {
-		m := "POST"
-		if strings.HasSuffix(p, "/owner") {
-			m = "PUT"
-		}
-		if !skipDestructive(m, p) {
-			t.Errorf("%s %s must still be filtered by §5", m, p)
+		if !skipDestructive("POST", p) {
+			t.Errorf("POST %s must still be filtered by §5", p)
 		}
 	}
 }
 
-// TestUserAPIKeyUpdateIsFilteredButRevokeSurvives — ADR-100 D12's `PUT` carries
-// the same ADR-097 §E escort as the mint, so this binary cannot call it.
-//
-// The two halves are the whole test, because the PUT and the DELETE are the SAME
-// PATH SHAPE — `…/user-api-keys/{id}`. A filter written as a path prefix would
-// catch both and silently remove `realm-id user-api-keys revoke`, which ADR-084
-// §9 and the partner guide both name as the primary control for an end-user key.
-func TestUserAPIKeyUpdateIsFilteredButRevokeSurvives(t *testing.T) {
+// TestUserAPIKeyUpdateAndRevokeAreBuilt — the update (`PUT`, hand-written, ADR-119
+// §6.2) and the revoke (`DELETE`, generated, ADR-084 §9) share the path shape
+// `…/user-api-keys/{id}`; neither is filtered, only the mint is.
+func TestUserAPIKeyUpdateAndRevokeAreBuilt(t *testing.T) {
 	const coll = "/tenants/{tid}/users/{uid}/user-api-keys"
-	if !skipBFFOnly("PUT", coll+"/{id}") {
-		t.Error("the ADR-100 update must be filtered: it shares the mint's escort and can WIDEN a key")
+	if skipBFFOnly("PUT", coll+"/{id}") {
+		t.Error("the update must not be filtered: `user-api-keys update` is built (ADR-119 §6.2)")
 	}
 	if skipBFFOnly("DELETE", coll+"/{id}") {
 		t.Error("the revoke must NOT be filtered — same path shape, different method, and it is " +
@@ -368,9 +363,8 @@ func TestUserAPIKeyUpdateIsFilteredButRevokeSurvives(t *testing.T) {
 			sawRevoke = true
 		}
 	}
-	if sawUpdate {
-		t.Error("`user-api-keys update` generated — it would appear in --help and 401 at runtime, " +
-			"which is worse than not existing")
+	if !sawUpdate {
+		t.Error("the update route is missing from the generated tree")
 	}
 	// The positive control: without it, a tree that failed to load passes above.
 	if !sawRevoke {

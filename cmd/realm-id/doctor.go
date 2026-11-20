@@ -15,7 +15,7 @@ package main
 //	               and `jwks_uri` must be present.
 //	jwks           GET /{realm}/.well-known/jwks.json; non-empty, every key a
 //	               usable RSA key.
-//	api_key        $REALM_ID_API_KEY is accepted: POST /auth/login with
+//	api_key        $REALM_ID_API_KEY is accepted: POST /auth/token with
 //	               grant_type=platform_api_key (the exchange every partner
 //	               backend performs, and what the typed tree does).
 //	api_key_token  the token that exchange minted verifies against the realm's
@@ -206,7 +206,7 @@ func doctorChecks(issuer, realm, apiKey string, client *http.Client) doctorRepor
 		var out struct {
 			AccessToken string `json:"access_token"`
 		}
-		st, raw, err := jsonRequestWith(&hc, http.MethodPost, issuer+"/auth/login", "",
+		st, raw, err := jsonRequestWith(&hc, http.MethodPost, issuer+"/auth/token", "",
 			map[string]string{"grant_type": "platform_api_key", "api_key": apiKey}, &out)
 		switch {
 		case err != nil:

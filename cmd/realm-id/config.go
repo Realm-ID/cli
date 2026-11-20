@@ -107,8 +107,38 @@ func saveConfig(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	// 0600: the file holds the session bearer.
-	return os.WriteFile(p, b, 0o600)
+	// The file holds the session bearer, so it must never exist with a mode wider
+	// than 0600. WriteFile would keep an existing file's mode while writing, so
+	// write a fresh 0600 temp file in the same directory and rename it over the
+	// target (atomic, and a new inode).
+	f, err := os.CreateTemp(filepath.Dir(p), ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	fail := func(err error) error {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return fail(err)
+	}
+	if _, err := f.Write(b); err != nil {
+		return fail(err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // bffURL resolves the effective BFF base URL: env > config > default.

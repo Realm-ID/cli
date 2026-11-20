@@ -16,9 +16,10 @@
 # and the revoke. A re-run with it set skips the mint and finishes the wait + revoke; with it unset it
 # starts a new rotation. Nothing is revoked until the new key is live.
 #
-# [inferred] Verb flags and JSON field names below (`id`, `key`, `active_key_ids`) follow the README's
-# "platform-keys create|revoke" and the api-keys response; platform-keys is planned (W5). Confirm
-# against `realm-id platform-keys --help` and the partner BFF's readiness body before use.
+# Verbs and fields: `platform-keys create --realm R --label L --out PATH` writes the issued key to PATH
+# (mode 0600, created exclusively) and prints it without `value`; the key is `.value` in that file and the
+# id is `.id` on stdout. `platform-keys revoke --realm R --keyId K` revokes. `active_key_ids` is the shape
+# the partner BFF's readiness body must report (this template's contract with the partner BFF).
 name: Rotate platform key
 
 on:
@@ -59,12 +60,12 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          realm-id platform-keys create --platform "${PLATFORM}" --label "ci-rotation-$(date -u +%Y%m%d)" \
+          realm-id platform-keys create --realm "${PLATFORM}" --label "ci-rotation-$(date -u +%Y%m%d)" \
             --out "${RUNNER_TEMP}/new-key.json" > "${RUNNER_TEMP}/create.json"
           new_id="$(jq -r '.id' "${RUNNER_TEMP}/create.json")"
           test -n "${new_id}" && test "${new_id}" != null
           # Store first: if this fails the old key is untouched and still live.
-          jq -r '.key' "${RUNNER_TEMP}/new-key.json" | gh secret set REALMID_PLATFORM_KEY --repo "${GITHUB_REPOSITORY}"
+          jq -r ".value" "${RUNNER_TEMP}/new-key.json" | gh secret set REALMID_PLATFORM_KEY --repo "${GITHUB_REPOSITORY}"
           gh variable set PENDING_OLD_KEY_ID --repo "${GITHUB_REPOSITORY}" --body "${CURRENT_KEY_ID:-none}"
           gh variable set CURRENT_KEY_ID --repo "${GITHUB_REPOSITORY}" --body "${new_id}"
           rm -f "${RUNNER_TEMP}/new-key.json"
@@ -94,7 +95,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${OLD_KEY_ID}" != none ]; then
-            realm-id platform-keys revoke --platform "${PLATFORM}" --keyId "${OLD_KEY_ID}"
+            realm-id platform-keys revoke --realm "${PLATFORM}" --keyId "${OLD_KEY_ID}"
           fi
           gh variable delete PENDING_OLD_KEY_ID --repo "${GITHUB_REPOSITORY}" || true
           echo "rotation complete: ${NEW_KEY_ID} active, ${OLD_KEY_ID} revoked"

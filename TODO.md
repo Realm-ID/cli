@@ -99,6 +99,8 @@ warning against concurrent `auth login`); these are the code fixes.
       FIXED-ON-MAIN-BUT-UNRELEASED. Do not read it as live.
 - [ ] `cmd/realm-id/spec.go` — Expose `realm-id messaging` (ADR-115). Owner ruling 2026-10-17: build it; the secret is read from stdin or an interactive prompt, never a flag; ships in the next cli release. Hidden via skipBFFOnly until then
 - [ ] `.github/workflows/release.yml` (`pin` job): the pin commit is pushed to `main` AFTER goreleaser has published the release. If that push fails, the release has no pin, so `setup/` and `install.sh` refuse it while `latest` already points at it, and nothing retries or alerts. Write the pin before publishing (draft release, pin on main, then publish), or fail the job loudly and retry the push.
+- [ ] **`setup/action.yml`: the `provider` input and `INPUT_PROVIDER` env feed no command**. `auth workload` has no `--provider`; drop the input or give the flag a meaning, and fix the input's description.
+- [ ] **`README.md` / `cmd/realm-id/error-reference.md` do not list the new verbs**: `platform-keys revoke`, `--out`, `tenants set-owner|delete`, `user-api-keys update`. `cmd/realm-id/commands.go` `isPersonOnlyVerb` is a stopgap until person-only verbs are derived from the spec.
 
 ## Tracked privately
 

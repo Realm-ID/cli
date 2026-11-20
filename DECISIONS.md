@@ -7,8 +7,10 @@ context.
 
 ## Index
 
-41 entries. Newest first.
+43 entries. Newest first.
 
+- [2026-11-19 — doctor mints through /auth/token; saveConfig always tightens the mode](#2026-11-19--doctor-mints-through-authtoken-saveconfig-always-tightens-the-mode)
+- [2026-11-19 — CLI builds the five ADR-119 § 6 verbs; the partner rotation template runs a line the CLI accepts](#2026-11-19--cli-builds-the-five-adr-119--6-verbs-the-partner-rotation-template-runs-a-line-the-cli-accepts)
 - [2026-11-19 — federation-bindings revoke allowed through the delete filter](#2026-11-19--federation-bindings-revoke-allowed-through-the-delete-filter)
 - [2026-11-03 — workflow-parity PIN_DRIFT: split the Go 1.23 minimum leg into its own job (RCA)](#2026-11-03--workflow-parity-pin_drift-split-the-go-123-minimum-leg-into-its-own-job-rca)
 - [2026-11-03 — Re-vendor issuer v0.147.0 / spec 0.66.0 to match api v0.47.0 (device-login release)](#2026-11-03--re-vendor-issuer-v01470--spec-0660-to-match-api-v0470-device-login-release)
@@ -50,6 +52,16 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-11-19 — doctor mints through /auth/token; saveConfig always tightens the mode
+
+`realm-id doctor` checks the API key through `POST /auth/token` with `grant_type=platform_api_key`. `saveConfig` leaves config.json at mode 0600 whether or not the file already existed.
+
+## 2026-11-19 — CLI builds the five ADR-119 § 6 verbs; the partner rotation template runs a line the CLI accepts
+
+- `realm-id platform-keys revoke --realm <id> --keyId <id>` revokes a platform key; `realm-id platform-keys create --out <path>` writes the new key to a mode-0600 file (it refuses an existing path) and prints the key object without its `value`; the key is `.value` in the file.
+- `realm-id tenants set-owner`, `realm-id tenants delete` and `realm-id user-api-keys update` exist; each needs a person's session and answers the MFA step-up with `--totp`.
+- The setup action signs in with `realm-id auth workload --audience <audience>`, and the rotation template uses `--realm`, `--keyId` and reads the key from `.value`.
 
 ## 2026-11-19 — federation-bindings revoke allowed through the delete filter
 
