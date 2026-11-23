@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-43 entries. Newest first.
+44 entries. Newest first.
 
+- [2026-11-23 — auth workload keeps a person session and defaults the audience; step-up routes apply to every verb](#2026-11-23--auth-workload-keeps-a-person-session-and-defaults-the-audience-step-up-routes-apply-to-every-verb)
 - [2026-11-19 — doctor mints through /auth/token; saveConfig always tightens the mode](#2026-11-19--doctor-mints-through-authtoken-saveconfig-always-tightens-the-mode)
 - [2026-11-19 — CLI builds the five ADR-119 § 6 verbs; the partner rotation template runs a line the CLI accepts](#2026-11-19--cli-builds-the-five-adr-119--6-verbs-the-partner-rotation-template-runs-a-line-the-cli-accepts)
 - [2026-11-19 — federation-bindings revoke allowed through the delete filter](#2026-11-19--federation-bindings-revoke-allowed-through-the-delete-filter)
@@ -52,6 +53,14 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-11-23 — auth workload keeps a person session and defaults the audience; step-up routes apply to every verb
+
+Two rules now in force, both in the release commit.
+
+`realm-id auth workload` never replaces a person's saved session: when the config already holds an `auth login` session (session token set, no session class) it exits 2 before any request, and the setup action points `REALM_ID_CONFIG` at `$RUNNER_TEMP/realm-id/config.json` (a caller-set value is honoured) so a job's session lives in a job-scoped file. It requests its OIDC token with the BFF URL as audience by default (`--audience` wins); the default follows the effective BFF URL, so an override of `REALM_ID_BFF` gets a matching audience, and in production it is the same value. Why: a workload run on a developer machine or a persistent runner must not destroy the person's login, and the BFF only accepts a token minted for it. Tests: `workload_session_test.go`, `TestAuthWorkloadAudienceDefaultsToTheBFF` and the flag-wins case. Supersedes the 2026-10-29 choice to store a workload session as the current session.
+
+Every generated verb and `realm-id api` apply the step-up policy from a copy of the BFF's step-up routes (`step_up_routes.go`): a call matching a step-up route is refused with exit 8 `needs_human`, nothing sent, in a key or workload session. Why: a call a non-person session can never complete should fail locally and say so rather than reach the BFF. Tests: `step_up_policy_test.go`, `step_up_routes_test.go`.
 
 ## 2026-11-19 — doctor mints through /auth/token; saveConfig always tightens the mode
 

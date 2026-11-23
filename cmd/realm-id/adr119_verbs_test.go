@@ -67,6 +67,7 @@ func TestSetupActionSignInLineIsAcceptedByTheCLI(t *testing.T) {
 	}
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", f.srv.URL+"/oidc?x=1")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "gh-req-token")
+	ownConfig(t)
 	if _, stderr, code := runCLI(t, lines[0]...); code != exitOK {
 		t.Fatalf("the action's command line %v exit = %d, want 0\n%s", lines[0], code, stderr)
 	}

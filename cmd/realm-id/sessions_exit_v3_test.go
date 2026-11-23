@@ -179,6 +179,7 @@ func workloadLogin(t *testing.T, role string) *v3BFF {
 	}
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", f.srv.URL+"/oidc?x=1")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "gh-req-token")
+	ownConfig(t)
 	if _, stderr, code := runCLI(t, "auth", "workload", "--audience", "https://api.realmid.dev"); code != exitOK {
 		t.Fatalf("auth workload exit = %d\n%s", code, stderr)
 	}

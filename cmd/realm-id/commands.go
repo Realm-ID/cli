@@ -141,12 +141,6 @@ func parseFlags(args []string) (*parsedFlags, error) {
 	return pf, nil
 }
 
-// isPersonOnlyVerb reports the generated verbs ADR-119 § 6 gates behind a person's session and the
-// BFF step-up: `tenants set-owner` and `tenants delete`.
-func isPersonOnlyVerb(cmd command) bool {
-	return len(cmd.Group) == 1 && cmd.Group[0] == "tenants" && (cmd.Verb == "set-owner" || cmd.Verb == "delete")
-}
-
 func runCommand(cfg *Config, cmd command, args []string) int {
 	pf, err := parseFlags(args)
 	if err != nil {
@@ -155,14 +149,6 @@ func runCommand(cfg *Config, cmd command, args []string) int {
 	if pf.help {
 		printCommandHelp(os.Stdout, cmd)
 		return exitOK
-	}
-
-	// ADR-119 § 6: owner transfer and the org delete are person-only verbs.
-	stepUp := isPersonOnlyVerb(cmd)
-	if stepUp {
-		if code := needsHuman(cfg, strings.Join(cmd.Group, " ")+" "+cmd.Verb, false); code != 0 {
-			return code
-		}
 	}
 
 	// Resolve path params.
@@ -192,7 +178,11 @@ func runCommand(cfg *Config, cmd command, args []string) int {
 		return failCode(berr, exitUsage)
 	}
 
-	if stepUp {
+	// A call that matches a step-up route is a person's verb, behind the step-up.
+	if stepUpRequired(cmd.Method, path, bodyJSONOf(body)) {
+		if code := needsHuman(cfg, strings.Join(cmd.Group, " ")+" "+cmd.Verb, mgmtRoute(cmd.Method, path)); code != 0 {
+			return code
+		}
 		st, raw, abort := stepUpCall(cfg, cmd.Method, path, body, pf.vals["totp"])
 		if abort >= 0 {
 			return abort

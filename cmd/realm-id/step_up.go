@@ -62,7 +62,7 @@ func resolveCredential(cfg *Config) (base, bearer string, err error) {
 }
 
 // exchangeUserKey trades a user API key for a key session at the BFF. The key travels in the BODY,
-// never as a bearer. A platform key (rk_live_) is refused offline: it has no session path (R24).
+// never as a bearer. A platform key (rk_live_) is refused offline: it has no session path.
 func exchangeUserKey(cfg *Config, apiKey string) (string, error) {
 	if strings.HasPrefix(apiKey, "rk_live_") {
 		return "", usageCredError{"REALM_ID_API_KEY holds a platform key (rk_live_). The CLI no longer signs in with one: " +
@@ -121,28 +121,37 @@ func needsHuman(cfg *Config, verb string, mgmtOK bool) int {
 }
 
 // authWorkload exchanges the CI runner's OIDC token (GitHub's ACTIONS_ID_TOKEN_REQUEST_*) for a
-// workload session at the BFF and stores it as the current session.
+// workload session at the BFF and stores it as the current session. It never replaces a person's
+// saved session: the job's config is a file of its own (REALM_ID_CONFIG).
 func authWorkload(cfg *Config, args []string) int {
 	h, err := parseHelperArgs(args, "audience")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return exitUsage
 	}
+	if cfg.SessionToken != "" && cfg.SessionClass == "" {
+		return failCode(errors.New("the config already holds a person's session (realm-id auth login); "+
+			"`auth workload` does not replace it. Point REALM_ID_CONFIG at a file of its own, for example "+
+			"$RUNNER_TEMP/realm-id/config.json"), exitUsage)
+	}
 	reqURL, reqTok := envOr("ACTIONS_ID_TOKEN_REQUEST_URL", ""), envOr("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 	if reqURL == "" || reqTok == "" {
 		return failCode(errors.New("no OIDC token source: ACTIONS_ID_TOKEN_REQUEST_URL / _TOKEN are not set "+
 			"(grant the job `permissions: id-token: write`)"), exitUsage)
 	}
-	if aud := h.flags["audience"]; aud != "" {
-		u, perr := url.Parse(reqURL)
-		if perr != nil {
-			return failCode(fmt.Errorf("ACTIONS_ID_TOKEN_REQUEST_URL: %w", perr), exitUsage)
-		}
-		q := u.Query()
-		q.Set("audience", aud)
-		u.RawQuery = q.Encode()
-		reqURL = u.String()
+	// The token's audience is the BFF that will accept it unless --audience names another.
+	aud := h.flags["audience"]
+	if aud == "" {
+		aud = cfg.bffURL()
 	}
+	u, perr := url.Parse(reqURL)
+	if perr != nil {
+		return failCode(fmt.Errorf("ACTIONS_ID_TOKEN_REQUEST_URL: %w", perr), exitUsage)
+	}
+	q := u.Query()
+	q.Set("audience", aud)
+	u.RawQuery = q.Encode()
+	reqURL = u.String()
 	var oidc struct {
 		Value string `json:"value"`
 	}

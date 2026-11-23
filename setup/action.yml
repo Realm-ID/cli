@@ -79,4 +79,8 @@ runs:
           echo "::error::no OIDC token available: the calling job needs 'permissions: id-token: write'"
           exit 1
         fi
+        # The job's session lives in a file of its own (mode 0600, in the per-job temp directory), so
+        # later steps of the job reuse it and a person's saved session is never touched.
+        export REALM_ID_CONFIG="${REALM_ID_CONFIG:-${RUNNER_TEMP}/realm-id/config.json}"
+        echo "REALM_ID_CONFIG=${REALM_ID_CONFIG}" >> "${GITHUB_ENV}"
         realm-id auth workload --audience "${INPUT_AUDIENCE}"

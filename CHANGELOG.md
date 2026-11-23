@@ -5,6 +5,19 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ## Unreleased
 
+### Changed
+
+- **`api` sends the key session (`REALM_ID_API_KEY`) on every route, as the typed verbs do.**
+- **`realm-id auth workload` never replaces a person's saved session.** It exits 2, before any request, when the config already holds an `auth login` session. The setup action keeps the job's session in `$RUNNER_TEMP/realm-id/config.json` (mode 0600) through `REALM_ID_CONFIG`.
+- **`realm-id auth workload` requests its OIDC token for the BFF** as the default audience; `--audience` still overrides it.
+- **Step-up routes apply to every generated verb and to `realm-id api`.** A call that matches a route on the BFF's step-up list is refused with exit 8 `needs_human`, nothing sent, in a key or workload session (a `platform_mgmt_api` workload actor is admitted on platform-key mint and revoke), and a person is stepped up with a TOTP code.
+
+### Breaking
+
+- **More commands now exit 8 `needs_human` locally in a key or workload session**, nothing sent: the generated verbs that match a step-up route (user-api-keys create/update/delete, federation-bindings create/revoke, messaging, signing-keys rotate/split, mfa enroll/confirm/reset, credentials, reset-handle, contact-verification approve, email/phone PATCH). A script that ran them with `REALM_ID_API_KEY` or a workload session now stops; run them as a signed-in person.
+- **`realm-id auth workload` exits 2** when the config already holds an `auth login` session, where it used to replace that session.
+- **The default OIDC audience of `realm-id auth workload` is the BFF URL**, not the provider default; a consumer that relied on the provider default passes `--audience`.
+
 ### Added
 
 - **`realm-id federation-bindings revoke --platform <id> --bid <binding id>`** (`DELETE /platforms/{id}/federation-bindings/{bid}`). A soft delete: the binding is marked `status=revoked` and stays readable, and a replacement is one `create` away.

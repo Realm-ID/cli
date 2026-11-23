@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,7 @@ import (
 type recReq struct {
 	Method string
 	Path   string
+	Query  url.Values
 	Header http.Header
 	Body   []byte
 }
@@ -92,7 +94,7 @@ func newBFF(t *testing.T, handle func(w http.ResponseWriter, r recReq)) *v3BFF {
 	f := &v3BFF{t: t, handle: handle}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
-		rr := recReq{Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(), Body: b}
+		rr := recReq{Method: r.Method, Path: r.URL.Path, Query: r.URL.Query(), Header: r.Header.Clone(), Body: b}
 		f.mu.Lock()
 		f.reqs = append(f.reqs, rr)
 		f.mu.Unlock()

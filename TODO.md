@@ -106,5 +106,7 @@ warning against concurrent `auth login`); these are the code fixes.
 
 Some items for this repo are tracked in a private tracker.
 
+- [ ] `README.md`, `cmd/realm-id/*.go` comments and tests, `setup/examples/` — references to private ruling numbers point at material readers of this repo cannot see. Replace each with the rule it stands for.
+
 
 - [ ] `cli/cmd/realm-id/step_up.go` — the step-up flow cannot enrol: `stepUpCall` treats any 412 with a token as a TOTP challenge and never branches on `mfa_registration_required`, so an administrator with no second factor is asked for a code they cannot have; enrol via the console first (opened 2026-11-14, doc-review 3 finding 4).

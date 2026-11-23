@@ -747,7 +747,26 @@ func cmdAPI(args []string) int {
 			return failCode(fmt.Errorf("invalid JSON body: %w", err), exitUsage)
 		}
 	}
-	status, raw, err := jsonRequest(method, cfg.bffURL()+path, cfg.SessionToken, body, nil)
+	// The passthrough's step-up routes get the same policy as the typed verbs.
+	var status int
+	var raw []byte
+	if issuerPath, viaPassthrough := strings.CutPrefix(path, "/api/"); viaPassthrough && stepUpRequired(method, "/"+issuerPath, bodyJSONOf(body)) {
+		if code := needsHuman(cfg, "api "+method+" "+path, mgmtRoute(method, "/"+issuerPath)); code != 0 {
+			return code
+		}
+		var abort int
+		status, raw, abort = stepUpCall(cfg, method, "/"+issuerPath, body, "")
+		if abort >= 0 {
+			return abort
+		}
+	} else {
+		// One credential for the whole verb: the same one the step-up branch classifies and sends.
+		_, bearer, cerr := resolveCredential(cfg)
+		if cerr != nil {
+			return fail(cerr)
+		}
+		status, raw, err = jsonRequest(method, cfg.bffURL()+path, bearer, body, nil)
+	}
 	if err != nil {
 		return fail(err)
 	}
