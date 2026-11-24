@@ -20,6 +20,11 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ### Added
 
+- **`realm-id platform-keys revoke --realm <id> --keyId <id>`** revokes a platform API key. A person is asked for a TOTP code; a key or workload session exits 8 `needs_human` with nothing sent.
+- **`--out <file>` on `platform-keys create`** writes the new key to a file created with mode 0600, instead of printing it.
+- **`realm-id tenants set-owner`** and **`realm-id tenants delete`**.
+- **`realm-id user-api-keys update`**.
+- **`config.json` is written atomically**: a 0600 temporary file renamed over the target, so a token is never written into a file with wider permissions.
 - **`realm-id federation-bindings revoke --platform <id> --bid <binding id>`** (`DELETE /platforms/{id}/federation-bindings/{bid}`). A soft delete: the binding is marked `status=revoked` and stays readable, and a replacement is one `create` away.
 
 ## v0.6.3 — embedded contract re-pinned to issuer v0.151.0 (spec 0.68.0) (2026-11-16)
