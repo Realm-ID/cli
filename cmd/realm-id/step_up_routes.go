@@ -33,8 +33,6 @@ var stepUpRoutes = []stepUpRoute{
 	{Method: "PATCH", Path: "/platforms/{id}/config", Field: "email_otp_login_enabled", Values: []string{"true"}},
 	{Method: "DELETE", Path: "/tenants/{tenantId}/users/{uid}/mfa"},
 	{Method: "PUT", Path: "/tenants/{tid}/users/{uid}/credentials"},
-	{Method: "POST", Path: "/platforms/{id}/federation-bindings"},
-	{Method: "DELETE", Path: "/platforms/{id}/federation-bindings/{bid}"},
 	{Method: "PUT", Path: "/platforms/{id}/messaging/{channel}"},
 	{Method: "DELETE", Path: "/platforms/{id}/messaging/{channel}"},
 	{Method: "POST", Path: "/platforms/{id}/signing-keys/rotate"},
@@ -46,11 +44,25 @@ var stepUpRoutes = []stepUpRoute{
 	{Method: "PATCH", Path: "/tenants/{id}/users/{uid}", Field: "phone", Values: []string{"*"}},
 }
 
+// personOnlyRoutes are operations the ISSUER gates (a person plus a fresh TOTP, Ruling 64): the
+// BFF carries no step-up row for them, so they are NOT in stepUpRoutes (the BFF-parity list). The
+// CLI still refuses a key or workload session locally (exit 8, nothing sent) and steps a person
+// through the issuer's 412.
+var personOnlyRoutes = []stepUpRoute{
+	{Method: "POST", Path: "/platforms/{id}/federation-bindings"},
+	{Method: "DELETE", Path: "/platforms/{id}/federation-bindings/{bid}"},
+}
+
 // stepUpRequired reports whether a call to the BFF passthrough (an issuer path, no /api prefix, and
-// the JSON body that will be sent, nil for none) matches a step-up route.
+// the JSON body that will be sent, nil for none) matches a step-up route or a person-only route.
 func stepUpRequired(method, path string, body []byte) bool {
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
+	}
+	for _, r := range personOnlyRoutes {
+		if strings.EqualFold(r.Method, method) && routePathMatches(path, r.Path) {
+			return true
+		}
 	}
 	for _, r := range stepUpRoutes {
 		if !strings.EqualFold(r.Method, method) || !routePathMatches(path, r.Path) {

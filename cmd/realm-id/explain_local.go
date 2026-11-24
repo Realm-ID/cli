@@ -8,7 +8,7 @@ func cliLocalErrorRows() []errorRow {
 	const sec = "CLI (local; pending the next error-reference re-vendor)"
 	return []errorRow{
 		{Code: "needs_human", Section: sec,
-			Meaning:  "[CLI exit 8] This verb needs a person's session. A key session (REALM_ID_API_KEY) or a workload session cannot run it; nothing was sent. The one exception is the platform_mgmt_api workload actor minting or revoking platform keys.",
+			Meaning:  "[CLI exit 8] This verb needs a person's session. A key session (REALM_ID_API_KEY) or a workload session cannot run it; nothing was sent. The one exception is the platform_mgmt_api workload actor minting or revoking platform keys. `federation-bindings create` and `federation-bindings revoke` are person-only with no exception: the issuer asks the person for a fresh authenticator code (--totp or a prompt) for each one.",
 			WhatToDo: "Run `realm-id auth login` as the realm owner and repeat the command."},
 		{Code: "split_upload_not_allowed", Section: sec,
 			Meaning:  "[409] The realm's custody state does not accept an upload of a split key now (for example, during an overlap). The first upload is the realm owner's; a rotation or recovery goes through a lease.",
