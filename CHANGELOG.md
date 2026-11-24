@@ -20,7 +20,7 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ### Added
 
-- **`realm-id platform-keys revoke --realm <id> --keyId <id>`** revokes a platform API key. A person is asked for a TOTP code; a key or workload session exits 8 `needs_human` with nothing sent.
+- **`realm-id platform-keys revoke --realm <id> --keyId <id>`** revokes a platform API key. A person is asked for a TOTP code; a key or workload session exits 8 `needs_human` with nothing sent, except a workload whose service account holds `platform_mgmt_api`, which is admitted.
 - **`--out <file>` on `platform-keys create`** writes the new key to a file created with mode 0600, instead of printing it.
 - **`realm-id tenants set-owner`** and **`realm-id tenants delete`**.
 - **`realm-id user-api-keys update`**.
