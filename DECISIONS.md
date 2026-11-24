@@ -7,8 +7,9 @@ context.
 
 ## Index
 
-44 entries. Newest first.
+45 entries. Newest first.
 
+- [2026-11-25 — Ruling 64: federation-binding create/revoke split out of the BFF step-up list; person-only locally](#2026-11-25--ruling-64-federation-binding-createrevoke-split-out-of-the-bff-step-up-list-person-only-locally)
 - [2026-11-23 — auth workload keeps a person session and defaults the audience; step-up routes apply to every verb](#2026-11-23--auth-workload-keeps-a-person-session-and-defaults-the-audience-step-up-routes-apply-to-every-verb)
 - [2026-11-19 — doctor mints through /auth/token; saveConfig always tightens the mode](#2026-11-19--doctor-mints-through-authtoken-saveconfig-always-tightens-the-mode)
 - [2026-11-19 — CLI builds the five ADR-119 § 6 verbs; the partner rotation template runs a line the CLI accepts](#2026-11-19--cli-builds-the-five-adr-119--6-verbs-the-partner-rotation-template-runs-a-line-the-cli-accepts)
@@ -53,6 +54,14 @@ context.
 - [2026-08-05 — service mode never worked, and the test was holding it that way](#2026-08-05--service-mode-never-worked-and-the-test-was-holding-it-that-way)
 - [2026-07-24 — Re-sync vendored spec for owner-required tenant create (ADR-073 Amendment C)](#2026-07-24--re-sync-vendored-spec-for-owner-required-tenant-create-adr-073-amendment-c)
 - [2026-07-10 — Cover the device-login "approval-failed" poll branch](#2026-07-10--cover-the-device-login-approval-failed-poll-branch)
+
+## 2026-11-25 — Ruling 64: federation-binding create/revoke split out of the BFF step-up list; person-only locally
+
+**Ruling 64 (root `DECISIONS.md` 2026-11-25, with 64a-64d; plan `plans/2026-11-25-ruling-64-fedbind-person-totp.md`).** The issuer now requires a signed-in person with a fresh TOTP, for that one operation, to create or revoke a federation binding. The BFF drops its own step-up rows for the two routes (api `DECISIONS.md`, same date) and relays the issuer's `412`.
+
+**Decision for the CLI.** `POST /platforms/{id}/federation-bindings` and `DELETE /platforms/{id}/federation-bindings/{bid}` leave the BFF-parity list in `step_up_routes.go` and move to a CLI-local "person only" list. Why: `TestStepUpRoutesMatchTheBFFList` compares the CLI copy with the BFF list, which no longer holds these two; but a key or workload session can never complete them, so the CLI still refuses locally with exit 8 `needs_human`, nothing sent (the issuer would answer `403 not_available_to_api_keys`). A person's session is unchanged on the wire: the existing `stepUpCall` loop (412, `--totp` or prompt, `/auth/mfa/verify`, one retry) answers the issuer's challenge. `realm-id explain needs_human` names the two operations. The parity test stays; new tests pin the person-only list and the issuer-challenge retry.
+
+**What a person sees.** The same prompt as any step-up, but the code must be fresh for THIS command: a code typed at login, or one already used for another create or revoke, does not count (one code per command; two commands within one 30 s step need the next code). A person with no authenticator enrolled gets `412 mfa_registration_required` and must enrol first. A `409 binding_exists` or `409 last_machine_credential` returns the approval unspent, so re-running does not need a new code.
 
 ## 2026-11-23 — auth workload keeps a person session and defaults the audience; step-up routes apply to every verb
 
