@@ -214,7 +214,7 @@ info:
     session-limit revocation token, the list now holds only the sessions that
     count toward the limit that refused you (see that operation). A normal
     signed-in caller's list is unchanged.
-  version: 0.68.0
+  version: 0.69.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -266,6 +266,13 @@ components:
         platform token (`BearerPlatformToken`). A user JWT sent as the
         `Authorization` bearer answers `401 platform_bearer_required`.
 
+        A platform token is never an actor. A token of class `platform` sent in
+        `X-User-Token` (including the same token sent in both headers) answers
+        `401 x_user_token_invalid` on every operation that reads the header. A
+        caller with no person or service account to act for sends no
+        `X-User-Token`, and is then limited to the `x-realmid-no-actor`
+        operations.
+
         The actor is judged by its own rights: a person's live role, a key's
         cap (a key session is refused on every `x-realmid-human-only` row), a
         service account's role. Every route behind this scheme can answer
@@ -315,7 +322,8 @@ components:
         on the session routes that take one. The platform token stays in
         `Authorization`. Missing it on this operation answers
         `403 actor_required`; a user token in `Authorization` instead answers
-        `401 platform_bearer_required`.
+        `401 platform_bearer_required`. A platform token is never an actor: one
+        sent in `X-User-Token` answers `401 x_user_token_invalid`.
     XUserTokenOptional:
       in: header
       name: X-User-Token
@@ -327,7 +335,8 @@ components:
         On the token endpoints it carries the integration install pass
         (`ip_...`, R67.2) for `grant_type=integration_installation`. A carried
         actor on any other no-actor route is judged by its own rights
-        [inferred, plan § 3.2 item 3].
+        [inferred, plan § 3.2 item 3]. If sent, it must not be a platform token
+        (`401 x_user_token_invalid`).
     IdempotencyKey:
       in: header
       name: Idempotency-Key
@@ -369,8 +378,9 @@ components:
         - `invalid_credentials` — bad password / token / OTP.
         - `invalid_audience` — id-token `aud` not registered (ADR-046).
         - `invalid_token` — malformed / expired bearer.
-        - `wrong_scope` — bearer present but wrong class
-          (e.g. user JWT where platform is required).
+        - `platform_bearer_required` — a bearer is present but it is not a
+          platform token (e.g. a user JWT sent in `Authorization`; the
+          person's token goes in `X-User-Token`).
         - `bff_bearer_required` — every realm requires the BFF escort (ADR-088)
           and the inbound platform bearer is missing. Emitted on
           `POST /auth/token` + `POST /auth/logout`. NOTE: `POST /auth/login`
@@ -941,8 +951,25 @@ components:
         `refresh_token`. Re-mint by exchanging a fresh assertion. R53: an
         exchange that yields a PLATFORM token is served by `POST /auth/token`
         on every realm, split or not, and refused by `/auth/token/partial`.
-        401 on: unknown issuer, invalid/stale/replayed assertion, audience
-        mismatch, or no matching binding.
+        401 on: unknown issuer, invalid/stale assertion, audience
+        mismatch, or no matching binding. A replayed assertion is `409
+        assertion_replayed`.
+        The response's `subject_type` names the class of the token minted:
+        `platform` for the platform mint, `service` for a `service_account` or
+        `platform_mgmt` target (the same word `POST /auth/token/partial`
+        reports for it).
+        Not emitted yet; it starts after a cutoff date announced to partners
+        (ADR-057). After the cutoff date the exchange is `401
+        binding_requires_repository_ids` when the matching GitHub binding lacks
+        `repository_id` or `repository_owner_id`, and also when no active binding
+        matches but the token matches a name-only GitHub binding that was revoked
+        at the cutoff. Two active bindings that match the same token (after the
+        cutoff date, two id-pinned ones) are ambiguous and answer a plain 401.
+        So before the cutoff date, a name-only
+        and an id-pinned binding that both match the same token are ambiguous,
+        and a partner re-creating a name-only binding must create it with both
+        ids AND revoke the old one. After the cutoff date a name-only binding is
+        dropped from the candidates, so the id-pinned one is the one that mints.
       properties:
         grant_type:
           type: string
@@ -954,6 +981,24 @@ components:
           type: string
           enum: ['urn:ietf:params:oauth:token-type:jwt']
           description: Optional; defaults to the JWT token-type URN when omitted.
+        platform_id:
+          type: string
+          description: |
+            Optional. The id of the platform the federation binding was
+            created under (the `{id}` of
+            `POST /platforms/{id}/federation-bindings`). When sent, only that
+            platform's bindings are considered for this exchange. A value that
+            names no platform, or a platform with no matching binding, answers
+            the same `401` as no matching binding. For a `service_account` or
+            `platform_mgmt` target, whose exchange carries a platform token in
+            `Authorization`, it must name that token's realm, else `401
+            bff_bearer_realm_mismatch`; the default `platform` target reads no
+            platform token. When omitted and the credential matches active
+            bindings in more than one platform, the exchange is refused as
+            ambiguous (`401 unauthorized`, "ambiguous federation binding");
+            send `platform_id` to disambiguate. A refused exchange still uses up its assertion:
+            retry with a freshly fetched one. Clients should send it; a later
+            release will make it required, announced in advance.
       example:
         grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange'
         subject_token: eyJhbGciOiJSUzI1NiIsImtpZCI6Ii4uLiJ9.eyJpc3MiOiJodHRwczovL3Rva2VuLmFjdGlvbnMuZ2l0aHVidXNlcmNvbnRlbnQuY29tIn0.sig
@@ -1148,6 +1193,9 @@ components:
         subject_token_type:
           type: string
           enum: ['urn:ietf:params:oauth:token-type:jwt']
+        platform_id:
+          type: string
+          description: "For the token exchange (ADR-057), optional: the platform the federation binding was created under. See `LoginRequestTokenExchange.platform_id`."
         tenant_id:
           type: string
           format: uuid
@@ -1733,7 +1781,9 @@ components:
             never silently receives an email: substituting the channel the
             subject controls would defeat the whole property. A subject with
             no address of the requested kind is a `400 no_delivery_address`
-            and the issue FAILS.
+            and the issue FAILS. An emailed code of any purpose goes only to a
+            proven (verified) email contact of the subject; with none, the
+            answer is `400 no_delivery_address`.
 
             **Login-mode matrix (ADR-103 D3/D4)** — `purpose=login`:
 
@@ -1750,7 +1800,8 @@ components:
 
             Errors: `400 unsupported_delivery_mode` (unknown mode, or `email`
             on a login OTP); `400 no_delivery_address` (the subject has no
-            address of the requested kind — the issue FAILS rather than
+            address of the requested kind, or for `email` no proven email
+            contact — the issue FAILS rather than
             returning an id for a code nobody will receive);
             `503 delivery_unavailable` (the mode is legal but the realm has no
             working channel for it).
@@ -2828,7 +2879,12 @@ components:
           description: |
             Length (in digits) of OTP values minted by `/auth/otp/issue`.
             Default 6. Per-realm only — per-call override is rejected to
-            avoid security erosion.
+            avoid security erosion. At least 6 while phone code sign-in
+            (`otp_login_enabled`), email code sign-in (`email_otp_login_enabled`)
+            or OTP MFA (`otp_mfa_enabled`) is on, judged on the config after the
+            patch is applied: a patch that sets `otp_length` below 6 while any of
+            the three is on, or turns any of them on while `otp_length` is below
+            6, is refused with `400 invalid_config_value` naming the minimum.
         otp_ttl_seconds:
           type: integer
           minimum: 30
@@ -3638,6 +3694,65 @@ components:
           description: |
             The verified domain whose SSO grant provisioned the row. Present
             only when `joined_via` is `sso_domain`.
+        verified_email_state:
+          type: string
+          enum: [verified, unverified, unverified_required]
+          description: |
+            Whether this member can be sent a password reset link, read at the
+            moment of the list. It lets an
+            admin console offer the right password action up front instead of
+            learning it from a 409.
+
+            - `verified`: the member holds an ACTIVE email contact marked
+              verified (`verified_at` set; the issuer stamps it when the
+              holder proves the address, and also on an address a platform
+              asserts at creation or import), AND email is an
+              identifying contact kind on the member's platform (ADR-117 D5:
+              a verified address that is only a mailing contact does not
+              count). `POST /tenants/{tid}/users/{uid}/password-reset` can
+              send a link (202); `PUT /tenants/{tid}/users/{uid}/credentials`
+              with a `password` answers 409 `reset_link_required`.
+            - `unverified`: no such contact, and the realm's
+              `password_policy.require_verified_email` is off. An admin may
+              set a temporary password; a reset link cannot be sent
+              (409 `no_verified_email`, or 409 `reset_email_not_identifying`
+              when email is not an identifying kind on the platform).
+            - `unverified_required`: no such contact, and the realm's
+              `password_policy.require_verified_email` is on. Neither action
+              works: setting a password answers 409 `verified_email_required`
+              and a reset link cannot be sent, until the member proves an
+              address.
+
+            The realm is the one governing this tenant, the same realm the
+            two write routes consult. This is the rule those two routes apply
+            at write time, stated in advance. It is NOT authoritative: the
+            write re-checks and its 409 still wins if the member's contacts
+            changed in between. It does not say whether password sign-in is
+            on for the realm: when the realm's `password_login_enabled` is
+            off, both write routes answer `400 unknown_method` whatever this
+            field says. Nor does it say whether the caller may change this
+            member's credentials: on the tenant owner's row, `PUT …/credentials`
+            still answers `403 forbidden` to a `users:manage` holder inside the
+            tenant who is not the owner.
+
+            Sent only on the items of `GET /tenants/{id}/users`; other
+            responses that return a `User` omit it. Omitted on a row whose
+            `kind` is `service`, which can hold no password. On a row whose
+            `kind` is `human`, ABSENT means only that the state could not be
+            read (the member's contacts, tenant or realm); it never means
+            "unverified". An item with no `kind` at all comes from an issuer
+            older than both fields. Either way, a client that does not find
+            the field falls back to trying the write and following its answer.
+        kind:
+          type: string
+          enum: [human, service]
+          description: |
+            The kind of principal this row is (ADR-071): `human` for a
+            person, `service` for a service account. A row stored with no
+            kind is a `human`. Sent only on the items of
+            `GET /tenants/{id}/users`; other responses that return a `User`
+            omit it. A service row can hold no username or password, so a
+            console offers no password action on it.
         mfa_methods:
           type: array
           items: { type: string, enum: [totp, otp] }
@@ -3675,6 +3790,66 @@ components:
           type: string
           nullable: true
         total: { type: integer, nullable: true }
+
+    ContactVerification:
+      type: object
+      description: |
+        One row of the first-login approval queue (ADR-042 P2). It names
+        whose account is asking, for which address, and who the identity
+        provider says is signing in, so the approver can decide without
+        looking anything up. Contact values are masked; the approver sees
+        enough to recognise an address, not to harvest it.
+      required: [id, contact_id, user_id, method, provider_uid, state, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        contact_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        method:
+          type: string
+          description: The sign-in method (provider) whose binding waits for approval.
+        provider_uid:
+          type: string
+          description: The provider's subject for the identity signing in.
+        state: { type: string, enum: [pending, active, rejected, revoked] }
+        created_at: { type: integer, format: int64 }
+        expires_at: { type: integer, format: int64 }
+        contact_kind:
+          type: string
+          enum: [email, phone, username]
+          description: Kind of the contact slot being taken up again.
+        contact_value_masked:
+          type: string
+          description: |
+            The contact's value, masked (for example `j***@example.com`,
+            `+44*******123`).
+        user_display_name:
+          type: string
+          description: Display name of the account the slot belongs to; absent when it has none.
+        user_email_masked:
+          type: string
+          description: The account's email, masked as above; absent when it has none.
+        asserted_identity:
+          type: object
+          description: |
+            What the identity provider asserted at the held sign-in. Every
+            field is optional; contact values are masked.
+          properties:
+            email_masked: { type: string }
+            phone_masked: { type: string }
+            display_name: { type: string }
+
+    ContactVerificationListPage:
+      type: object
+      description: Paginated list envelope per SDK SPEC §7.
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ContactVerification' }
+        next_cursor:
+          type: string
+          nullable: true
+        total: { type: integer, nullable: true }
+        has_more: { type: boolean, nullable: true }
 
     TenantListPage:
       type: object
@@ -4310,8 +4485,11 @@ components:
           additionalProperties: { type: string }
           description: |
             AND-conditions the assertion must satisfy — the tenant boundary.
-            Must constrain at least the provider's mandatory claim (GCP `sub`
-            = the service account's numeric `uniqueId`; GitHub `repository`).
+            Must constrain at least the provider's mandatory claims (GCP `sub`
+            = the service account's numeric `uniqueId`; GitHub `repository`,
+            `repository_id` and `repository_owner_id`, all three required at
+            create on every target, see
+            `POST /platforms/{id}/federation-bindings`).
         mapped_role:
           type: string
           description: "Role stamped on the minted platform session. Defaults to platform_api."
@@ -4828,6 +5006,34 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    PermissionCapLacksPermission:
+      description: |
+        `permission_cap_exceeded` — refused for a capped user API key whose
+        `permissions_cap` lacks the permission this operation needs; the message
+        names it (`this API key's permissions_cap does not include: <perm>`). An
+        uncapped key and a signed-in person pass this check.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PermissionCapExceeded:
+      description: |
+        `permission_cap_exceeded` — the caller is a CAPPED user API key, and this
+        operation names no permission a cap could grant, so it is refused. An uncapped
+        key and a signed-in person are not refused by this rule.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PlatformBotImmutable:
+      description: |
+        `platform_bot_immutable` — the target is the realm's `platform_api` bot.
+        RealmID manages it and every platform API key of the realm is bound to
+        it, so it is visible and readable but never modified: its role, status,
+        handle and sessions are not changed through any route. Rotate platform
+        credentials through `/platforms/{id}/api-keys` instead. Nothing is
+        written.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     IdempotencyKeyReused:
       description: |
         `idempotency_key_reused` (G11) — the same `Idempotency-Key` arrived with a
@@ -4980,8 +5186,6 @@ paths:
             or integration token, not a platform token; G19, R60. Copy:
             "Send your platform token in Authorization; the user's token goes
             in X-User-Token.")
-            | wrong_scope (bearer is not `token_class=platform`; the
-            error CODE is unchanged, only the claim it reads)
             | invalid_audience (id-token `aud` not registered;
             `provider_token` / `google`)
             | invalid_credentials (bad password / OTP).
@@ -5099,6 +5303,18 @@ paths:
         `401 platform_bearer_required` (G19). EXEMPT (R60): the
         `platform_api_key` grant and a WIF platform exchange carry no platform
         token, they ARE the platform mint.
+
+        **The escort and the credential belong to ONE realm.** For every grant
+        that needs the platform token, the realm of the credential in the body
+        (the `api_key` or `user_api_key` key, the workload binding of a token
+        exchange, the install pass, the device code, the refresh-bound session)
+        must be the realm the platform token was minted for. A platform token
+        of any other realm answers `401 bff_bearer_realm_mismatch` and nothing
+        is minted; send the credential through its own realm's backend. One
+        exception in the answer, not the rule: a device code is looked up only
+        in the platform token's realm, so another realm's device code answers
+        exactly as an unknown code does, `400 expired_token`. Signing custody
+        is judged on that same realm.
 
         Returns 412 if the tenant's MFA policy requires a challenge
         the caller has not completed.
@@ -5219,7 +5435,23 @@ paths:
             | platform_bearer_required (G19: the `Authorization` bearer is not
             a platform token. Copy: "Send your platform token in
             Authorization; the user's token goes in X-User-Token.")
-            | m2m_refresh_withdrawn.
+            | bff_bearer_realm_mismatch (the platform token belongs to a
+            different realm than the credential in the body; nothing is
+            minted)
+            | m2m_refresh_withdrawn
+            | binding_requires_repository_ids (token-exchange grant, ADR-057.
+            NOT emitted yet; it starts after a cutoff date announced to
+            partners, and before it a name-only binding still matches. After it:
+            the matching GitHub binding is name-only, missing `repository_id` or
+            `repository_owner_id` (or both), or it was revoked at the cutoff for
+            that reason. If it is still active, create one with both ids (and
+            revoke the name-only one; the cutoff revokes it anyway). If it was
+            revoked at the cutoff, create one with both ids. If you already
+            created one with both ids, one of its claims, the ids included, does
+            not match this token: a transferred repository has a new
+            `repository_owner_id`, and a repository deleted and re-made under
+            the same name has a new `repository_id`, so compare each claim
+            against the token).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6051,6 +6283,10 @@ paths:
             § MFA, "Per-membership MFA fail counter", MFA-P1..P9). A wrong `code` here counts
             toward the same total as `/auth/mfa/verify` and `/auth/mfa/recovery`; while locked,
             a correct code is refused too.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Whole seconds until the lock in force ends (at least 1); absent when the wait could not be read or the lock expired as it was read; a client without it should show a generic "try again later".
 
   /auth/mfa/verify:
     post:
@@ -6108,6 +6344,10 @@ paths:
             `users` row, across every session; 15 min lock, doubling to 24h) is locked. The lock
             is read before the code is checked, so a correct code is refused too. design.md
             § MFA, MFA-P1..P9.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Whole seconds until the lock in force ends (at least 1); absent when the wait could not be read or the lock expired as it was read; a client without it should show a generic "try again later".
 
   /auth/mfa/recovery:
     post:
@@ -6162,6 +6402,10 @@ paths:
             `mfa_too_many_fails` — the per-session or the per-membership MFA counter is locked. A
             wrong recovery code counts toward the same per-membership total as `/auth/mfa/verify`
             (design.md § MFA, MFA-P2).
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Whole seconds until the lock in force ends (at least 1); absent when the wait could not be read or the lock expired as it was read; a client without it should show a generic "try again later".
 
   /auth/mfa/authenticators:
     get:
@@ -6271,10 +6515,13 @@ paths:
         Partner OTP primitive (proposal: partner-otp-primitive.md §3).
         Mints a short-lived, one-shot OTP scoped to the caller's
         tenant. Length and TTL come from
-        `realms.config.otp_length` / `otp_ttl_seconds`. Multiple
-        issuers can mint codes concurrently for the same
-        `(subject_ref, purpose)` — codes stack; verify consumes the
-        first hash-match. For `view_bff` (the default) the plaintext is cached in Redis under the
+        `realms.config.otp_length` / `otp_ttl_seconds`. For every purpose
+        except `login`, multiple issuers can mint codes concurrently for
+        the same `(subject_ref, purpose)` — codes stack; verify consumes the
+        first hash-match. A `login` (sign-in) code supersedes: issuing it
+        consumes every earlier unconsumed `login` code for the same
+        `(tenant, subject_ref)` in the same write, so only the newest
+        sign-in code verifies. For `view_bff` (the default) the plaintext is cached in Redis under the
         OTP id and re-displayable via `GET /auth/otp/{id}` until TTL; for `email`, `sms`
         and `whatsapp` no plaintext is cached or re-displayable (that GET is 404).
         Emits `auth.otp.issued`.
@@ -6299,8 +6546,9 @@ paths:
             subject's proven identifying email, and is limited by `email_otp`
             (`429 email_otp_rate_limited`)) |
             no_delivery_address (the subject has no address of the requested
-            kind, or the provider says the phone number cannot receive on the
-            channel).
+            kind, an emailed code of any purpose finds no proven (verified)
+            email contact, or the provider says the phone number cannot
+            receive on the channel).
             ADR-071 §4, ADR-103, ADR-115.
           content:
             application/json:
@@ -6424,8 +6672,8 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
           description: |
-            unauthorized (missing or invalid bearer) | wrong_scope (the bearer
-            is not a platform-class token) | platform_bearer_required (G19).
+            unauthorized (missing or invalid bearer) | platform_bearer_required
+            (the bearer is not a platform-class token; G19).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6502,13 +6750,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OTPViewResponse' }
-        '403':
-          description: '`permission_cap_exceeded` (ADR-084 AF-084.7) — the caller is a CAPPED user API-key session. This route names no catalog permission, so a capped key is refused before any OTP is read. A signed-in person and an uncapped key are not refused by this rule.'
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
+        '404':
+          description: >-
+            otp_not_found: no such row, or the row is not one the caller may view
+            (another tenant's, a code another user issued, or a delivery mode other
+            than view_bff), or the plaintext is no longer held for display (the
+            row may still be verifiable).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '404':
-          description: otp_not_found (row missing, expired, or cross-tenant)
+        '410':
+          description: "otp_expired: the code has expired."
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6530,7 +6783,9 @@ paths:
         On miss, increments the per-`(tenant, subject_ref, purpose)`
         lockout counter (5 fails / 15 min → 429). Emits
         `auth.otp.verified` on success and `auth.otp.verify_failed`
-        on miss/expired/locked.
+        on miss/expired/locked. A capped user API key is refused (403)
+        before any row is read or consumed, and the lockout counter is
+        not touched.
       requestBody:
         required: true
         content:
@@ -6552,11 +6807,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '403':
-          description: '`permission_cap_exceeded` (ADR-084 AF-084.7) — the caller is a CAPPED user API-key session. This route names no catalog permission, so a capped key is refused before any OTP is read or consumed, and the lockout counter is not touched. A signed-in person and an uncapped key are not refused by this rule.'
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '410':
           description: otp_expired (matched row exists but is expired)
           content:
@@ -6832,6 +7083,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ClaimDomainResponse' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
 
   /domains/verify:
     post:
@@ -6861,6 +7113,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '404':
           description: domain_not_found (no pending claim for this domain by the caller)
           content:
@@ -6892,6 +7145,7 @@ paths:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/PendingDomain' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
 
   /platforms:
     post:
@@ -6964,6 +7218,10 @@ paths:
             tenant-scoped identity provider (or is a pre-release session the release
             migration confined), so its login cannot be copied onto the new platform's
             owner, which is outside that tenant (ADR-099 AF-099.6, `createPlatformCore`).
+
+            `permission_cap_exceeded` — the caller is a CAPPED user API key, and this operation names
+            no permission a cap could grant, so it is refused. An uncapped key and a signed-in person
+            are not refused by this rule.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -7012,6 +7270,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '404':
           description: |
             platform_not_found — returned identically for an unknown id and for
@@ -7067,6 +7326,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '501':
           description: integration_endpoint_unsupported (the realm store cannot hold an integration endpoint; checked before any write)
           content:
@@ -7379,7 +7639,7 @@ paths:
         requires a **platform bearer** in `Authorization`, carrying the acting
         user's access JWT in `X-User-Token` — the same ADR-050 shape the rest of
         the partner-mediated surface uses. A bare user access token answers
-        `401 wrong_scope`.
+        `401 platform_bearer_required`.
 
         The escort must belong to the **target user's own realm**: a platform
         bearer from a different realm answers `403 realm_mismatch`. RealmID's own
@@ -7392,9 +7652,11 @@ paths:
         this collection are deliberately unchanged**, because reading and
         revoking a key you already hold is not credential issuance.
 
-        *Consequence for the `realm-id` CLI:* it holds a user token and cannot
-        satisfy this escort, so `user-api-keys create` is filtered out of its
-        command tree. `list` and `revoke` are unaffected.
+        *The `realm-id` CLI:* it holds a person's token, not a platform token,
+        so it does not call this operation directly. Its `user-api-keys create`
+        verb goes through the RealmID BFF, which supplies the platform escort;
+        it works from a person's session only and answers step-up with
+        `--totp`. `list` and `revoke` are unaffected.
       requestBody:
         required: true
         content:
@@ -7416,8 +7678,9 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
           description: |
-            `wrong_scope` — ADR-097 §E: this route requires a platform bearer
-            (`token_class=platform`). A bare user access token is refused.
+            `platform_bearer_required` — ADR-097 §E: this route requires a
+            platform bearer (`token_class=platform`). A bare user access token
+            is refused.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -7455,6 +7718,11 @@ paths:
         Returns the label plus a non-secret hash prefix — never the plaintext.
         `{uid}` must be the caller, or an org admin holding `user_api_keys:read`
         while the realm's `user_api_keys.org_admin_visible` is on (default).
+
+        **The tenant owner's keys are excluded from the admin lane (owner ruling,
+        2026-11-20).** Only the owner (`tenants.owner_user_id`, ADR-076) can list
+        their own keys; an admin naming the owner as `{uid}` gets `404
+        user_not_found`, the same answer as for a non-member.
 
         `user_api_keys:read` / `:manage` are distinct from `platform_api_keys:read` /
         `:manage` on purpose: an org admin managing members' keys must not
@@ -7497,7 +7765,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/UserAPIKeyListPage' }
         '403':
-          description: '`forbidden`'
+          description: '`forbidden` | `permission_cap_exceeded` - a capped user API key whose `permissions_cap` lacks `user_api_keys:read` (message names it), or, on the caller''s own keys, ANY capped key (that path names no permission); an uncapped key and a signed-in person pass this check'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -7506,7 +7774,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-
+        '404':
+          description: '`user_not_found` - `{uid}` is not a member of `{tid}`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
         '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{tid}/users/{uid}/user-api-keys/{id}:
     parameters:
@@ -7631,6 +7904,11 @@ paths:
         Soft revoke — sets `revoked_at`; the row is retained for audit and stops
         consuming an active-quota slot.
 
+        **The tenant owner's keys are excluded from the admin lane (owner ruling,
+        2026-11-20).** Only the owner (`tenants.owner_user_id`, ADR-076) can revoke
+        their own keys; an admin naming the owner as `{uid}` gets `404
+        user_not_found`, the same answer as for a non-member, and the key is untouched.
+
         Revocation is effective at the next **exchange**: the key can no longer
         be swapped for a token. Any access token already minted from it remains
         valid for the remainder of its TTL, which bounds the staleness window.
@@ -7658,10 +7936,11 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '404':
-          description: No such key for this user.
+          description: '`user_not_found` - `{uid}` is not a member of `{tid}` | `user_api_key_not_found` - no such key for this user'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
 
   # ----------------------------------------------------- Platform admin
   #
@@ -7744,6 +8023,12 @@ paths:
             created in a keyless realm, which produced exactly the forgotten,
             never-exercised secret that ADR-085 §3's default expiry exists to
             age out.
+
+            `not_available_to_api_keys` — the carried actor is a person's user
+            API key session (capped or uncapped). A user API key never mints a
+            platform API key. A signed-in person with the right may, and so may
+            a service-class session that holds it (for example a CI workload
+            holding `platform_mgmt_api`, the automated rotation channel).
         '409':
           description: |-
             `too_many_api_keys` — ADR-085 §2 caps a realm at **2 active
@@ -7811,6 +8096,17 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StatusOK' }
+        '403':
+          description: |
+            `not_available_to_api_keys` — the carried actor is a person's user
+            API key session (capped or uncapped). A user API key never revokes
+            a platform API key. A signed-in person with the right may, and so
+            may a service-class session that holds it (for example a CI
+            workload holding `platform_mgmt_api`, the automated rotation
+            channel).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: api_key_not_found
         '409':
@@ -7957,7 +8253,10 @@ paths:
         '403':
           description: |
             forbidden — the caller lacks `platform:config` (and is not RealmID
-            staff), OR the body turns `email_otp_login_enabled` from false to true
+            staff), OR the caller is a CAPPED user API key whose `permissions_cap`
+            lacks `platform:config` (`permission_cap_exceeded`, message `this API
+            key's permissions_cap does not include: platform:config`; an uncapped
+            key and a signed-in person pass this check), OR the body turns `email_otp_login_enabled` from false to true
             and the actor is not the realm owner (ADR-123 D2, owner 2026-11-04 R10:
             staff and non-owner `platform:config` holders cannot turn it
             on; the whole PATCH is refused). Turning it on from a user API key
@@ -8059,7 +8358,8 @@ paths:
         '401':
           description: missing or invalid bearer
         '403':
-          description: forbidden - missing permission `platform:config`
+          description: |
+            forbidden - missing permission `platform:config` | `permission_cap_exceeded` - a capped user API key whose `permissions_cap` lacks `platform:config` (message: `this API key's permissions_cap does not include: platform:config`; an uncapped key and a signed-in person pass this check)
         '422':
           description: channel_validation_failed - the provider refused the credentials; the message is the provider's reason
         '503':
@@ -8091,7 +8391,8 @@ paths:
         '401':
           description: missing or invalid bearer
         '403':
-          description: forbidden - missing permission `platform:config`
+          description: |
+            forbidden - missing permission `platform:config` | `permission_cap_exceeded` - a capped user API key whose `permissions_cap` lacks `platform:config` (message: `this API key's permissions_cap does not include: platform:config`; an uncapped key and a signed-in person pass this check)
         '404':
           description: channel_not_configured
     delete:
@@ -8120,7 +8421,8 @@ paths:
         '401':
           description: missing or invalid bearer
         '403':
-          description: forbidden - missing permission `platform:config`
+          description: |
+            forbidden - missing permission `platform:config` | `permission_cap_exceeded` - a capped user API key whose `permissions_cap` lacks `platform:config` (message: `this API key's permissions_cap does not include: platform:config`; an uncapped key and a signed-in person pass this check)
         '409':
           description: |
             last_browser_sign_in (ADR-124 D1, owner 2026-11-04 R16) —
@@ -8168,7 +8470,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/FederationBindingListPage' }
         '403':
-          description: not_authorized (caller is not a realm admin / owner)
+          description: not_authorized (caller is not a realm admin / owner) | `permission_cap_exceeded` - a capped user API key whose `permissions_cap` lacks `federation:read` (message names it; an uncapped key and a signed-in person pass this check)
         '404':
           description: realm_not_found | federation_disabled
         '400': { $ref: '#/components/responses/InvalidPageParams' }
@@ -8186,10 +8488,20 @@ paths:
         Registers a trust binding. The `issuer` must be an RI-known provider
         (v1: GCP `accounts.google.com` or GitHub
         `token.actions.githubusercontent.com`); `match_claims` must constrain
-        at least the provider's mandatory claim (GCP `sub` — the SA's numeric
-        `uniqueId`; GitHub `repository`). `audience` is forced to the global RI
-        constant. 409 `binding_exists` if an active binding already has the
+        at least the provider's mandatory claims (GCP `sub` — the SA's numeric
+        `uniqueId`; GitHub `repository`, `repository_id` AND
+        `repository_owner_id`, see below). `audience` is forced to the global RI constant. 409
+        `binding_exists` if an active binding on this platform already has the
         same `(issuer, match_claims)` tuple.
+
+        **A GitHub binding pins numeric ids, not names.** Every new binding
+        whose `issuer` is GitHub must carry `repository`, `repository_id` and
+        `repository_owner_id` in `match_claims`, all three, whatever its
+        `target`: the default `platform` target, `platform_mgmt` and
+        `service_account` alike. A create missing any of the three answers
+        `400 missing_mandatory_claim` and stores nothing. Further claims may be
+        added as extra constraints. Read the two ids with
+        `gh api repos/OWNER/REPO --jq '.id, .owner.id'`.
 
         Gated on the platform owner or a realm role granting
         `federation:manage` (ADR-074), plus base-realm RealmID staff on ANY
@@ -8244,7 +8556,11 @@ paths:
                   items: { type: string }
             example:
               issuer: https://token.actions.githubusercontent.com
-              match_claims: { repository: acme/billing, environment: prod }
+              match_claims:
+                repository_id: '123456789'
+                repository_owner_id: '987654321'
+                repository: acme/billing
+                environment: prod
       responses:
         '201':
           description: Created
@@ -8254,7 +8570,9 @@ paths:
         '400':
           description: |
             `unknown_issuer` | `unconstrained_binding` |
-            `missing_mandatory_claim` | `invalid_mapped_role` (ADR-091 D2 — the
+            `missing_mandatory_claim` (a mandatory claim is absent or empty;
+            for a GitHub binding, on every target, that is any of
+            `repository`, `repository_id` or `repository_owner_id`) | `invalid_mapped_role` (ADR-091 D2 — the
             role does not resolve in the governing realm) |
             `invalid_target` (unknown `target.kind`, or `service_account`
             without `tenant_id` / `user_id`)
@@ -8266,7 +8584,13 @@ paths:
             i.e. one holding any permission whose action is not "read"
             (ADR-101 D6). This includes the default `platform_api` when
             `mapped_role` is omitted. A non-owner with `federation:manage` may
-            still create a binding at a role that confers no authority.
+            still create a binding at a role that confers no authority. |
+            `permission_cap_exceeded` — a capped user API key whose
+            `permissions_cap` lacks `federation:manage` (message names it); and, for
+            a `service_account` target, ANY capped user API key, because that path
+            names no permission (message: `this operation is not available to an
+            API-key session (no permission is defined for it)`). An uncapped key
+            and a signed-in person pass this check.
         '404':
           description: |-
             realm_not_found | federation_disabled |
@@ -8324,7 +8648,7 @@ paths:
                   status: { type: string, enum: [revoked] }
                   id: { type: string, format: uuid }
         '403':
-          description: not_authorized (caller is not a realm admin / owner)
+          description: not_authorized (caller is not a realm admin / owner) | `permission_cap_exceeded` - a capped user API key whose `permissions_cap` lacks `federation:manage` (message names it; an uncapped key and a signed-in person pass this check)
         '404':
           description: binding_not_found | federation_disabled
         '409':
@@ -8610,7 +8934,27 @@ paths:
         '404':
           description: role_template_not_found
         '409':
-          description: role_template_seated (this role is held — by a users row or by an active federation binding's mapped_role; pass ?override_seated=true)
+          description: |
+            role_template_seated (this role is held — by a users row or by an
+            active federation binding's mapped_role; pass ?override_seated=true).
+            The error object carries `seated_count`, the number of seats counted
+            (an SDK surfaces it as `details.seated_count`); read the count from
+            this field, never from the message text.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      seated_count:
+                        type: integer
+                        description: |
+                          Seats holding this role when the write was judged. At
+                          least 1 on this response: a count that could not be
+                          taken answers `503 role_template_seat_check_failed`
+                          instead. As on every seat count of this surface, `-1`
+                          means "could not count", never "none".
         '501':
           description: role_templates_unavailable
         '503':
@@ -8671,7 +9015,27 @@ paths:
         '404':
           description: role_template_not_found
         '409':
-          description: role_template_seated (this role is held — by a users row or by an active federation binding's mapped_role; pass ?override_seated=true)
+          description: |
+            role_template_seated (this role is held — by a users row or by an
+            active federation binding's mapped_role; pass ?override_seated=true).
+            The error object carries `seated_count`, the number of seats counted
+            (an SDK surfaces it as `details.seated_count`); read the count from
+            this field, never from the message text.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      seated_count:
+                        type: integer
+                        description: |
+                          Seats holding this role when the write was judged. At
+                          least 1 on this response: a count that could not be
+                          taken answers `503 role_template_seat_check_failed`
+                          instead. As on every seat count of this surface, `-1`
+                          means "could not count", never "none".
         '501':
           description: role_templates_unavailable
         '503':
@@ -9309,7 +9673,7 @@ paths:
       responses:
         '200': { description: Uploaded; awaiting handshake. }
         '400': { description: split_key_size_unsupported | split_key_invalid | overlap_cap_exceeded }
-        '403': { description: actor_required | owner_required }
+        '403': { description: "actor_required | owner_required | `permission_cap_exceeded` (a capped user API key: on the first upload, owner lane, any capped key is refused because no permission is named; once overlap is pending the rotate lane requires `signing_keys:rotate` in the cap, message `this API key's permissions_cap does not include: signing_keys:rotate`; an uncapped key and a signed-in person pass this check)" }
         '409': { description: split_kid_in_use | rotation_lease_held | split_upload_not_allowed }
         '404': { description: platform_not_found }
         '501': { description: split_custody_unavailable }
@@ -9365,6 +9729,7 @@ paths:
                     properties:
                       nonce: { type: string }
                       partial_ri: { type: string, description: 'base64url, no padding' }
+        '403': { description: "`permission_cap_exceeded` (a capped user API key: while custody is still full, owner lane, any capped key is refused because no permission is named; from overlap_pending the rotate lane requires `signing_keys:rotate` in the cap, message `this API key's permissions_cap does not include: signing_keys:rotate`; an uncapped key and a signed-in person pass this check)" }
         '404': { description: platform_not_found | split_key_not_found }
 
   /platforms/{id}/signing-keys/split/{kid}/handshake/complete:
@@ -9409,6 +9774,7 @@ paths:
       responses:
         '200': { description: 'Handshake verified; the overlap countdown is running (or already was). The realm is split-only only at expiry (R36).' }
         '401': { description: handshake_failed }
+        '403': { description: "`permission_cap_exceeded` (a capped user API key: while custody is still full, owner lane, any capped key is refused because no permission is named; from overlap_pending the rotate lane requires `signing_keys:rotate` in the cap, message `this API key's permissions_cap does not include: signing_keys:rotate`; an uncapped key and a signed-in person pass this check)" }
         '404': { description: platform_not_found | split_key_not_found }
 
   /platforms/{id}/signing-keys/split/overlap/extend:
@@ -9437,6 +9803,7 @@ paths:
                 by: { type: string }
       responses:
         '200': { description: Extended. }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '409': { description: not_in_overlap }
 
   /platforms/{id}/signing-keys/split/overlap/cancel:
@@ -9459,6 +9826,7 @@ paths:
         not_in_overlap`. Auth as upload.
       responses:
         '200': { description: Cancelled. }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '409': { description: not_in_overlap }
 
   /platforms/{id}/signing-keys/split/rotation-lease:
@@ -9744,7 +10112,7 @@ paths:
         '400':
           description: bad_platform
         '401':
-          description: unauthorized | wrong_scope
+          description: unauthorized | platform_bearer_required
         '403':
           description: realm_mismatch
         '404':
@@ -9790,7 +10158,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/PublicIdentityProviderResponse' }
         '401':
-          description: unauthorized | wrong_scope
+          description: unauthorized | platform_bearer_required
         '403':
           description: realm_mismatch
         '404':
@@ -10184,6 +10552,7 @@ paths:
               schema: { $ref: '#/components/schemas/TenantListPage' }
 
         '400': { $ref: '#/components/responses/InvalidPageParams' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
   /tenants/{id}:
     parameters:
       - in: path
@@ -10214,6 +10583,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Tenant' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
     patch:
       x-realmid-step-up-candidate: true
       tags: [Tenants]
@@ -10234,6 +10604,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Tenant' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
     delete:
       x-realmid-step-up-candidate: true
       tags: [Tenants]
@@ -10274,6 +10645,7 @@ paths:
               schema: { $ref: '#/components/schemas/Tenant' }
         '400':
           description: unknown_config_key | invalid_config_value
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
 
   /tenants/{id}/owner:
     put:
@@ -10314,7 +10686,10 @@ paths:
             (which names a row, not an address, and is unaffected), or have the
             holder verify the address first. Provisioning a NEW row on the
             parent path is unchanged — at an address nobody holds there is no
-            identity to confuse.
+            identity to confuse. |
+            recipient_not_human — the recipient is not a person (a
+            `kind=service` account, the realm's `platform_api` bot included).
+            Only a person may own a tenant (ADR-081). Nothing is written.
         '403':
           description: caller is neither the tenant's owner nor its G-014 parent
         '404':
@@ -10436,6 +10811,7 @@ paths:
               schema: { $ref: '#/components/schemas/UserListPage' }
 
         '400': { $ref: '#/components/responses/InvalidPageParams' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
   /tenants/{id}/users/import:
     post:
       tags: [Tenants]
@@ -10508,6 +10884,22 @@ paths:
             tenant OWNER (ADR-101 D6), as well as for the pre-existing
             `owner`/`platform_api` refusal. Because the import is
             whole-file-atomic, one such row refuses the whole batch.
+
+            Per-row `error` code `platform_bot_immutable` — the row's `user_id`
+            names the realm's `platform_api` bot. RealmID manages that bot and
+            every platform API key of the realm is bound to it, so an import
+            never reconciles it. Like every phase-1 error, it refuses the whole
+            file and nothing is written.
+
+            Per-row `error` code `role_not_assignable_to_kind` — a reconcile
+            row (its `user_id` names an existing member) sets a role whose
+            `assignable_to` does not include that member's kind; the same check
+            `PATCH /tenants/{id}/users/{uid}/role` applies.
+
+            Per-row `error` code `last_owner` — a reconcile row would change the
+            role of the tenant's owner; the same refusal
+            `PATCH /tenants/{id}/users/{uid}/role` answers with `409`. Transfer
+            ownership first.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ImportUsersResponse' }
@@ -10535,6 +10927,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/User' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
     patch:
       x-realmid-step-up-candidate: true
       tags: [Tenants]
@@ -10648,7 +11041,15 @@ paths:
                   tenant_id: { type: string, format: uuid }
                   updated_at: { type: integer, format: int64 }
         '400':
-          description: invalid_role | use_transfer_owner
+          description: |
+            invalid_role | use_transfer_owner | platform_bot_immutable (the
+            target is the realm's `platform_api` bot, which RealmID manages:
+            every platform API key of the realm is bound to it, so its role and
+            status are never changed through any route. Nothing is written.) |
+            role_not_assignable_to_kind (the role's `assignable_to` does not
+            include the TARGET member's kind, `human` or `service`: a service
+            account is judged by the same checks `POST
+            /tenants/{id}/service-accounts` applies. Nothing is written.)
         '403':
           description: >-
             forbidden (caller lacks users:manage on the tenant) |
@@ -10710,9 +11111,19 @@ paths:
         row). The member's tokens for THIS organisation are refused at once
         (`403 user_suspended`); their other organisations are unaffected. To
         sign someone out, use `POST /tenants/{id}/users/{uid}/sessions/revoke`.
+
+        The realm's `platform_api` bot is never a target: RealmID manages it,
+        and every platform API key of the realm is bound to it.
       responses:
         '200':
           description: OK
+        '400':
+          description: |
+            platform_bot_immutable — the target is the realm's `platform_api`
+            bot. Nothing is written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
             last_owner — cannot deactivate the owner; transfer ownership first.
@@ -10737,7 +11148,9 @@ paths:
 
         Each id gets its own outcome in `results`; one refused id does not fail
         the call. The tenant owner cannot be bulk-suspended or deactivated and
-        is reported as `refused_owner`.
+        is reported as `refused_owner`. The realm's `platform_api` bot is never
+        a target (RealmID manages it; every platform API key of the realm is
+        bound to it) and is reported as `refused_platform_bot`, unchanged.
 
         A store error part-way through aborts the call with a 5xx. Rows already
         processed stay applied, and a retry reports them as `unchanged`.
@@ -10779,7 +11192,7 @@ paths:
                         user_id: { type: string, format: uuid }
                         outcome:
                           type: string
-                          enum: [updated, unchanged, not_found, refused_owner]
+                          enum: [updated, unchanged, not_found, refused_owner, refused_platform_bot]
         '400':
           description: invalid_status (status is not suspended or deactivated) | invalid_config_value (user_ids holds fewer than 1 or more than 500 ids) | bad_json
           content:
@@ -11028,6 +11441,7 @@ paths:
       responses:
         '200':
           description: OK
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '404':
           description: invite_not_found
         '409':
@@ -11140,6 +11554,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ServiceAccountList' }
         '400': { $ref: '#/components/responses/InvalidPageParams' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
     post:
       tags: [Service Accounts]
       security:
@@ -11232,6 +11647,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '404':
           description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
 
@@ -11272,7 +11688,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ServiceAccount' }
         '400':
-          description: bad_json | invalid_handle (must be email-shaped, containing `@`)
+          description: |
+            bad_json | invalid_handle (must be email-shaped, containing `@`) |
+            platform_bot_immutable (the target is the realm's `platform_api`
+            bot, which RealmID manages; nothing is written)
         '404':
           description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
         '409':
@@ -11304,6 +11723,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '400': { $ref: '#/components/responses/PlatformBotImmutable' }
         '404':
           description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
 
@@ -11332,6 +11752,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '400': { $ref: '#/components/responses/PlatformBotImmutable' }
         '404':
           description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
 
@@ -11368,6 +11789,7 @@ paths:
                 properties:
                   status: { type: string }
                   revoked_sessions: { type: integer }
+        '400': { $ref: '#/components/responses/PlatformBotImmutable' }
         '404':
           description: service_account_not_found
 
@@ -11400,6 +11822,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ServiceAccount' }
+        '400': { $ref: '#/components/responses/PlatformBotImmutable' }
         '404':
           description: service_account_not_found (also covers a wrong-tenant or non-service target — no oracle)
 
@@ -11458,6 +11881,11 @@ paths:
       responses:
         '200':
           description: OK
+        '403':
+          description: >-
+            forbidden: the target is the organisation owner and the caller is
+            not the owner (only the owner may change the owner's sign-in
+            details). A failed read of the user is a store error, not a 403.
         '409':
           description: review already resolved / identifier collision
 
@@ -11496,6 +11924,11 @@ paths:
       responses:
         '200':
           description: "OK — status=rejected, mode=soft|hard"
+        '403':
+          description: >-
+            forbidden: the target is the organisation owner and the caller is
+            not the owner (only the owner may change the owner's sign-in
+            details). A failed read of the user is a store error, not a 403.
 
   /tenants/{id}/users/{uid}/contacts/{contactId}/delink:
     post:
@@ -11529,6 +11962,11 @@ paths:
       responses:
         '200':
           description: "OK — status=delinked, contact_id, revoked_bindings"
+        '403':
+          description: >-
+            forbidden: the target is the organisation owner and the caller is
+            not the owner (only the owner may change the owner's sign-in
+            details). A failed read of the user is a store error, not a 403.
         '404':
           description: user or contact not found (or contact not owned by user)
 
@@ -11604,7 +12042,13 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
       responses:
         '200':
-          description: OK
+          description: |
+            OK. Each row names the account, the contact slot (kind and masked
+            value) and the identity the provider asserted, so an approver can
+            tell who is asking and for which address.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContactVerificationListPage' }
 
         '400': { $ref: '#/components/responses/InvalidPageParams' }
   /tenants/{id}/contact-verifications/{cvId}/approve:
@@ -11704,7 +12148,8 @@ paths:
       summary: Confirm TOTP code and activate the caller's own enrollment
       description: |
         SELF-ONLY (ADR-061 amendment 2026-10-14): `uid` must be the caller. Any
-        other `uid` answers `403 forbidden`.
+        other `uid` answers `403 forbidden`. The body carries the current code
+        from the authenticator the caller just enrolled.
       parameters:
         - $ref: '#/components/parameters/XUserToken'
         - in: path
@@ -11715,9 +12160,26 @@ paths:
           name: uid
           required: true
           schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: |
+                    A currently valid TOTP code from the authenticator set up by
+                    `POST .../mfa/enroll`.
       responses:
         '200':
           description: OK
+        '400':
+          description: "`bad_json` — the body is not a JSON object."
+        '401':
+          description: "`unauthorized` — the code is wrong or expired."
         '403':
           description: "`forbidden` — `uid` is not the caller."
 
@@ -11962,6 +12424,7 @@ paths:
                   tenant_id: { type: string, format: uuid }
                   status: { type: string, enum: [accepted] }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '404':
           description: |
             No such membership for this caller. Deliberately does not
@@ -12011,6 +12474,7 @@ paths:
                   tenant_id: { type: string, format: uuid }
                   status: { type: string, enum: [rejected] }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '404':
           description: |
             No such membership for this caller. Deliberately does not
@@ -12068,6 +12532,7 @@ paths:
                   tenant_id: { type: string, format: uuid }
                   status: { type: string, enum: [left] }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '404': { description: No such membership for this caller. }
         '409':
           description: |
@@ -12191,9 +12656,17 @@ paths:
       security:
         - BearerPlatformToken: []
           ActorToken: []
+      x-realmid-human-only: true
       summary: Assign a member's username and/or a temporary password (ADR-104, ADR-111)
       description: |
-        The ADMIN path. Requires `users:manage` in the tenant.
+        The ADMIN path. Requires `users:manage` in the tenant, held by a
+        signed-in PERSON: a sign-in credential is set only by people (ADR-084),
+        so a user API key session (capped or uncapped) and any service-class
+        session (a service account's or a service-class key's) answer
+        `403 not_available_to_api_keys`. A platform token carrying no actor
+        answers `403 actor_required`. Sending a reset link
+        (`POST /tenants/{tid}/users/{uid}/password-reset`) is not restricted
+        this way.
 
         **Since spec `0.53.0` (ADR-111):** a `password` is accepted ONLY for a
         member with NO verified email, and only while the realm's
@@ -12274,17 +12747,34 @@ paths:
         '400':
           description: |
             `invalid_username`, `password_too_short`, `password_too_long`,
-            `unknown_method`, `bad_request` (nothing sent, or a service account).
+            `bad_request` (nothing sent, or a service account), and
+            `unknown_method` (no credential store, or the realm governing this
+            tenant has `password_login_enabled` off; the same rule as
+            `POST /tenants/{tid}/users/{uid}/password-reset`). The realm rule
+            refuses every body, including one that only sets a `username`. A
+            realm whose setting cannot be read counts as off, as on the send
+            route. It is checked right after the member lookup and the
+            service-account refusal, so it comes before the owner check
+            (`403 forbidden`), before `invalid_username`, before the 409s
+            `reset_link_required` and `verified_email_required` (a reset link
+            is refused on such a realm too), and before anything is written.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
           description: |
+            `actor_required` when the platform token carries no actor in
+            `X-User-Token`. This is checked first.
+
+            `not_available_to_api_keys` when the carried actor is not a
+            signed-in person: a key session or a service-class session (see
+            above). This is checked before any permission or owner check.
+
             `forbidden` when the target is the tenant's OWNER and the caller is
             not: only the owner may set the username or password through which
             the owner signs in (ADR-116 second amendment). A `users:manage`
             holder inside the tenant is refused; the owner acting on themselves
-            and a realm M2M principal are not. Nothing is written.
+            is not. Nothing is written.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -12448,6 +12938,7 @@ paths:
                     description: How many memberships were suspended.
         '400': { description: '`tenant_required` — tenant_id is required.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PermissionCapExceeded' }
         '404': { description: No such membership for this caller. }
         '409':
           description: |
@@ -13031,7 +13522,7 @@ paths:
       summary: List custom domains bound to a tenant
       responses:
         '200': { description: OK }
-        '401': { description: unauthorized | wrong_scope }
+        '401': { description: unauthorized | platform_bearer_required }
         '403': { description: realm_mismatch }
         '404': { description: tenant_not_found }
     post:
@@ -13523,6 +14014,7 @@ paths:
       security:
         - BearerPlatformToken: []
           ActorToken: []
+      x-realmid-human-only: true
       parameters:
         - $ref: '#/components/parameters/XUserToken'
       summary: Four-tile dashboard summary (ADR-048 §2)
@@ -13537,7 +14029,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminStats'
-        '403': { description: not base-realm staff }
+        '403':
+          description: |
+            Not base-realm staff, or `not_available_to_api_keys` — the caller is a user API key
+            session (capped or uncapped) or a service-class key session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /admin/events:
     get:
@@ -13545,6 +14043,7 @@ paths:
       security:
         - BearerPlatformToken: []
           ActorToken: []
+      x-realmid-human-only: true
       summary: Paged audit/activity feed across all platforms (ADR-048 §3)
       description: |
         The same shape backs the customer-mode activity feed; the UI scopes
@@ -13584,7 +14083,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminEventsResponse'
-        '403': { description: not base-realm staff }
+        '403':
+          description: |
+            Not base-realm staff, or `not_available_to_api_keys` — the caller is a user API key
+            session (capped or uncapped) or a service-class key session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
         '400': { $ref: '#/components/responses/InvalidPageParams' }
   /platforms/{id}/audit-events:
@@ -13654,6 +14159,7 @@ paths:
       security:
         - BearerPlatformToken: []
           ActorToken: []
+      x-realmid-human-only: true
       summary: Cmd-K typeahead across platforms and tenants (ADR-048 §4)
       description: |
         Prefix matches rank above substring matches; per-type cap so
@@ -13675,7 +14181,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminSearchResponse'
-        '403': { description: not base-realm staff }
+        '403':
+          description: |
+            Not base-realm staff, or `not_available_to_api_keys` — the caller is a user API key
+            session (capped or uncapped) or a service-class key session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
         '400': { $ref: '#/components/responses/InvalidPageParams' }
   /admin/platforms/{id}:
@@ -13867,7 +14379,9 @@ paths:
         Flips `realms.status` to `suspended` and records the optional
         reason. Idempotent — re-suspending an already-suspended platform
         returns the current state without re-emitting an audit row.
-        Audited as `platform.suspend`.
+        Audited as `platform.suspend`, once, after the session revocation
+        completes. A repeat of a suspend that failed before auditing writes
+        the row, since it finds none for the realm since the suspend time.
       parameters:
         - $ref: '#/components/parameters/XUserToken'
         - in: path
