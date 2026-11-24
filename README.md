@@ -275,8 +275,8 @@ session the CLI asks for the code (`--totp CODE`, else the hidden prompt), answe
 `/auth/mfa/verify` and retries once. A code typed at login, an SMS or email code, or a code already used does
 not count, so two commands in one 30 s step need the next code. With no authenticator enrolled the answer is
 `412 mfa_registration_required`: the person has no authenticator and must enrol one before retrying. A
-recovery code does not count. A `409` (`binding_exists`, `last_machine_credential`) returns the approval
-unspent.
+recovery code does not count. A write that does not happen (`409 binding_exists`, `409 last_machine_credential`, a store error)
+returns the approval unspent.
 
 **Picking a workspace that needs MFA (R41 amendment, owner 2026-10-30; BUILT).**
 `realm-id config set tenant <id> [--totp CODE]` re-pins the session through `POST /switch-tenant`.
