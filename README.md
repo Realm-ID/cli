@@ -267,15 +267,16 @@ one, so the CLI adopts the verify body's `session_token` (saved to config for an
 session) and the retry carries THAT token. [R41 amendment, owner 2026-10-30; BUILT. A
 `REALM_ID_API_KEY` key session is never written to config.]
 
-**Federation bindings (Ruling 64, 2026-11-25).** `federation-bindings create` and `federation-bindings
-revoke` are person-only, enforced by the issuer: a signed-in person with a FRESH authenticator (TOTP) code
-for that one command. They are no longer on the BFF step-up list; the CLI keeps them on a separate local
+**Federation bindings (from issuer v0.153.0).** From issuer v0.153.0, `federation-bindings create` and
+`federation-bindings revoke` are person-only, enforced by the issuer: a signed-in person with a FRESH
+authenticator (TOTP) code for that one command. They are no longer on the BFF step-up list; the CLI keeps them on a separate local
 "person only" list. In a key or workload session they exit 8 `needs_human` with nothing sent. In a person's
 session the CLI asks for the code (`--totp CODE`, else the hidden prompt), answers the issuer's `412` at
 `/auth/mfa/verify` and retries once. A code typed at login, an SMS or email code, or a code already used does
 not count, so two commands in one 30 s step need the next code. With no authenticator enrolled the answer is
-`412 mfa_registration_required`: enrol first. A `409` (`binding_exists`, `last_machine_credential`) returns
-the approval unspent.
+`412 mfa_registration_required`: the person has no authenticator and must enrol one before retrying. A
+recovery code does not count. A `409` (`binding_exists`, `last_machine_credential`) returns the approval
+unspent.
 
 **Picking a workspace that needs MFA (R41 amendment, owner 2026-10-30; BUILT).**
 `realm-id config set tenant <id> [--totp CODE]` re-pins the session through `POST /switch-tenant`.
