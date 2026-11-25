@@ -7,6 +7,8 @@ Release notes for consumers of the binary. **WHAT shipped** lives here, the
 
 ### Changed
 
+- **The embedded issuer spec is re-vendored from issuer `v0.153.0` (spec `info.version` 0.70.0), the same release the BFF pins.**
+
 - **From issuer `v0.153.0`, `federation-bindings create` and `revoke` need a person with a fresh TOTP for each command.** The two routes leave the BFF-parity step-up list and sit on a CLI-local person-only list: a key or workload session still exits 8 `needs_human` with nothing sent; a person is asked for a code (`--totp` or prompt) for each create or revoke, and the one retry carries the new session token from the verify. A login code, an SMS or email code or a spent code does not count. `realm-id explain needs_human` names both operations.
 
 ## v0.7.0 — step-up routes, workload sessions that keep a person's login, and `federation-bindings revoke` (2026-11-23)

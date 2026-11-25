@@ -214,7 +214,22 @@ info:
     session-limit revocation token, the list now holds only the sessions that
     count toward the limit that refused you (see that operation). A normal
     signed-in caller's list is unchanged.
-  version: 0.69.0
+
+    **0.70.0 (behaviour change, ADR-057 amendment 2026-11-25, owner decision).**
+    `POST /platforms/{id}/federation-bindings` and
+    `DELETE /platforms/{id}/federation-bindings/{bid}` are setup, not operational
+    work, and are now enforced by the issuer itself: only a signed-in PERSON who
+    answers a step-up challenge minted for that one request with a fresh
+    authenticator (TOTP) code may create or revoke a binding. A platform API key,
+    a user API key (capped or uncapped), a service account, a workload session and
+    a bare platform bearer are refused (`403 not_available_to_api_keys` /
+    `403 actor_required`). Without a fresh approval the answer is
+    `412 mfa_required` (or `412 mfa_registration_required` when the person has no
+    confirmed authenticator); the approval is single-use, lives 120 seconds, and a
+    TOTP typed at sign-in does not count. A `412` is never cached by
+    `Idempotency-Key`. Some existing bindings will be disabled; the release
+    notice lists which.
+  version: 0.70.0
   contact:
     name: RealmID
     url: https://realmid.dev
@@ -6348,6 +6363,12 @@ paths:
             Retry-After:
               schema: { type: integer }
               description: Whole seconds until the lock in force ends (at least 1); absent when the wait could not be read or the lock expired as it was read; a client without it should show a generic "try again later".
+        '503':
+          description: |
+            `store_unavailable` — from v0.153.0, a TOTP answer to an operation-bound
+            challenge (federation-binding create or revoke) could not write its one-shot
+            approval. Nothing was rotated: the session and the refresh token are as they
+            were, so the same verify may be retried with a fresh code.
 
   /auth/mfa/recovery:
     post:
@@ -8475,7 +8496,7 @@ paths:
           description: realm_not_found | federation_disabled
         '400': { $ref: '#/components/responses/InvalidPageParams' }
     post:
-      x-realmid-step-up-candidate: true
+      x-realmid-human-only: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -8509,10 +8530,35 @@ paths:
         resource for why. Every create notifies the platform owner by email
         (ADR-095).
 
+        **From issuer v0.153.0, only a person can create a binding, and only with
+        a fresh TOTP for THIS request (ADR-057 amendment 2026-11-25).** The caller
+        must be a signed-in person (a platform token carrying the person's
+        `X-User-Token`) who answered a step-up challenge for exactly this request
+        with an authenticator (TOTP) code and retries within 120 seconds of that
+        answer. A user API key (capped or uncapped), a user-API-key session, a
+        service-account session (including a workload session whose binding
+        targets a service account) answers `403 not_available_to_api_keys`; a
+        platform API key, a workload session whose binding targets `platform` or
+        `platform_mgmt` (it holds a bare platform token), or any bare platform
+        bearer with no `X-User-Token` answers `403 actor_required`. A TOTP passed
+        at sign-in does not count, and neither does an SMS or email code, or a
+        recovery code (a recovery code does not authorize the operation and clears
+        the person's authenticator, so they must enrol again). Each create needs
+        its own code. The flow: send the request; on `412 mfa_required` take the
+        `mfa_challenge_token`, answer it with `POST /auth/mfa/verify` (`method:
+        totp`), adopt the rotated refresh token and obtain a new access token for
+        the person (a successful verify invalidates the previous access token), then send the same method, path and body again with the NEW
+        `X-User-Token`. A retry carrying the pre-verify token answers `401` and
+        does not spend the approval. The approval is bound to the request (method,
+        realm, path and the canonical body, so key order and spacing do not
+        matter), is consumed by the retry, and is returned unspent whenever the
+        write does not happen (a `409` or a store error). Do not rely on an `Idempotency-Key` to replay the `412`: a
+        `412` is never cached.
+
         **A `target.kind=service_account` binding** may be created only by the
         tenant OWNER of `target.tenant_id` acting as a person (a carried
         actor); a member, or a bare platform token (`403 actor_required`),
-        is refused (R12, R65).
+        is refused (R12, R65). It needs the same fresh TOTP.
 
         **Creating a binding SEATS a role** — every external identity that
         later matches it authenticates AS `mapped_role` — so ADR-101 D6's one
@@ -8585,12 +8631,14 @@ paths:
             (ADR-101 D6). This includes the default `platform_api` when
             `mapped_role` is omitted. A non-owner with `federation:manage` may
             still create a binding at a role that confers no authority. |
-            `permission_cap_exceeded` — a capped user API key whose
-            `permissions_cap` lacks `federation:manage` (message names it); and, for
-            a `service_account` target, ANY capped user API key, because that path
-            names no permission (message: `this operation is not available to an
-            API-key session (no permission is defined for it)`). An uncapped key
-            and a signed-in person pass this check.
+            `not_available_to_api_keys` — from v0.153.0, the caller is not a
+            person: a user API key (capped or uncapped), a user-API-key
+            session, a service-account session (including a service-account
+            workload), or a session the challenge cannot be bound to. The person check runs before the
+            permission check, so `permission_cap_exceeded` no longer arises
+            on this operation | `actor_required` — a platform API key, a workload
+            session whose binding targets `platform` or `platform_mgmt`, or any
+            bare platform bearer with no `X-User-Token`.
         '404':
           description: |-
             realm_not_found | federation_disabled |
@@ -8599,15 +8647,37 @@ paths:
             or human target, no oracle)
         '409':
           description: |-
-            binding_exists
+            binding_exists (the step-up approval is returned unspent, so an
+            identical request within the approval's remaining 120 seconds needs
+            no new code)
 
             `idempotency_in_progress` (G11) — a request with the same `Idempotency-Key`
             is still running; retry after it finishes.
+        '412':
+          description: |
+            `mfa_required` — the person has no step-up approval for THIS request.
+            The body carries an `mfa_challenge_token` bound to the person's
+            session and to this request (method, realm, path, canonical body);
+            answer it with `POST /auth/mfa/verify` (body `mfa_challenge_token`,
+            `code`, `method: totp`; platform token, no actor) and a fresh
+            authenticator code, take the rotated tokens, then send the same
+            request again with the new `X-User-Token` within 120 seconds of the
+            answer. A TOTP passed at sign-in, an SMS or email code, a recovery
+            code and an enrolment confirmation do not produce the approval (a
+            recovery code also clears the authenticator). `reason` is
+            `fresh_required`. Never cached by `Idempotency-Key`.
+
+            `mfa_registration_required` — the person has no authenticator
+            (TOTP) and must enrol one before retrying. The body carries
+            `methods: ["totp"]` and the key `mfa_challenge_token` PRESENT BUT
+            EMPTY (`""`): there is nothing to verify, so do not send it.
         '422': { $ref: '#/components/responses/IdempotencyKeyReused' }
+        '503':
+          description: store_unavailable — the step-up approval store or the person's MFA state could not be read or written; nothing was created (fail closed).
 
   /platforms/{id}/federation-bindings/{bid}:
     delete:
-      x-realmid-step-up-candidate: true
+      x-realmid-human-only: true
       tags: [Platform Admin]
       security:
         - BearerPlatformToken: []
@@ -8618,7 +8688,26 @@ paths:
         immediately stops authenticating workloads, but the row is retained for
         audit. Gated on the platform owner or a realm role granting
         `federation:manage` (ADR-074). Idempotent only in that a second
-        call on an already-removed id returns 404.
+        call on an already-removed id returns 404 (from issuer v0.153.0 that
+        404 comes before any code is asked).
+
+        **From issuer v0.153.0, only a person can revoke a binding, and only with
+        a fresh TOTP for THIS request (ADR-057 amendment 2026-11-25).** The same
+        rule, errors and flow as the create (including adopting the rotated
+        tokens after the verify and retrying with the new `X-User-Token`): a
+        signed-in person (platform token plus the person's `X-User-Token`) who
+        answered, with an authenticator (TOTP) code, a step-up challenge minted
+        for this exact revoke and retries within 120 seconds of that answer. A
+        user API key, a user-API-key session, a service-account session
+        (including a service-account workload) answers
+        `403 not_available_to_api_keys`; a platform API key, a workload session
+        whose binding targets `platform` or `platform_mgmt`, or a bare platform
+        bearer answers `403 actor_required`. A TOTP passed at
+        sign-in, an SMS code, an email code or a recovery code does not count
+        (a recovery code also clears the authenticator); each revoke needs its
+        own code. The approval is bound to this `{bid}`, is single-use and is
+        returned unspent whenever the revoke does not happen (a
+        `409 last_machine_credential` or a store error).
 
         Base-realm RealmID staff are additionally accepted on ANY realm
         (`requireRealmPermissionOrBaseStaff`). A binding is the credential a
@@ -8648,7 +8737,7 @@ paths:
                   status: { type: string, enum: [revoked] }
                   id: { type: string, format: uuid }
         '403':
-          description: not_authorized (caller is not a realm admin / owner) | `permission_cap_exceeded` - a capped user API key whose `permissions_cap` lacks `federation:manage` (message names it; an uncapped key and a signed-in person pass this check)
+          description: not_authorized (caller is not a realm admin / owner) | `not_available_to_api_keys` - from v0.153.0, the caller is not a person (a user API key, capped or uncapped, a user-API-key session, a service-account session or a service-account workload); the person check runs before the permission check, so `permission_cap_exceeded` no longer arises here | `actor_required` - a platform API key, a workload session whose binding targets `platform` or `platform_mgmt`, or any bare platform bearer with no `X-User-Token`
         '404':
           description: binding_not_found | federation_disabled
         '409':
@@ -8658,9 +8747,25 @@ paths:
             `apikey:fed:<bid>`) and it is the realm's only credential that can get
             its platform token today (usable platform API keys while platform-key
             login is on, plus active bindings whose target is `platform` or
-            `platform_mgmt`). No override.
+            `platform_mgmt`). No override. The step-up approval is returned
+            unspent.
+        '412':
+          description: |
+            `mfa_required` — the person has no step-up approval for THIS revoke
+            (bound to the realm, path and `{bid}`). The body carries an
+            `mfa_challenge_token`; answer it with `POST /auth/mfa/verify`
+            (body `mfa_challenge_token`, `code`, `method: totp`; a fresh code),
+            take the rotated tokens, then repeat the DELETE with the new
+            `X-User-Token` within 120 seconds of the answer. A recovery code
+            does not produce the approval (and clears the authenticator).
+            `reason` is `fresh_required`.
+
+            `mfa_registration_required` — the person has no authenticator
+            (TOTP) and must enrol one before retrying. The body carries
+            `methods: ["totp"]` and the key `mfa_challenge_token` PRESENT BUT
+            EMPTY (`""`): there is nothing to verify, so do not send it.
         '503':
-          description: store_unavailable — the ADR-124 count could not be taken; nothing was revoked.
+          description: store_unavailable — the ADR-124 count, the step-up approval store, or the person's MFA state could not be read or written; nothing was revoked (fail closed).
 
   /platforms/{id}/permissions:
     parameters:
