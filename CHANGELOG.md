@@ -3,7 +3,7 @@
 Release notes for consumers of the binary. **WHAT shipped** lives here, the
 **WHY** lives in `DECISIONS.md`, and open work lives in `TODO.md`.
 
-## Unreleased
+## v0.8.0 — federation-binding create and revoke need a person with a fresh TOTP; issuer spec v0.153.0 (2026-11-25)
 
 ### Changed
 
